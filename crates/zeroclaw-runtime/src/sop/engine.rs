@@ -4582,9 +4582,8 @@ impl SopEngine {
         let mut last_completed_step = 0;
         for result in &run.step_results {
             if result.status == SopStepStatus::Completed {
-                // Try to parse output as JSON, fall back to string value.
-                let value = serde_json::from_str(&result.output)
-                    .unwrap_or_else(|_| serde_json::Value::String(result.output.clone()));
+                // Recover JSON from bare / fenced / prose-wrapped output, else string.
+                let value = super::rundata::parse_step_output_value(&result.output);
                 step_outputs.insert(result.step_number, value);
                 last_completed_step = result.step_number;
             }
@@ -5654,7 +5653,7 @@ fn forge_comment_input_matches_checkpoint_output(
 }
 
 fn jsonish_value(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()))
+    super::rundata::parse_step_output_value(raw)
 }
 
 // ── Utilities ───────────────────────────────────────────────────
