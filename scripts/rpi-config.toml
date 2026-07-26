@@ -127,10 +127,9 @@ max_subprocesses = 10
 memory_monitoring = true
 
 [security.audit]
-# Command audit logging is scaffolding only — no production writer exists
-# yet (see zeroclaw-labs/zeroclaw#9391 / #9086). Leaving this false avoids a
-# false sense of protection; flipping it to true has no effect beyond a
-# startup warning.
+# Command audit logging is scaffolding only: no production writer exists
+# yet. Leaving this false avoids a false sense of protection; flipping it
+# to true has no effect beyond a startup warning.
 enabled = false
 log_path = "audit.log"
 max_size_mb = 100

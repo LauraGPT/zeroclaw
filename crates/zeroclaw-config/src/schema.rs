@@ -16231,12 +16231,12 @@ pub struct AuditConfig {
     ///
     /// **Currently a placeholder.** `AuditLogger`/`AuditEvent` are fully
     /// implemented (see `zeroclaw-runtime::security::audit`) but nothing in
-    /// the runtime constructs or calls them outside of tests yet — there is
+    /// the runtime constructs or calls them outside of tests yet: there is
     /// no production write path. Setting this to `true` does not record
     /// anything. It exists as scaffolding for a future production audit
-    /// pipeline (tracked in #9086/#9391); until that lands, this defaults to
-    /// `false` and setting it explicitly to `true` surfaces a startup
-    /// warning instead of silently doing nothing.
+    /// pipeline; until that lands, this defaults to `false` and setting it
+    /// explicitly to `true` surfaces a startup warning instead of silently
+    /// doing nothing.
     #[serde(default = "default_audit_enabled")]
     pub enabled: bool,
 
@@ -18816,11 +18816,11 @@ impl Config {
             }
         }
         // `security.audit.enabled` defaults to `false` because there is no
-        // production writer yet (see #9391/#9086): `AuditLogger`/`log_command`
-        // are fully implemented but only ever called from tests. An operator
-        // who explicitly sets it to `true` should not be left believing
-        // command audit logging is protecting them, so surface it plainly
-        // instead of silently no-op'ing.
+        // production writer yet: `AuditLogger`/`log_command` are fully
+        // implemented but only ever called from tests. An operator who
+        // explicitly sets it to `true` should not be left believing command
+        // audit logging is protecting them, so surface it plainly instead
+        // of silently no-op'ing.
         if self.security.audit.enabled {
             warnings.push(crate::validation_warnings::ValidationWarning::new(
                 "security_audit_enabled_has_no_effect",
@@ -30582,9 +30582,9 @@ group_policy = "disabled"
         );
     }
 
-    // #9391: command audit logging is not wired into any production write
-    // path (AuditLogger/log_command_event are only ever called from tests).
-    // The default must stay `false` so operators aren't led to believe the
+    // Command audit logging is not wired into any production write path
+    // (AuditLogger/log_command_event are only ever called from tests). The
+    // default must stay `false` so operators aren't led to believe the
     // control is active; this test directly falsifies the original bug
     // report if the default regresses back to `true`.
     #[test]
@@ -30592,7 +30592,7 @@ group_policy = "disabled"
         assert!(
             !AuditConfig::default().enabled,
             "security.audit.enabled must default to false until a production \
-             audit writer exists (see #9391/#9086)"
+             audit writer exists"
         );
 
         // Also confirm it holds through a full config load with no

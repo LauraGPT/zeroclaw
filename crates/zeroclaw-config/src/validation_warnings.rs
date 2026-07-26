@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
 /// - `security_audit_enabled_has_no_effect`: `security.audit.enabled` is set
-///   to `true`, but command audit logging has no production writer yet
-///   (see #9391/#9086) — the setting currently has no effect.
+///   to `true`, but command audit logging has no production writer yet, so
+///   the setting currently has no effect.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
