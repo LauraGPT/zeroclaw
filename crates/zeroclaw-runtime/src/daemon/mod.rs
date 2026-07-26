@@ -4306,6 +4306,7 @@ done
             url: None,
             headers: std::collections::HashMap::new(),
             pinned_resources: vec![],
+            tls_ca_cert_path: None,
         });
         let agent_alias = "ops".to_string();
         config.mcp_bundles.insert(
