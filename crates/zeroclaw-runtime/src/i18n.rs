@@ -443,6 +443,18 @@ mod tests {
     }
 
     #[test]
+    fn quickstart_terminal_width_error_formats_from_english_fluent() {
+        let message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-narrow",
+            &[("min_width", "3"), ("width", "2")],
+        );
+        assert_eq!(
+            message,
+            "Quickstart needs a terminal at least 3 columns wide; the current terminal is 2 columns. Widen the terminal and try again."
+        );
+    }
+
+    #[test]
     fn wechat_cli_strings_format_from_fluent() {
         let keys = [
             (

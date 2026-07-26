@@ -581,6 +581,7 @@ cli-no-command = No command provided.
 cli-press-enter = Press Enter to exit...
 cli-quickstart-title = Quickstart — create one working agent end-to-end.
 cli-quickstart-needs-tty = Quickstart is interactive and needs a terminal on stdin and stderr. Run it from an interactive shell, or use `zeroclaw config set <path> <value>` for headless configuration.
+cli-quickstart-terminal-too-narrow = Quickstart needs a terminal at least {$min_width} columns wide; the current terminal is {$width} columns. Widen the terminal and try again.
 cli-quickstart-cancelled = Quickstart cancelled. No config written.
 cli-quickstart-incomplete = {"  "}Not all selectors are filled yet.
 cli-quickstart-create-agent = ── Create agent

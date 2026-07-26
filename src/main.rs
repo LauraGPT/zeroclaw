@@ -150,6 +150,70 @@ fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
 }
 
 #[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_MIN_WIDTH: usize = 3;
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_row_budget(terminal_width: usize) -> Option<usize> {
+    terminal_width.checked_sub(QUICKSTART_SELECTOR_MIN_WIDTH)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn fit_quickstart_selector_row(row: &str, budget: usize) -> String {
+    let normalized: String = row
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if normalized.len() <= budget && console::measure_text_width(&normalized) <= budget {
+        return normalized;
+    }
+    if budget == 0 {
+        return String::new();
+    }
+
+    let marker = if budget >= "…".len() { "…" } else { "." };
+    let byte_budget = budget - marker.len();
+    let width_budget = budget - console::measure_text_width(marker);
+    let mut fitted = String::with_capacity(budget);
+    for ch in normalized.chars() {
+        fitted.push(ch);
+        if fitted.len() > byte_budget || console::measure_text_width(&fitted) > width_budget {
+            fitted.pop();
+            break;
+        }
+    }
+    fitted.push_str(marker);
+    fitted
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartChecklistAction {
+    Provider,
+    Risk,
+    Memory,
+    Channels,
+    PeerGroups,
+    Agent,
+    Create,
+    Quit,
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_action_for_pick(
+    choices: &[(QuickstartChecklistAction, String)],
+    pick: Option<usize>,
+) -> QuickstartChecklistAction {
+    pick.and_then(|index| choices.get(index).map(|(action, _)| *action))
+        .unwrap_or(QuickstartChecklistAction::Quit)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_labels_are_unique(labels: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(labels.len());
+    labels.iter().all(|label| seen.insert(label.as_str()))
+}
+
+#[cfg(feature = "agent-runtime")]
 fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> String {
     t(step.label_key(), step.label())
 }
@@ -1401,19 +1465,6 @@ async fn run_quickstart_cli(
         }
     }
 
-    // ── Main checklist loop ─────────────────────────────────────
-    #[derive(Clone, Copy)]
-    enum Action {
-        Provider,
-        Risk,
-        Memory,
-        Channels,
-        PeerGroups,
-        Agent,
-        Create,
-        Quit,
-    }
-
     println!();
     println!(
         "{}",
@@ -1503,74 +1554,110 @@ async fn run_quickstart_cli(
         };
 
         let risk_summary = preset_summary(&form.risk);
-        let mut labels: Vec<String> = vec![
-            quickstart_row(
-                "cli-quickstart-row-model-provider",
-                glyph(form.provider_done()),
-                &provider_summary,
+        let mut choices: Vec<(QuickstartChecklistAction, String)> = vec![
+            (
+                QuickstartChecklistAction::Provider,
+                quickstart_row(
+                    "cli-quickstart-row-model-provider",
+                    glyph(form.provider_done()),
+                    &provider_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-risk-profile",
-                glyph(form.risk_done()),
-                &risk_summary,
+            (
+                QuickstartChecklistAction::Risk,
+                quickstart_row(
+                    "cli-quickstart-row-risk-profile",
+                    glyph(form.risk_done()),
+                    &risk_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-memory",
-                glyph(form.memory_done()),
-                &memory_summary,
+            (
+                QuickstartChecklistAction::Memory,
+                quickstart_row(
+                    "cli-quickstart-row-memory",
+                    glyph(form.memory_done()),
+                    &memory_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-channels",
-                glyph(form.channels_done()),
-                &channels_summary,
+            (
+                QuickstartChecklistAction::Channels,
+                quickstart_row(
+                    "cli-quickstart-row-channels",
+                    glyph(form.channels_done()),
+                    &channels_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-peer-groups",
-                glyph(form.peer_groups_done()),
-                &peer_groups_summary,
+            (
+                QuickstartChecklistAction::PeerGroups,
+                quickstart_row(
+                    "cli-quickstart-row-peer-groups",
+                    glyph(form.peer_groups_done()),
+                    &peer_groups_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-agent-identity",
-                glyph(form.agent_done()),
-                &agent_summary,
+            (
+                QuickstartChecklistAction::Agent,
+                quickstart_row(
+                    "cli-quickstart-row-agent-identity",
+                    glyph(form.agent_done()),
+                    &agent_summary,
+                ),
             ),
         ];
         let create_enabled = form.all_done();
-        labels.push(if create_enabled {
-            t("cli-quickstart-create-agent", "── Create agent")
-        } else {
-            t(
-                "cli-quickstart-create-agent-locked",
-                "── Create agent (locked — fill every selector first)",
-            )
-        });
+        choices.push((
+            QuickstartChecklistAction::Create,
+            if create_enabled {
+                t("cli-quickstart-create-agent", "── Create agent")
+            } else {
+                t(
+                    "cli-quickstart-create-agent-locked",
+                    "── Create agent (locked — fill every selector first)",
+                )
+            },
+        ));
 
-        let actions = [
-            Action::Provider,
-            Action::Risk,
-            Action::Memory,
-            Action::Channels,
-            Action::PeerGroups,
-            Action::Agent,
-            Action::Create,
-        ];
-
-        let pick = FuzzySelect::new()
-            .with_prompt(t(
-                "cli-quickstart-open-selector-prompt",
-                "Open a selector (Enter), or pick Create. Esc to quit.",
-            ))
-            .items(&labels)
-            .default(0)
-            .max_length(labels.len())
-            .interact_opt()?;
-        let action = match pick {
-            Some(i) => actions[i],
-            None => Action::Quit, // Esc on the main checklist quits.
+        let term = console::Term::stderr();
+        let terminal_width = usize::from(term.size().1);
+        let Some(row_budget) = quickstart_selector_row_budget(terminal_width) else {
+            let terminal_width = terminal_width.to_string();
+            let min_width = QUICKSTART_SELECTOR_MIN_WIDTH.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-narrow",
+                    &[("width", &terminal_width), ("min_width", &min_width)],
+                )
+            );
         };
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, row_budget))
+            .collect();
+
+        let prompt = t(
+            "cli-quickstart-open-selector-prompt",
+            "Open a selector (Enter), or pick Create. Esc to quit.",
+        );
+        let pick = if quickstart_labels_are_unique(&labels) {
+            FuzzySelect::new()
+                .with_prompt(prompt)
+                .items(&labels)
+                .default(0)
+                .max_length(labels.len())
+                .interact_on_opt(&term)?
+        } else {
+            Select::new()
+                .with_prompt(prompt)
+                .items(&labels)
+                .default(0)
+                .max_length(labels.len())
+                .interact_on_opt(&term)?
+        };
+        let action = quickstart_action_for_pick(&choices, pick);
 
         match action {
-            Action::Quit => {
+            QuickstartChecklistAction::Quit => {
                 println!(
                     "{}",
                     t(
@@ -1580,7 +1667,7 @@ async fn run_quickstart_cli(
                 );
                 return Ok(());
             }
-            Action::Create => {
+            QuickstartChecklistAction::Create => {
                 if !create_enabled {
                     println!(
                         "{}",
@@ -1593,7 +1680,7 @@ async fn run_quickstart_cli(
                 }
                 break;
             }
-            Action::Provider => {
+            QuickstartChecklistAction::Provider => {
                 // Step 1: pick Existing or Fresh, when there are
                 // existing providers to choose from.
                 let mut mode_labels: Vec<String> = Vec::new();
@@ -1759,7 +1846,7 @@ async fn run_quickstart_cli(
                     fields: field_buf,
                 });
             }
-            Action::Risk => {
+            QuickstartChecklistAction::Risk => {
                 let chosen = pick_preset(
                     &t("cli-quickstart-risk-profile-prompt", "Risk profile"),
                     RISK_PRESETS
@@ -1775,7 +1862,7 @@ async fn run_quickstart_cli(
                     });
                 }
             }
-            Action::Memory => {
+            QuickstartChecklistAction::Memory => {
                 let kinds: [MemoryChoice; 6] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
@@ -1813,7 +1900,7 @@ async fn run_quickstart_cli(
                 };
                 form.memory = Some(kinds[i]);
             }
-            Action::Channels => {
+            QuickstartChecklistAction::Channels => {
                 // Channels sub-flow: list current drafts + Add / Done.
                 loop {
                     let mut items: Vec<String> = form
@@ -1969,7 +2056,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::PeerGroups => {
+            QuickstartChecklistAction::PeerGroups => {
                 // Available channel refs: staged channels (this run) +
                 // unassigned channels already in config. Refs already
                 // covered by a staged peer-group are filtered out.
@@ -2085,7 +2172,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::Agent => {
+            QuickstartChecklistAction::Agent => {
                 let default_name = form
                     .agent
                     .as_ref()
@@ -8131,6 +8218,97 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn fit_quickstart_selector_row_respects_byte_and_display_budgets() {
+        let short = "[ ] Memory — not yet chosen";
+        assert_eq!(fit_quickstart_selector_row(short, 80), short);
+
+        let rows = [
+            "[✓] Model provider — Anthropic (alias: main, model: claude-sonnet-4-5)",
+            "[✓] モデルプロバイダー — Anthropic（モデル：長い名前）",
+            "[✓] 模型提供方 — 提供商与模型摘要",
+            "emoji 👩‍💻 and combining e\u{301} text",
+            "line one\nline two\twith controls",
+        ];
+        for row in rows {
+            for budget in 0..=64 {
+                let fitted = fit_quickstart_selector_row(row, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
+
+        let long = rows[0];
+        assert_eq!(fit_quickstart_selector_row(long, 0), "");
+        assert_eq!(fit_quickstart_selector_row(long, 1), ".");
+        assert_eq!(fit_quickstart_selector_row(long, 2), "[.");
+        assert!(fit_quickstart_selector_row(long, 40).ends_with('…'));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_budget_rejects_unsafe_terminal_widths() {
+        assert_eq!(quickstart_selector_row_budget(0), None);
+        assert_eq!(quickstart_selector_row_budget(1), None);
+        assert_eq!(quickstart_selector_row_budget(2), None);
+        assert_eq!(quickstart_selector_row_budget(3), Some(0));
+        assert_eq!(quickstart_selector_row_budget(4), Some(1));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selection_maps_by_index_when_fitted_labels_are_identical() {
+        let actions = [
+            QuickstartChecklistAction::Provider,
+            QuickstartChecklistAction::Risk,
+            QuickstartChecklistAction::Memory,
+            QuickstartChecklistAction::Channels,
+            QuickstartChecklistAction::PeerGroups,
+            QuickstartChecklistAction::Agent,
+            QuickstartChecklistAction::Create,
+        ];
+        let choices: Vec<(QuickstartChecklistAction, String)> = actions
+            .iter()
+            .copied()
+            .map(|action| (action, "same row".to_string()))
+            .collect();
+        let fitted: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, 0))
+            .collect();
+        assert!(fitted.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(!quickstart_labels_are_unique(&fitted));
+        assert!(quickstart_labels_are_unique(&[
+            "provider".to_string(),
+            "risk".to_string(),
+        ]));
+
+        for (index, expected) in actions.into_iter().enumerate() {
+            assert_eq!(quickstart_action_for_pick(&choices, Some(index)), expected);
+        }
+        assert_eq!(
+            quickstart_action_for_pick(&choices, None),
+            QuickstartChecklistAction::Quit
+        );
+        assert_eq!(
+            quickstart_action_for_pick(&choices, Some(choices.len())),
+            QuickstartChecklistAction::Quit
+        );
+    }
 
     #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
