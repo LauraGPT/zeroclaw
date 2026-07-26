@@ -40,9 +40,13 @@ pub use traits::{
     ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
 
-use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
+use reliable::{
+    CredentialProviderFactory, CredentialResolver, CredentialRotation, ReliableModelProvider,
+    ReliableModelProviderEntry,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -1228,13 +1232,17 @@ pub fn create_resilient_model_provider_with_options(
     let primary_model_provider =
         create_model_provider_inner(None, primary_name, "default", api_key, api_url, options)?;
 
-    let reliable = ReliableModelProvider::new(
+    let mut reliable = ReliableModelProvider::new(
         primary_name,
         vec![(primary_name.to_string(), primary_model_provider)],
         reliability.provider_retries,
         reliability.provider_backoff_ms,
-    )
-    .with_api_keys(reliability.api_keys.clone());
+    );
+    if let Some(rotation) =
+        credential_rotation_for_bare_provider(primary_name, api_key, api_url, reliability, options)
+    {
+        reliable = reliable.with_credential_rotation(rotation);
+    }
 
     Ok(Box::new(reliable))
 }
@@ -1261,6 +1269,8 @@ pub fn create_resilient_model_provider_for_alias(
         reliability,
         options,
         None,
+        None,
+        true,
     )
 }
 
@@ -1273,6 +1283,8 @@ fn create_resilient_model_provider_for_alias_with_model_override(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
     primary_model_override: Option<&str>,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    include_additional_keys: bool,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
@@ -1298,15 +1310,255 @@ fn create_resilient_model_provider_for_alias_with_model_override(
         )?;
     }
 
-    let reliable = ReliableModelProvider::new_with_entries(
+    let mut reliable = ReliableModelProvider::new_with_entries(
         alias,
         model_providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
-    )
-    .with_api_keys(reliability.api_keys.clone());
+    );
+    if let Some(rotation) = credential_rotation_for_alias(
+        config,
+        family,
+        alias,
+        api_key,
+        reliability,
+        live_config,
+        include_additional_keys,
+    ) {
+        reliable = reliable.with_credential_rotation(rotation);
+    }
 
     Ok(Box::new(reliable))
+}
+
+fn credential_rotation_for_bare_provider(
+    provider_name: &str,
+    primary_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+) -> Option<Arc<CredentialRotation>> {
+    let primary_key = primary_key
+        .map(str::trim)
+        .filter(|key| !key.is_empty())?
+        .to_string();
+    let extras = reliability.api_keys.clone();
+    let resolve: CredentialResolver = Arc::new(move || {
+        std::iter::once(primary_key.clone())
+            .chain(extras.clone())
+            .collect()
+    });
+    let provider_name = provider_name.to_string();
+    let api_url = api_url.map(ToString::to_string);
+    let options = options.clone();
+    let build: CredentialProviderFactory = Arc::new(move |key| {
+        create_model_provider_inner(
+            None,
+            &provider_name,
+            "default",
+            Some(key),
+            api_url.as_deref(),
+            &options,
+        )
+    });
+    Some(CredentialRotation::new(resolve, build))
+}
+
+fn alias_uses_api_key_auth(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+) -> bool {
+    use zeroclaw_config::schema::AuthMode;
+
+    let Some(entry) = config.providers.models.find(family, alias) else {
+        return false;
+    };
+    if entry.requires_openai_auth {
+        return false;
+    }
+    match family {
+        "gemini" => !matches!(
+            config
+                .providers
+                .models
+                .gemini
+                .get(alias)
+                .and_then(|entry| entry.auth_mode),
+            Some(AuthMode::OAuth)
+        ),
+        "qwen" => !matches!(
+            config
+                .providers
+                .models
+                .qwen
+                .get(alias)
+                .and_then(|entry| entry.auth_mode),
+            Some(AuthMode::OAuth)
+        ),
+        "minimax" => !matches!(
+            config
+                .providers
+                .models
+                .minimax
+                .get(alias)
+                .and_then(|entry| entry.auth_mode),
+            Some(AuthMode::OAuth)
+        ),
+        _ => true,
+    }
+}
+
+fn credential_rotation_for_alias(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    primary_key: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    include_additional_keys: bool,
+) -> Option<Arc<CredentialRotation>> {
+    if !alias_uses_api_key_auth(config, family, alias) {
+        return None;
+    }
+    let primary_key = primary_key
+        .or_else(|| {
+            config
+                .providers
+                .models
+                .find(family, alias)
+                .and_then(|entry| entry.api_key.as_deref())
+        })
+        .map(str::trim)
+        .filter(|key| !key.is_empty())?
+        .to_string();
+    let provider_ref = format!("{family}.{alias}");
+    let route_supplied_primary = config.model_routes.iter().any(|route| {
+        route.model_provider == provider_ref
+            && route
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|key| key == primary_key)
+    });
+    let alias_supplied_primary = !route_supplied_primary
+        && config
+            .providers
+            .models
+            .find(family, alias)
+            .and_then(|entry| entry.api_key.as_deref())
+            .map(str::trim)
+            .is_some_and(|key| key == primary_key);
+    let family = family.to_string();
+    let alias = alias.to_string();
+    let (resolve, build): (CredentialResolver, CredentialProviderFactory) =
+        if let Some(live_config) = live_config {
+            let resolve_config = Arc::clone(&live_config);
+            let resolve_family = family.clone();
+            let resolve_alias = alias.clone();
+            let resolve_provider_ref = provider_ref;
+            let external_primary =
+                (!route_supplied_primary && !alias_supplied_primary).then_some(primary_key.clone());
+            let resolve: CredentialResolver = Arc::new(move || {
+                let config = resolve_config.read();
+                if !alias_uses_api_key_auth(&config, &resolve_family, &resolve_alias) {
+                    return Vec::new();
+                }
+                let alias_primary = || {
+                    config
+                        .providers
+                        .models
+                        .find(&resolve_family, &resolve_alias)
+                        .and_then(|entry| entry.api_key.as_deref())
+                        .map(str::trim)
+                        .filter(|key| !key.is_empty())
+                };
+                let primary = if route_supplied_primary {
+                    config
+                        .model_routes
+                        .iter()
+                        .find(|route| route.model_provider == resolve_provider_ref)
+                        .and_then(|route| route.api_key.as_deref())
+                        .map(str::trim)
+                        .filter(|key| !key.is_empty())
+                        .or_else(alias_primary)
+                        .map(ToString::to_string)
+                } else if alias_supplied_primary {
+                    alias_primary().map(ToString::to_string)
+                } else {
+                    external_primary.clone()
+                };
+                let extras = if include_additional_keys {
+                    config.reliability.api_keys.clone()
+                } else {
+                    Vec::new()
+                };
+                primary.into_iter().chain(extras).collect()
+            });
+            let build_config = Arc::clone(&live_config);
+            let build: CredentialProviderFactory = Arc::new(move |key| {
+                let config = build_config.read();
+                if !alias_uses_api_key_auth(&config, &family, &alias) {
+                    anyhow::bail!(
+                        "model_provider `{family}.{alias}` no longer uses API-key authentication"
+                    );
+                }
+                let entry = config
+                    .providers
+                    .models
+                    .find(&family, &alias)
+                    .ok_or_else(|| {
+                        anyhow::Error::msg(format!(
+                            "model_provider `{family}.{alias}` no longer resolves"
+                        ))
+                    })?;
+                let options = provider_runtime_options_for_alias(&config, &family, &alias);
+                create_model_provider_inner(
+                    Some(&config),
+                    &family,
+                    &alias,
+                    Some(key),
+                    entry.uri.as_deref(),
+                    &options,
+                )
+            });
+            (resolve, build)
+        } else {
+            let extras = if include_additional_keys {
+                reliability.api_keys.clone()
+            } else {
+                Vec::new()
+            };
+            let resolve: CredentialResolver = Arc::new(move || {
+                std::iter::once(primary_key.clone())
+                    .chain(extras.clone())
+                    .collect()
+            });
+            let config = Arc::new(config.clone());
+            let build_config = Arc::clone(&config);
+            let build: CredentialProviderFactory = Arc::new(move |key| {
+                let entry = build_config
+                    .providers
+                    .models
+                    .find(&family, &alias)
+                    .ok_or_else(|| {
+                        anyhow::Error::msg(format!(
+                            "model_provider `{family}.{alias}` no longer resolves"
+                        ))
+                    })?;
+                let options = provider_runtime_options_for_alias(&build_config, &family, &alias);
+                create_model_provider_inner(
+                    Some(&build_config),
+                    &family,
+                    &alias,
+                    Some(key),
+                    entry.uri.as_deref(),
+                    &options,
+                )
+            });
+            (resolve, build)
+        };
+    Some(CredentialRotation::new(resolve, build))
 }
 
 fn push_pinned_entries(
@@ -1457,6 +1709,8 @@ pub fn create_resilient_model_provider_from_ref(
         reliability,
         options,
         None,
+        None,
+        true,
     )
 }
 
@@ -1551,6 +1805,8 @@ fn create_resilient_model_provider_from_ref_with_model_override(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
     primary_model_override: Option<&str>,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    include_additional_keys: bool,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     match name.split_once('.') {
         Some((family, alias)) => create_resilient_model_provider_for_alias_with_model_override(
@@ -1562,6 +1818,8 @@ fn create_resilient_model_provider_from_ref_with_model_override(
             reliability,
             options,
             primary_model_override,
+            live_config,
+            include_additional_keys,
         ),
         None => create_resilient_model_provider_with_options(
             name,
@@ -1583,6 +1841,55 @@ pub fn create_routed_model_provider_with_options(
     default_model: &str,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_routed_model_provider_with_options_and_live(
+        config,
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        default_model,
+        options,
+        None,
+    )
+}
+
+/// Build a routed provider whose API-key pool is resolved from the shared
+/// canonical config before every request.
+pub fn create_routed_model_provider_with_live_config_options(
+    live_config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    let config = live_config.read().clone();
+    create_routed_model_provider_with_options_and_live(
+        &config,
+        primary_name,
+        api_key,
+        api_url,
+        &config.reliability,
+        &config.model_routes,
+        default_model,
+        options,
+        Some(live_config),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_routed_model_provider_with_options_and_live(
+    config: &zeroclaw_config::schema::Config,
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
     if model_routes.is_empty() {
         return create_resilient_model_provider_from_ref_with_model_override(
             config,
@@ -1592,6 +1899,8 @@ pub fn create_routed_model_provider_with_options(
             reliability,
             options,
             Some(default_model),
+            live_config,
+            true,
         );
     }
 
@@ -1650,6 +1959,8 @@ pub fn create_routed_model_provider_with_options(
             reliability,
             &entry_options,
             is_primary.then_some(default_model),
+            live_config.clone(),
+            is_primary,
         ) {
             Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
             Err(e) => {
@@ -2842,6 +3153,120 @@ mod tests {
             .take()
             .expect("server should capture request");
         assert_eq!(model, "new-model");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn routed_live_alias_uses_route_key_then_observes_config_mutation() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, ModelRouteConfig, OpenAIModelProviderConfig,
+        };
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> (StatusCode, Json<Value>) {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            capture
+                .lock()
+                .expect("capture lock poisoned")
+                .push(auth.clone());
+            if auth == "Bearer sk-route-live-bad" {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error": {"message": "rate limited"}})),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(Arc::clone(&capture));
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        for alias in ["primary", "route"] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
+                        uri: Some(format!("http://{addr}/v1")),
+                        api_key: (alias == "primary").then(|| "sk-primary".to_string()),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config.reliability.provider_retries = 1;
+        config.reliability.provider_backoff_ms = 1;
+        config.reliability.api_keys = vec!["sk-global-must-not-reach-route".to_string()];
+        config.model_routes = vec![ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openai.route".to_string(),
+            model: "route-model".to_string(),
+            api_key: Some("sk-route-env".to_string()),
+        }];
+        let live_config = Arc::new(parking_lot::RwLock::new(config));
+        let provider = create_routed_model_provider_with_live_config_options(
+            Arc::clone(&live_config),
+            "openai.primary",
+            Some("sk-primary"),
+            Some(&format!("http://{addr}/v1")),
+            "default-model",
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("live routed provider should build");
+
+        assert_eq!(
+            provider
+                .simple_chat("hello", "hint:fast", None)
+                .await
+                .unwrap(),
+            "ok"
+        );
+        live_config.write().model_routes[0].api_key = Some("sk-route-live-bad".to_string());
+        provider
+            .simple_chat("hello", "hint:fast", None)
+            .await
+            .expect_err("the live route key is rate limited with no route-local fallback");
+        live_config.write().model_routes[0].api_key = None;
+        provider
+            .simple_chat("hello", "hint:fast", None)
+            .await
+            .expect_err("removing the route credential must revoke the startup key");
+
+        assert_eq!(
+            &*capture.lock().expect("capture lock poisoned"),
+            &["Bearer sk-route-env", "Bearer sk-route-live-bad"]
+        );
         server.abort();
     }
 

@@ -384,6 +384,7 @@ pub struct StreamedTurnError {
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
+    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -1585,8 +1586,18 @@ impl Agent {
             provider_alias,
         );
 
-        let model_provider: Box<dyn ModelProvider> =
-            zeroclaw_providers::create_routed_model_provider_with_options(
+        let model_provider: Box<dyn ModelProvider> = match live_config.as_ref() {
+            Some(live_config) => {
+                zeroclaw_providers::create_routed_model_provider_with_live_config_options(
+                    Arc::clone(live_config),
+                    &provider_ref,
+                    agent_model_provider.and_then(|e| e.api_key.as_deref()),
+                    agent_model_provider.and_then(|e| e.uri.as_deref()),
+                    &model_name,
+                    &provider_runtime_options,
+                )?
+            }
+            None => zeroclaw_providers::create_routed_model_provider_with_options(
                 config,
                 &provider_ref,
                 agent_model_provider.and_then(|e| e.api_key.as_deref()),
@@ -1595,7 +1606,8 @@ impl Agent {
                 &config.model_routes,
                 &model_name,
                 &provider_runtime_options,
-            )?;
+            )?,
+        };
 
         let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
 
@@ -1626,7 +1638,8 @@ impl Agent {
         };
 
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
+            if let Some(cap_config) = live_config.as_ref() {
+                let cap_config = Arc::clone(cap_config);
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
                     cap_config
@@ -1688,7 +1701,10 @@ impl Agent {
             })
             .approval_manager(Some(Arc::new(approval_manager)))
             .provider_switch_config(ProviderSwitchConfig {
-                config: Some(std::sync::Arc::new(config.clone())),
+                config: live_config
+                    .is_none()
+                    .then(|| std::sync::Arc::new(config.clone())),
+                live_config: live_config.clone(),
             })
             .build()?;
 
@@ -1937,58 +1953,75 @@ impl Agent {
             )
         );
 
-        let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> = match self
-            .provider_switch_config
-            .as_ref()
-            .and_then(|cfg| cfg.config.as_ref())
-        {
-            Some(full_config) => {
-                let agent_entry = full_config
-                    .resolved_model_provider_for_agent(&self.agent_alias)
-                    .map(|(_ty, _alias, entry)| entry);
-                let default_api_key = agent_entry.and_then(|e| e.api_key.as_deref());
-                let default_base_url = agent_entry.and_then(|e| e.uri.as_deref());
+        let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> =
+            match self.provider_switch_config.as_ref() {
+                Some(switch_config)
+                    if switch_config.live_config.is_some() || switch_config.config.is_some() =>
+                {
+                    let full_config = switch_config
+                        .live_config
+                        .as_ref()
+                        .map(|config| config.read().clone())
+                        .or_else(|| switch_config.config.as_deref().cloned())
+                        .expect("guarded by match condition");
+                    let agent_entry = full_config
+                        .resolved_model_provider_for_agent(&self.agent_alias)
+                        .map(|(_ty, _alias, entry)| entry);
+                    let default_api_key = agent_entry.and_then(|e| e.api_key.as_deref());
+                    let default_base_url = agent_entry.and_then(|e| e.uri.as_deref());
 
-                // Prefer a route-specific api_key when the switched
-                // provider/model matches a configured model_route entry.
-                let route_api_key = full_config
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.as_deref());
-                let api_key = route_api_key.or(default_api_key);
+                    // Prefer a route-specific api_key when the switched
+                    // provider/model matches a configured model_route entry.
+                    let route_api_key = full_config
+                        .model_routes
+                        .iter()
+                        .find(|r| {
+                            r.model_provider.eq_ignore_ascii_case(&new_model_provider)
+                                && (r.model.eq_ignore_ascii_case(&new_model)
+                                    || r.hint.eq_ignore_ascii_case(&new_model))
+                        })
+                        .and_then(|r| r.api_key.as_deref());
+                    let api_key = route_api_key.or(default_api_key);
 
-                let runtime_options = new_model_provider
-                    .split_once('.')
-                    .map(|(family, alias)| {
-                        zeroclaw_providers::provider_runtime_options_for_alias(
-                            full_config.as_ref(),
-                            family,
-                            alias,
+                    let runtime_options = new_model_provider
+                        .split_once('.')
+                        .map(|(family, alias)| {
+                            zeroclaw_providers::provider_runtime_options_for_alias(
+                                &full_config,
+                                family,
+                                alias,
+                            )
+                        })
+                        .unwrap_or_default();
+
+                    match switch_config.live_config.as_ref() {
+                    Some(live_config) => {
+                        zeroclaw_providers::create_routed_model_provider_with_live_config_options(
+                            Arc::clone(live_config),
+                            &new_model_provider,
+                            api_key,
+                            default_base_url,
+                            &new_model,
+                            &runtime_options,
                         )
-                    })
-                    .unwrap_or_default();
-
-                zeroclaw_providers::create_routed_model_provider_with_options(
-                    full_config.as_ref(),
-                    &new_model_provider,
-                    api_key,
-                    default_base_url,
-                    &full_config.reliability,
-                    &full_config.model_routes,
-                    &new_model,
-                    &runtime_options,
-                )
-            }
-            None => Err(anyhow::Error::msg(
-                "model_switch requested but agent has no provider_switch_config; \
+                    }
+                    None => zeroclaw_providers::create_routed_model_provider_with_options(
+                        &full_config,
+                        &new_model_provider,
+                        api_key,
+                        default_base_url,
+                        &full_config.reliability,
+                        &full_config.model_routes,
+                        &new_model,
+                        &runtime_options,
+                    ),
+                }
+                }
+                _ => Err(anyhow::Error::msg(
+                    "model_switch requested but agent has no provider_switch_config; \
                  cannot rebuild provider safely",
-            )),
-        };
+                )),
+            };
 
         match switch_outcome {
             Ok(new_prov) => {
@@ -9066,6 +9099,7 @@ mod tests {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -9088,11 +9122,44 @@ mod tests {
     }
 
     #[test]
+    fn try_apply_model_switch_reads_the_live_config_handle() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let startup = zeroclaw_config::schema::Config::default();
+        let live_config = Arc::new(parking_lot::RwLock::new(startup.clone()));
+        let switch_cfg = ProviderSwitchConfig {
+            config: Some(Arc::new(startup)),
+            live_config: Some(Arc::clone(&live_config)),
+        };
+        live_config.write().providers.models.openai.insert(
+            "live".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-live-config".to_string()),
+                    uri: Some("http://127.0.0.1:1/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "openai.live".to_string(),
+            "gpt-live".to_string(),
+        );
+
+        assert_eq!(result.as_deref(), Some("gpt-live"));
+        assert_eq!(agent.model_provider_name, "openai.live");
+    }
+
+    #[test]
     fn try_apply_model_switch_succeeds_on_provider_only_change() {
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
@@ -9129,6 +9196,7 @@ mod tests {
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -9323,6 +9391,7 @@ mod tests {
                 },
                 ..zeroclaw_config::schema::Config::default()
             })),
+            live_config: None,
         };
 
         let mut agent = Agent::builder()
