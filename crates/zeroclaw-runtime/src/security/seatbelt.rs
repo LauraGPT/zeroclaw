@@ -92,12 +92,16 @@ impl Sandbox for SeatbeltSandbox {
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
+        let current_dir = cmd.get_current_dir().map(Path::to_path_buf);
 
         let mut sandbox_cmd = Command::new("sandbox-exec");
         sandbox_cmd.arg("-f");
         sandbox_cmd.arg(&self.policy_path);
         sandbox_cmd.arg(&program);
         sandbox_cmd.args(&args);
+        if let Some(current_dir) = current_dir {
+            sandbox_cmd.current_dir(current_dir);
+        }
 
         *cmd = sandbox_cmd;
         Ok(())
@@ -369,6 +373,52 @@ mod tests {
         assert!(
             args.contains(&"/workspace".to_string()),
             "original args must be preserved"
+        );
+    }
+
+    #[test]
+    fn seatbelt_wrap_command_preserves_current_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("test.sb");
+        std::fs::write(&policy_path, "(version 1)").unwrap();
+
+        let sandbox = SeatbeltSandbox {
+            policy_dir: dir.path().to_path_buf(),
+            policy_path,
+        };
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let mut cmd = Command::new("pwd");
+        cmd.current_dir(&workspace);
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        assert_eq!(cmd.get_current_dir(), Some(workspace.as_path()));
+    }
+
+    #[test]
+    fn seatbelt_wrapped_command_executes_in_current_dir() {
+        if !SeatbeltSandbox::is_installed() {
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox = SeatbeltSandbox::with_workspace(Some(workspace.path())).unwrap();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "pwd"]);
+        cmd.current_dir(workspace.path());
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "sandboxed pwd failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        assert_eq!(
+            actual.canonicalize().unwrap(),
+            workspace.path().canonicalize().unwrap()
         );
     }
 
