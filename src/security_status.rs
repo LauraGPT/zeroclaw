@@ -74,7 +74,7 @@ pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatus
     let sandbox_config = sandbox_config_from_policy(&resolved.policy);
     let sandbox = zeroclaw_runtime::security::sandbox_posture(
         &sandbox_config,
-        config.runtime.kind.as_wire(),
+        config.runtime.kind,
         Some(&resolved.policy.workspace_dir),
     );
 

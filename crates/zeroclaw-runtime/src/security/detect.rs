@@ -3,7 +3,7 @@
 use crate::security::traits::Sandbox;
 use std::path::Path;
 use std::sync::Arc;
-use zeroclaw_config::schema::{SandboxBackend, SandboxConfig};
+use zeroclaw_config::schema::{RuntimeKind, SandboxBackend, SandboxConfig};
 
 const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
 const LANDLOCK_DESCRIPTION: &str = "Linux kernel LSM sandboxing (filesystem access control)";
@@ -25,7 +25,7 @@ pub struct SandboxPosture {
 #[must_use]
 pub fn sandbox_posture(
     sandbox: &SandboxConfig,
-    runtime_kind: &str,
+    runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
 ) -> SandboxPosture {
     let requested_backend = sandbox_backend_name(&sandbox.backend);
@@ -104,7 +104,7 @@ impl SelectedSandboxBackend {
 
 fn configured_backend_selection(
     backend: &SandboxBackend,
-    runtime_kind: &str,
+    runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
 ) -> SelectedSandboxBackend {
     if matches!(backend, SandboxBackend::Auto) {
@@ -112,22 +112,51 @@ fn configured_backend_selection(
     }
 
     SelectedSandboxBackend::from_config(backend)
+        .filter(|selected| sandbox_backend_compatible_with_runtime(*selected, runtime_kind))
         .filter(|selected| sandbox_backend_available(*selected, workspace_dir))
         .unwrap_or(SelectedSandboxBackend::None)
 }
 
-fn detect_best_backend(runtime_kind: &str, workspace_dir: Option<&Path>) -> SelectedSandboxBackend {
-    let skip_docker = runtime_kind == "native";
+fn sandbox_backend_compatible_with_runtime(
+    selected: SelectedSandboxBackend,
+    runtime_kind: RuntimeKind,
+) -> bool {
+    !(matches!(selected, SelectedSandboxBackend::Docker)
+        && matches!(runtime_kind, RuntimeKind::Docker))
+}
+
+fn auto_backend_compatible_with_runtime(
+    selected: SelectedSandboxBackend,
+    runtime_kind: RuntimeKind,
+) -> bool {
+    sandbox_backend_compatible_with_runtime(selected, runtime_kind)
+        && !(matches!(selected, SelectedSandboxBackend::Docker)
+            && matches!(runtime_kind, RuntimeKind::Native))
+}
+
+fn detect_best_backend(
+    runtime_kind: RuntimeKind,
+    workspace_dir: Option<&Path>,
+) -> SelectedSandboxBackend {
+    detect_best_backend_with(runtime_kind, |selected| {
+        sandbox_backend_available(selected, workspace_dir)
+    })
+}
+
+fn detect_best_backend_with(
+    runtime_kind: RuntimeKind,
+    mut is_available: impl FnMut(SelectedSandboxBackend) -> bool,
+) -> SelectedSandboxBackend {
     #[cfg(target_os = "linux")]
     {
         #[cfg(feature = "sandbox-landlock")]
         {
-            if sandbox_backend_available(SelectedSandboxBackend::Landlock, workspace_dir) {
+            if is_available(SelectedSandboxBackend::Landlock) {
                 return SelectedSandboxBackend::Landlock;
             }
         }
 
-        if sandbox_backend_available(SelectedSandboxBackend::Firejail, workspace_dir) {
+        if is_available(SelectedSandboxBackend::Firejail) {
             return SelectedSandboxBackend::Firejail;
         }
     }
@@ -136,17 +165,19 @@ fn detect_best_backend(runtime_kind: &str, workspace_dir: Option<&Path>) -> Sele
     {
         #[cfg(feature = "sandbox-bubblewrap")]
         {
-            if sandbox_backend_available(SelectedSandboxBackend::Bubblewrap, workspace_dir) {
+            if is_available(SelectedSandboxBackend::Bubblewrap) {
                 return SelectedSandboxBackend::Bubblewrap;
             }
         }
 
-        if sandbox_backend_available(SelectedSandboxBackend::SandboxExec, workspace_dir) {
+        if is_available(SelectedSandboxBackend::SandboxExec) {
             return SelectedSandboxBackend::SandboxExec;
         }
     }
 
-    if !skip_docker && sandbox_backend_available(SelectedSandboxBackend::Docker, workspace_dir) {
+    if auto_backend_compatible_with_runtime(SelectedSandboxBackend::Docker, runtime_kind)
+        && is_available(SelectedSandboxBackend::Docker)
+    {
         return SelectedSandboxBackend::Docker;
     }
 
@@ -241,7 +272,7 @@ fn sandbox_backend_name(backend: &SandboxBackend) -> &'static str {
 
 pub fn create_sandbox(
     sandbox: &SandboxConfig,
-    runtime_kind: &str,
+    runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
 ) -> Arc<dyn Sandbox> {
     let backend = &sandbox.backend;
@@ -260,13 +291,22 @@ pub fn create_sandbox(
             if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
                 return sandbox;
             }
-            log_requested_backend_unavailable(selected_backend_label(requested));
+            if matches!(requested, SandboxBackend::Docker)
+                && matches!(runtime_kind, RuntimeKind::Docker)
+            {
+                log_docker_sandbox_redundant_with_docker_runtime();
+            } else {
+                log_requested_backend_unavailable(selected_backend_label(requested));
+            }
             Arc::new(super::traits::NoopSandbox)
         }
     }
 }
 
-fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
+fn detect_best_sandbox(
+    runtime_kind: RuntimeKind,
+    workspace_dir: Option<&Path>,
+) -> Arc<dyn Sandbox> {
     let selected = detect_best_backend(runtime_kind, workspace_dir);
     if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
         log_auto_backend_selection(selected, runtime_kind);
@@ -376,14 +416,30 @@ fn log_requested_backend_unavailable(label: &'static str) {
     );
 }
 
-fn log_auto_backend_selection(selected: SelectedSandboxBackend, runtime_kind: &str) {
+fn log_docker_sandbox_redundant_with_docker_runtime() {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "Docker sandbox skipped: runtime.kind = \"docker\" already runs commands in a container; \
+         a nested Docker sandbox would double-wrap the command"
+    );
+}
+
+fn log_auto_backend_selection(selected: SelectedSandboxBackend, runtime_kind: RuntimeKind) {
     match selected {
         SelectedSandboxBackend::None => {
-            if runtime_kind == "native" {
+            if matches!(runtime_kind, RuntimeKind::Native) {
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                     "Docker sandbox skipped: runtime.kind = \"native\" overrides auto-detection"
+                );
+            } else if matches!(runtime_kind, RuntimeKind::Docker) {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Docker sandbox skipped: runtime.kind = \"docker\" already provides container isolation"
                 );
             }
             ::zeroclaw_log::record!(
@@ -471,7 +527,7 @@ mod tests {
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox("", None);
+        let sandbox = detect_best_sandbox(RuntimeKind::Cloudflare, None);
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -483,7 +539,7 @@ mod tests {
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
+        let sandbox = create_sandbox(&sandbox_cfg, RuntimeKind::Cloudflare, None);
         assert_eq!(sandbox.name(), "none");
     }
 
@@ -494,7 +550,7 @@ mod tests {
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
         };
-        let posture = sandbox_posture(&sandbox_cfg, "", None);
+        let posture = sandbox_posture(&sandbox_cfg, RuntimeKind::Cloudflare, None);
         assert_eq!(posture.requested_backend, "none");
         assert_eq!(posture.active_backend, "none");
         assert!(!posture.fallback);
@@ -507,7 +563,7 @@ mod tests {
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
+        let sandbox = create_sandbox(&sandbox_cfg, RuntimeKind::Cloudflare, None);
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
     }
@@ -517,7 +573,7 @@ mod tests {
         // When runtime.kind = "native", Docker must be skipped in auto-detection
         // even when Docker is installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox("native", None);
+        let sandbox = detect_best_sandbox(RuntimeKind::Native, None);
         assert_ne!(sandbox.name(), "docker");
     }
 
@@ -528,7 +584,7 @@ mod tests {
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let posture = sandbox_posture(&sandbox_cfg, "native", None);
+        let posture = sandbox_posture(&sandbox_cfg, RuntimeKind::Native, None);
         assert_ne!(posture.active_backend, "docker");
     }
 
@@ -539,8 +595,8 @@ mod tests {
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
-        let posture = sandbox_posture(&sandbox_cfg, "native", None);
+        let sandbox = create_sandbox(&sandbox_cfg, RuntimeKind::Native, None);
+        let posture = sandbox_posture(&sandbox_cfg, RuntimeKind::Native, None);
 
         assert_eq!(posture.active_backend, sandbox.name());
     }
@@ -554,9 +610,80 @@ mod tests {
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
+        let sandbox = create_sandbox(&sandbox_cfg, RuntimeKind::Native, None);
         // If Docker is available, it will be selected; if not, NoopSandbox fallback.
         assert!(sandbox.is_available());
+    }
+
+    #[test]
+    fn docker_runtime_auto_selection_skips_available_docker_backend() {
+        let selected = detect_best_backend_with(RuntimeKind::Docker, |backend| {
+            matches!(backend, SelectedSandboxBackend::Docker)
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::None);
+    }
+
+    #[test]
+    fn native_runtime_auto_selection_skips_available_docker_backend() {
+        let selected = detect_best_backend_with(RuntimeKind::Native, |backend| {
+            matches!(backend, SelectedSandboxBackend::Docker)
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::None);
+    }
+
+    #[test]
+    fn non_docker_runtime_auto_selection_can_use_available_docker_backend() {
+        let selected = detect_best_backend_with(RuntimeKind::Cloudflare, |backend| {
+            matches!(backend, SelectedSandboxBackend::Docker)
+        });
+
+        assert_eq!(selected, SelectedSandboxBackend::Docker);
+    }
+
+    #[test]
+    fn explicit_docker_backend_falls_back_on_docker_runtime() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Docker,
+            firejail_args: Vec::new(),
+        };
+
+        let sandbox = create_sandbox(&sandbox_cfg, RuntimeKind::Docker, None);
+
+        assert_eq!(sandbox.name(), "none");
+    }
+
+    #[test]
+    fn explicit_docker_posture_reports_fallback_on_docker_runtime() {
+        let sandbox_cfg = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Docker,
+            firejail_args: Vec::new(),
+        };
+
+        let posture = sandbox_posture(&sandbox_cfg, RuntimeKind::Docker, None);
+
+        assert_eq!(posture.requested_backend, "docker");
+        assert_eq!(posture.active_backend, "none");
+        assert!(posture.fallback);
+    }
+
+    #[test]
+    fn only_docker_sandbox_conflicts_with_docker_runtime() {
+        assert!(!sandbox_backend_compatible_with_runtime(
+            SelectedSandboxBackend::Docker,
+            RuntimeKind::Docker,
+        ));
+        assert!(sandbox_backend_compatible_with_runtime(
+            SelectedSandboxBackend::Docker,
+            RuntimeKind::Native,
+        ));
+        assert!(sandbox_backend_compatible_with_runtime(
+            SelectedSandboxBackend::SandboxExec,
+            RuntimeKind::Docker,
+        ));
     }
 
     #[test]
