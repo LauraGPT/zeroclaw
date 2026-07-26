@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::sync::{Mutex, MutexGuard};
 use zeroclaw_api::tool::Tool;
 use zeroclaw_config::platform::DockerRuntime;
 use zeroclaw_config::schema::{Config, RuntimeKind};
@@ -50,11 +51,8 @@ impl Drop for EnvGuard {
     }
 }
 
-fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+async fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await
 }
 
 fn write_fake_docker(bin_dir: &Path) {
@@ -74,7 +72,7 @@ fn write_fake_docker(bin_dir: &Path) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn config_loaded_docker_runtime_executes_one_docker_run_through_shell_tool() {
-    let _env_lock = env_lock();
+    let _env_lock = env_lock().await;
     let install = TempDir::new().expect("create isolated install");
     let bin_dir = install.path().join("bin");
     write_fake_docker(&bin_dir);
