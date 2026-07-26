@@ -434,20 +434,28 @@ the cranelift compiler is in the build, not off pulley.
 
 ### Per-call execution limits
 
-Every plugin call runs under per-call resource limits the host applies to the
+Every guest export runs under per-call resource limits the host applies to the
 store. The engine enables fuel metering, and each call is given a fresh fuel
-budget so a runaway or malicious component traps instead of hanging the host. A
+budget so a runaway or malicious component traps instead of hanging the host.
+The host also applies a wall-clock deadline around the complete export future,
+including time awaiting async host imports such as `wasi:http`; periodic fuel
+yields ensure uninterrupted guest computation cannot starve that timer. A
 `StoreLimits` ceiling bounds linear memory, table elements, and instance count.
 The tool world gets a fresh store per execute; the warm channel and memory
 stores are refueled before each call so a long-lived plugin gets a fresh budget
 rather than draining over its lifetime.
 
-The four bounds are operator-tunable and every value is validated as non-zero:
+The five bounds are operator-tunable and every value is validated as non-zero:
 `plugins.limits.call_fuel` (default 1,000,000,000 instruction units),
+`plugins.limits.call_timeout_ms` (default 30,000 milliseconds),
 `plugins.limits.max_memory_mb` (default 256), `plugins.limits.max_table_elements`
 (default 100,000), and `plugins.limits.max_instances` (default 64). A store can
 only be built with explicit limits, so no load path can construct an
-unsandboxed plugin. The canonical fields and defaults live in the
+unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
+cannot extend the host deadline. An interrupted warm store is never resumed:
+channels recreate it from host-owned inputs on the next call, while memory
+instances remain unavailable until their owner rebuilds them. The canonical
+fields and defaults live in the
 [Config reference](../reference/index.md).
 
 ### 32-bit address space (wasip2 is wasm32)

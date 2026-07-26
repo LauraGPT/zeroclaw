@@ -2,6 +2,8 @@
 
 #[cfg(target_family = "wasm")]
 mod component {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     wit_bindgen::generate!({
         path: "../../../../../wit/v0",
         world: "channel-plugin",
@@ -15,6 +17,7 @@ mod component {
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
 
     struct FixtureChannel;
+    static HTTP_CALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
     impl PluginInfo for FixtureChannel {
         fn plugin_name() -> String {
@@ -35,7 +38,18 @@ mod component {
             Ok(())
         }
 
-        fn send(_message: SendMessage) -> Result<(), String> {
+        fn send(message: SendMessage) -> Result<(), String> {
+            if message.content.starts_with("http://") {
+                if HTTP_CALL_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+                    return Err("interrupted channel instance was resumed".to_string());
+                }
+                waki::Client::new()
+                    .get(&message.content)
+                    .send()
+                    .and_then(waki::Response::body)
+                    .map_err(|error| error.to_string())?;
+                HTTP_CALL_IN_FLIGHT.store(false, Ordering::SeqCst);
+            }
             Ok(())
         }
 

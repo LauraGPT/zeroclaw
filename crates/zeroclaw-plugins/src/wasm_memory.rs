@@ -9,7 +9,10 @@ use crate::component::bindings::memory::exports::zeroclaw::plugin::memory::{
     MemoryCategory as WitMemoryCategory, MemoryEntry as WitMemoryEntry,
     ProceduralMessage as WitProceduralMessage,
 };
-use crate::component::{PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt};
+use crate::component::{
+    PluginState, PluginStoreSpec, WarmPluginState, call_plugin, call_store, engine, load_component,
+    wt,
+};
 use crate::instance::PluginInstanceScope;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -27,7 +30,7 @@ use zeroclaw_api::memory_traits::{
 pub struct WasmMemory {
     scope: PluginInstanceScope,
     capabilities: MemoryCapabilities,
-    state: Arc<Mutex<(Store<PluginState>, MemoryPlugin)>>,
+    state: Arc<Mutex<WarmPluginState<MemoryPlugin>>>,
 }
 
 impl Attributable for WasmMemory {
@@ -69,21 +72,25 @@ impl WasmMemory {
         let mut store = crate::component::new_store(PluginStoreSpec::new(scope.clone(), limits));
         let linker = linker()?;
         crate::component::ensure_http_coherent(&store, false)?;
-        let bindings = wt(
-            MemoryPlugin::instantiate_async(&mut store, &component, &linker).await,
-            "failed to instantiate memory plugin",
-        )?;
-        let capabilities = wt(
-            bindings
-                .zeroclaw_plugin_memory()
-                .call_get_memory_capabilities(&mut store)
-                .await,
-            "memory.get-memory-capabilities failed",
-        )?;
+        let bindings = call_store!(store, async |store: &mut Store<PluginState>| {
+            wt(
+                MemoryPlugin::instantiate_async(store, &component, &linker).await,
+                "failed to instantiate memory plugin",
+            )
+        })?;
+        let capabilities = call_store!(store, async |store: &mut Store<PluginState>| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_memory()
+                    .call_get_memory_capabilities(store)
+                    .await,
+                "memory.get-memory-capabilities failed",
+            )
+        })?;
         Ok(Self {
             scope,
             capabilities,
-            state: Arc::new(Mutex::new((store, bindings))),
+            state: Arc::new(Mutex::new(Some((store, bindings)))),
         })
     }
 }

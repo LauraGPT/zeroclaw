@@ -9,9 +9,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use zeroclaw_api::attribution::Attributable;
 use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_plugins::component::{HostInboundMessage, PluginLimits};
@@ -56,11 +58,16 @@ fn fixture() -> PathBuf {
 }
 
 fn limits() -> PluginLimits {
+    limits_with_timeout(Duration::from_secs(30))
+}
+
+fn limits_with_timeout(call_timeout: Duration) -> PluginLimits {
     PluginLimits {
         call_fuel: 1_000_000_000,
         max_memory_bytes: 64 * 1024 * 1024,
         max_table_elements: 10_000,
         max_instances: 32,
+        call_timeout,
     }
 }
 
@@ -72,18 +79,53 @@ async fn channel(binding: &str) -> WasmChannel {
         author: None,
         wasm_path: Some("channel-fixture.wasm".to_string()),
         capabilities: vec![PluginCapability::Channel],
-        permissions: vec![],
+        permissions: vec![zeroclaw_plugins::PluginPermission::HttpClient],
         signature: None,
         publisher_key: None,
     };
-    let scope =
-        PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, binding, [])
-            .expect("admit fixture scope");
+    let scope = PluginInstanceScope::from_manifest(
+        &manifest,
+        PluginCapability::Channel,
+        binding,
+        manifest.permissions.iter().copied(),
+    )
+    .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
 
     WasmChannel::from_wasm(endpoint, &fixture(), &HashMap::new(), limits())
         .await
         .expect("instantiate fixture channel")
+}
+
+async fn channel_with_timeout(binding: &str, timeout: Duration) -> WasmChannel {
+    let manifest = PluginManifest {
+        name: "channel-fixture".to_string(),
+        version: "0.0.0".to_string(),
+        description: None,
+        author: None,
+        wasm_path: Some("channel-fixture.wasm".to_string()),
+        capabilities: vec![PluginCapability::Channel],
+        permissions: vec![zeroclaw_plugins::PluginPermission::HttpClient],
+        signature: None,
+        publisher_key: None,
+    };
+    let scope = PluginInstanceScope::from_manifest(
+        &manifest,
+        PluginCapability::Channel,
+        binding,
+        manifest.permissions.iter().copied(),
+    )
+    .expect("admit fixture scope");
+    let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
+
+    WasmChannel::from_wasm(
+        endpoint,
+        &fixture(),
+        &HashMap::new(),
+        limits_with_timeout(timeout),
+    )
+    .await
+    .expect("instantiate fixture channel")
 }
 
 fn outbound() -> SendMessage {
@@ -161,4 +203,131 @@ async fn channel_listener_stops_when_receiver_closes() {
         .expect("listener observes receiver closure")
         .expect("listener task joins")
         .expect("listener exits cleanly");
+}
+
+#[tokio::test]
+async fn timed_out_channel_call_releases_lock_and_recreates_instance() {
+    let channel = channel_with_timeout("recreate", Duration::from_millis(500)).await;
+
+    let drip_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind drip server");
+    let drip_address = drip_listener.local_addr().expect("drip server address");
+    let drip_server = ::zeroclaw_spawn::spawn!(async move {
+        let (mut stream, _) = drip_listener.accept().await.expect("accept drip request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nx")
+            .await
+            .expect("write drip head");
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if stream.write_all(b"x").await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut dripping = outbound();
+    dripping.content = format!("http://{drip_address}/body");
+    let error = channel
+        .send(&dripping)
+        .await
+        .expect_err("dripping send must hit the host deadline");
+    assert!(
+        error.to_string().contains("wall-clock deadline"),
+        "unexpected error: {error:#}"
+    );
+    drip_server.abort();
+
+    let healthy_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind healthy server");
+    let healthy_address = healthy_listener
+        .local_addr()
+        .expect("healthy server address");
+    let healthy_server = ::zeroclaw_spawn::spawn!(async move {
+        let (mut stream, _) = healthy_listener
+            .accept()
+            .await
+            .expect("accept healthy request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .expect("write healthy response");
+    });
+    let mut healthy = outbound();
+    healthy.content = format!("http://{healthy_address}/body");
+    tokio::time::timeout(Duration::from_secs(2), channel.send(&healthy))
+        .await
+        .expect("recreated channel call is not stranded behind the old lock")
+        .expect("recreated channel handles a healthy request");
+    healthy_server.await.expect("healthy server task");
+}
+
+#[tokio::test]
+async fn externally_cancelled_channel_call_discards_store_and_recreates() {
+    let channel = Arc::new(channel_with_timeout("cancel", Duration::from_secs(5)).await);
+
+    let stalled_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled server");
+    let stalled_address = stalled_listener
+        .local_addr()
+        .expect("stalled server address");
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let stalled_server = ::zeroclaw_spawn::spawn!(async move {
+        let (mut stream, _) = stalled_listener
+            .accept()
+            .await
+            .expect("accept stalled request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await;
+        let _ = accepted_tx.send(());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let mut stalled = outbound();
+    stalled.content = format!("http://{stalled_address}/body");
+    let cancelled_channel = Arc::clone(&channel);
+    let call = ::zeroclaw_spawn::spawn!(async move { cancelled_channel.send(&stalled).await });
+    accepted_rx
+        .await
+        .expect("guest call reached the async HTTP host import");
+    call.abort();
+    assert!(
+        call.await
+            .expect_err("call task was aborted")
+            .is_cancelled(),
+        "external cancellation must drop the in-flight host call"
+    );
+    stalled_server.abort();
+
+    let healthy_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind post-cancel server");
+    let healthy_address = healthy_listener
+        .local_addr()
+        .expect("post-cancel server address");
+    let healthy_server = ::zeroclaw_spawn::spawn!(async move {
+        let (mut stream, _) = healthy_listener
+            .accept()
+            .await
+            .expect("accept post-cancel request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .expect("write post-cancel response");
+    });
+    let mut healthy = outbound();
+    healthy.content = format!("http://{healthy_address}/body");
+    tokio::time::timeout(Duration::from_secs(2), channel.send(&healthy))
+        .await
+        .expect("cancelled call released the channel lock")
+        .expect("fresh channel instance served the healthy call");
+    healthy_server.await.expect("post-cancel server task");
 }
