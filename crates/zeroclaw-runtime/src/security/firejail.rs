@@ -119,8 +119,6 @@ impl FirejailSandbox {
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
-        let current_dir = cmd.get_current_dir().map(std::path::Path::to_path_buf);
-
         // Build firejail wrapper with security flags
         let mut firejail_cmd = Command::new("firejail");
         firejail_cmd.args([
@@ -139,10 +137,6 @@ impl FirejailSandbox {
         // Add the original command
         firejail_cmd.arg(&program);
         firejail_cmd.args(&args);
-        if let Some(current_dir) = current_dir {
-            firejail_cmd.current_dir(current_dir);
-        }
-
         // Replace the command
         *cmd = firejail_cmd;
         Ok(())
@@ -349,17 +343,5 @@ mod tests {
             args.contains(&"/workspace".to_string()),
             "original args must be preserved"
         );
-    }
-
-    #[test]
-    fn firejail_wrap_command_preserves_current_dir() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sandbox = FirejailSandbox;
-        let mut cmd = Command::new("pwd");
-        cmd.current_dir(workspace.path());
-
-        sandbox.wrap_command(&mut cmd).unwrap();
-
-        assert_eq!(cmd.get_current_dir(), Some(workspace.path()));
     }
 }

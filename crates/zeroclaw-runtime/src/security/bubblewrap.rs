@@ -106,8 +106,6 @@ impl BubblewrapSandbox {
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
-        let current_dir = cmd.get_current_dir().map(std::path::Path::to_path_buf);
-
         let mut bwrap_cmd = Command::new("bwrap");
         bwrap_cmd.args([
             "--ro-bind",
@@ -140,10 +138,6 @@ impl BubblewrapSandbox {
         }
         bwrap_cmd.arg(&program);
         bwrap_cmd.args(&args);
-        if let Some(current_dir) = current_dir {
-            bwrap_cmd.current_dir(current_dir);
-        }
-
         *cmd = bwrap_cmd;
         Ok(())
     }
@@ -317,18 +311,6 @@ mod tests {
             args.contains(&"/tmp".to_string()),
             "original args must be preserved"
         );
-    }
-
-    #[test]
-    fn bubblewrap_wrap_command_preserves_current_dir() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sandbox = BubblewrapSandbox;
-        let mut cmd = Command::new("pwd");
-        cmd.current_dir(workspace.path());
-
-        sandbox.wrap_command(&mut cmd).unwrap();
-
-        assert_eq!(cmd.get_current_dir(), Some(workspace.path()));
     }
 
     #[test]
