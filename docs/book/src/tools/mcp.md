@@ -75,9 +75,12 @@ certificate-chain, expiry, and hostname verification remain enabled.
 
 A relative, missing, unreadable, empty, or invalid CA file is a hard connection
 error for that server. ZeroClaw never disables verification or silently falls
-back when this field is set. The value is applied when the MCP session starts;
-restart the affected session after changing it. Remove the field and restart
-the session to return to the default trust store. Stdio servers ignore it.
+back when this field is set. The configured server URL and any message endpoint
+advertised by an SSE server must use `https://`; plaintext URLs and downgrade
+redirects are rejected before request headers or content are sent. The value is
+applied when the MCP session starts; restart the affected session after changing
+it. Remove the field and restart the session to return to the default trust
+store. Stdio servers ignore it.
 
 ## Top-level fields
 

@@ -4985,7 +4985,9 @@ pub struct McpServerConfig {
     ///
     /// Certificate and hostname verification remain enabled. A missing,
     /// unreadable, empty, or invalid file is a hard connection error rather
-    /// than a fallback to the default trust store. Ignored by stdio.
+    /// than a fallback to the default trust store. When set, the configured
+    /// URL and any advertised SSE message endpoint must use HTTPS; plaintext
+    /// URLs and downgrade redirects are rejected. Ignored by stdio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca_cert_path: Option<String>,
 }

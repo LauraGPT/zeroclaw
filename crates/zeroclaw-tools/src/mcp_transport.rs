@@ -65,6 +65,18 @@ fn apply_request_timeout(
     }
 }
 
+fn require_https_url(server_name: &str, url: &str, target: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .with_context(|| format!("MCP server `{server_name}`: invalid {target} URL"))?;
+    if parsed.scheme() != "https" {
+        bail!(
+            "MCP server `{server_name}`: tls_ca_cert_path requires an HTTPS {target}; \
+             refusing plaintext transport"
+        );
+    }
+    Ok(())
+}
+
 /// Build the shared HTTP client for remote MCP transports.
 ///
 /// The optional server-specific CA is additive: system/default roots remain
@@ -73,6 +85,21 @@ fn build_remote_http_client(config: &McpServerConfig) -> Result<reqwest::Client>
     let mut builder = reqwest::Client::builder();
 
     if let Some(path) = config.tls_ca_cert_path.as_deref() {
+        let server_name = config.name.clone();
+        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error(std::io::Error::other(format!(
+                    "MCP server `{server_name}`: too many redirects"
+                )))
+            } else if attempt.url().scheme() == "https" {
+                attempt.follow()
+            } else {
+                attempt.error(std::io::Error::other(format!(
+                    "MCP server `{server_name}`: tls_ca_cert_path forbids redirecting to plaintext"
+                )))
+            }
+        }));
+
         if !std::path::Path::new(path).is_absolute() {
             bail!(
                 "MCP server `{}`: TLS CA certificate path must be absolute: `{}`",
@@ -331,6 +358,9 @@ impl HttpTransport {
             })?
             .clone();
 
+        if config.tls_ca_cert_path.is_some() {
+            require_https_url(&config.name, &url, "configured remote URL")?;
+        }
         let client = build_remote_http_client(config)?;
 
         Ok(Self {
@@ -479,6 +509,7 @@ pub struct SseTransport {
     tool_timeout_secs: Option<u64>,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
+    require_https: bool,
     stream_state: SseStreamState,
     shared: std::sync::Arc<Mutex<SseSharedState>>,
     notify: std::sync::Arc<Notify>,
@@ -506,6 +537,10 @@ impl SseTransport {
             })?
             .clone();
 
+        let require_https = config.tls_ca_cert_path.is_some();
+        if require_https {
+            require_https_url(&config.name, &sse_url, "configured remote URL")?;
+        }
         let client = build_remote_http_client(config)?;
 
         Ok(Self {
@@ -514,6 +549,7 @@ impl SseTransport {
             tool_timeout_secs: config.tool_timeout_secs,
             client,
             headers: config.headers.clone(),
+            require_https,
             stream_state: SseStreamState::Unknown,
             shared: std::sync::Arc::new(Mutex::new(SseSharedState::default())),
             notify: std::sync::Arc::new(Notify::new()),
@@ -969,6 +1005,9 @@ impl McpTransportConn for SseTransport {
             .chain(secondary_url)
             .enumerate()
         {
+            if self.require_https {
+                require_https_url(&self.server_name, &url, "SSE message endpoint")?;
+            }
             let has_accept = self
                 .headers
                 .keys()
@@ -1160,7 +1199,23 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
     }
 
+    fn test_ca_file() -> tempfile::NamedTempFile {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["ZeroClaw MCP test CA".into()]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), cert.pem()).unwrap();
+        file
+    }
+
     async fn spawn_test_tls_server() -> TestTlsServer {
+        spawn_test_tls_server_with_san("127.0.0.1").await
+    }
+
+    async fn spawn_test_tls_server_with_san(server_san: &str) -> TestTlsServer {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
         use rustls::pki_types::PrivatePkcs8KeyDer;
         use std::sync::Arc;
@@ -1173,7 +1228,7 @@ mod tests {
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
         let server_key = KeyPair::generate().unwrap();
-        let mut server_params = CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        let mut server_params = CertificateParams::new(vec![server_san.into()]).unwrap();
         server_params.is_ca = IsCa::NoCa;
         let server_cert = server_params
             .signed_by(&server_key, &ca_cert, &ca_key)
@@ -1257,6 +1312,62 @@ mod tests {
         };
         assert!(HttpTransport::new(&http).is_ok());
         assert!(SseTransport::new(&sse).is_ok());
+    }
+
+    #[test]
+    fn remote_transports_with_custom_ca_reject_plaintext_configured_url() {
+        let ca_file = test_ca_file();
+        for transport in [McpTransport::Http, McpTransport::Sse] {
+            let config = McpServerConfig {
+                name: "internal".into(),
+                transport,
+                url: Some("http://internal.example/mcp".into()),
+                tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            let error = create_transport(&config)
+                .err()
+                .expect("custom CA must reject a plaintext configured URL");
+            let message = error.to_string();
+            assert!(message.contains("internal"));
+            assert!(message.contains("requires an HTTPS configured remote URL"));
+            assert!(message.contains("refusing plaintext transport"));
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_ca_rejects_plaintext_endpoint_advertised_by_https_sse_stream() {
+        let ca_file = test_ca_file();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Sse,
+            url: Some("https://internal.example/sse".into()),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut transport = SseTransport::new(&config).expect("HTTPS SSE transport should build");
+
+        handle_sse_event(
+            &transport.server_name,
+            &transport.sse_url,
+            &transport.shared,
+            &transport.notify,
+            Some("endpoint"),
+            None,
+            "http://internal.example/messages".to_string(),
+        )
+        .await;
+        transport.stream_state = SseStreamState::Unsupported;
+
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+        let error = transport
+            .send_and_recv(&request)
+            .await
+            .expect_err("custom CA must reject a plaintext advertised endpoint");
+        let message = error.to_string();
+        assert!(message.contains("internal"));
+        assert!(message.contains("requires an HTTPS SSE message endpoint"));
+        assert!(message.contains("refusing plaintext transport"));
     }
 
     #[test]
@@ -1362,13 +1473,13 @@ mod tests {
         );
         server.task.await.unwrap();
 
-        let server = spawn_test_tls_server().await;
+        let server = spawn_test_tls_server_with_san("wrong.example").await;
         let ca_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(ca_file.path(), &server.ca_pem).unwrap();
         let config = McpServerConfig {
             name: "internal".into(),
             transport: McpTransport::Http,
-            url: Some(server.url.replace("127.0.0.1", "localhost")),
+            url: Some(server.url),
             tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
             ..Default::default()
         };
