@@ -145,7 +145,7 @@ fn is_integration_test_matches_tests_component_regardless_of_separator() {
 /// persist call, and assert a violation is emitted. This pins the behavior the
 /// gate ships — if the scan were later disconnected from `is_integration_test`
 /// or regressed to rendered-path matching, this fails, closing the fail-open
-/// window from #9238 that a classifier-only test could not catch. The path is
+/// window that a classifier-only test could not catch. The path is
 /// built from single components (never an embedded separator) so it cannot
 /// pass by matching a hardcoded `/` or `\`.
 #[test]
