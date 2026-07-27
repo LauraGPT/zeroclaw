@@ -40,6 +40,22 @@ pub enum BuiltinCommandId {
     Goal,
 }
 
+impl BuiltinCommandId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Help => "help",
+            Self::Clear => "clear",
+            Self::New => "new",
+            Self::Stop => "stop",
+            Self::Model => "model",
+            Self::Models => "models",
+            Self::Config => "config",
+            Self::Thinking => "thinking",
+            Self::Goal => "goal",
+        }
+    }
+}
+
 /// Where command execution is owned today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

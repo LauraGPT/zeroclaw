@@ -461,10 +461,11 @@ impl Chat {
         match result {
             Ok(session) => {
                 let resumed_sid = resume.as_deref().map(|_| session.session_id.clone());
-                let mut state = ChatState::new(
+                let mut state = ChatState::with_shared_commands(
                     session.session_id,
                     agent_alias.to_string(),
                     self.todo_settings,
+                    self.rpc.commands(),
                 );
                 state.cwd = session.workspace_dir;
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
@@ -5223,10 +5224,20 @@ pub struct ChatState {
 }
 
 impl ChatState {
+    #[cfg(test)]
     pub fn new(
         session_id: String,
         agent_alias: String,
         todo_settings: crate::todo_tracker::TodoTrackerSettings,
+    ) -> Self {
+        Self::with_shared_commands(session_id, agent_alias, todo_settings, &[])
+    }
+
+    fn with_shared_commands(
+        session_id: String,
+        agent_alias: String,
+        todo_settings: crate::todo_tracker::TodoTrackerSettings,
+        commands: &[crate::wire::CommandDescriptor],
     ) -> Self {
         Self {
             session_id,
@@ -5239,7 +5250,7 @@ impl ChatState {
             first_message: None,
             git_hash: None,
             git_branch_last_fetch: None,
-            input_bar: InputBarState::new(),
+            input_bar: InputBarState::with_shared_commands(commands),
             entries: Vec::new(),
             streaming_text: String::new(),
             streaming_thought: String::new(),

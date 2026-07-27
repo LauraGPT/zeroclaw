@@ -476,6 +476,7 @@ struct InitializeResponse {
     server_version: String,
     tui_id: Option<String>,
     tui_sig: Option<String>,
+    commands: Vec<crate::wire::CommandDescriptor>,
 }
 
 fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
@@ -495,6 +496,12 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
             .get("tui_sig")
             .and_then(Value::as_str)
             .map(String::from),
+        commands: serde_json::from_value(
+            resp.get("commands")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+        )
+        .context("invalid command descriptors in initialize response")?,
     })
 }
 
@@ -587,6 +594,9 @@ pub struct RpcClient {
     pub tui_sig: Option<String>,
     /// Transport protocol of this connection.
     transport: Transport,
+    /// Shared TUI command metadata received from the daemon's canonical
+    /// command catalogue during initialization.
+    commands: Vec<crate::wire::CommandDescriptor>,
 }
 
 impl RpcClient {
@@ -718,6 +728,7 @@ impl RpcClient {
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Local,
+            commands: init.commands,
         })
     }
 
@@ -866,6 +877,7 @@ impl RpcClient {
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Wss,
+            commands: init.commands,
         })
     }
 
@@ -1655,6 +1667,10 @@ impl RpcClient {
         self.tui_sig.as_deref()
     }
 
+    pub fn commands(&self) -> &[crate::wire::CommandDescriptor] {
+        &self.commands
+    }
+
     /// List all connected TUI sessions from the daemon registry.
     pub async fn tui_list(&self) -> Result<TuiListResult> {
         self.call(method::TUI_LIST, serde_json::json!({})).await
@@ -1695,6 +1711,7 @@ impl RpcClient {
             tui_id: None,
             tui_sig: None,
             transport: Transport::Local,
+            commands: Vec::new(),
         }
     }
 
@@ -1733,6 +1750,29 @@ mod initialize_version_tests {
         assert_eq!(parsed.server_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
         assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
+        assert!(parsed.commands.is_empty());
+    }
+
+    #[test]
+    fn initialize_response_parses_command_descriptors() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": [{
+                "id": "new",
+                "name": "new",
+                "aliases": ["new-session"]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            parsed.commands,
+            vec![crate::wire::CommandDescriptor {
+                id: "new".into(),
+                name: "new".into(),
+                aliases: vec!["new-session".into()],
+            }]
+        );
     }
 
     #[test]
