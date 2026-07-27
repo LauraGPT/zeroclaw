@@ -129,6 +129,9 @@ pub(crate) struct Chat {
     /// Guards the one-shot `[todotracker]` config fetch so it doesn't
     /// repeat on every session start.
     todo_settings_loaded: bool,
+    /// One-shot app-level Help request, set by the `/help` slash command and
+    /// drained immediately by `app.rs` after this pane handles the key.
+    help_requested: bool,
     deferred_elicitations: Vec<DeferredInboundRequest>,
 }
 
@@ -202,6 +205,7 @@ impl Chat {
             session_list_double_click: crate::mouse::DoubleClickTracker::new(),
             todo_settings: crate::todo_tracker::TodoTrackerSettings::default(),
             todo_settings_loaded: false,
+            help_requested: false,
             deferred_elicitations: Vec::new(),
         }
     }
@@ -462,10 +466,7 @@ impl Chat {
                     agent_alias.to_string(),
                     self.todo_settings,
                 );
-                // Only ACP shows the working directory above the input bar.
-                if self.pane_kind == PaneKind::Acp {
-                    state.cwd = session.workspace_dir;
-                }
+                state.cwd = session.workspace_dir;
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
@@ -559,9 +560,7 @@ impl Chat {
                 let old_session_id = state.session_id.clone();
                 let _ = rpc.session_close(&old_session_id).await;
                 state.reset_for_session(s.session_id, None);
-                if pane_kind == PaneKind::Acp {
-                    state.cwd = s.workspace_dir;
-                }
+                state.cwd = s.workspace_dir;
                 Self::refresh_model_identity(rpc, state).await;
                 state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
             }
@@ -968,7 +967,7 @@ impl Chat {
                 explorer.render(frame, area);
             }
             ChatPhase::Active(state) => {
-                render(frame, state, area);
+                render(frame, state, area, self.pane_kind);
             }
             ChatPhase::Error(msg) => {
                 draw_error(frame, area, msg, &self.pane_kind.name());
@@ -1422,6 +1421,14 @@ impl Chat {
                     state.mark_dirty_append();
                     return false;
                 }
+                InputBarAction::EnterBrowseMode => {
+                    state.enter_browse_mode();
+                    return false;
+                }
+                InputBarAction::OpenHelp => {
+                    self.help_requested = true;
+                    return false;
+                }
                 InputBarAction::ClearQueue(idx) => {
                     let notice = state.clear_queue_cmd(idx);
                     state.set_info_notice(notice);
@@ -1806,9 +1813,7 @@ impl Chat {
         state.session_overlay = SessionOverlay::None;
         state.reset_for_session(new_sid.clone(), new_name);
         state.agent_alias = agent_alias.clone();
-        if pane_kind == PaneKind::Acp {
-            state.cwd = rehydrated.workspace_dir;
-        }
+        state.cwd = rehydrated.workspace_dir;
 
         Self::refresh_model_identity(rpc, state).await;
         if let Ok(msgs) = rpc.session_messages(&new_sid).await {
@@ -2512,6 +2517,14 @@ impl Chat {
         }
     }
 
+    /// Working directory for the active conversation, if a session is running.
+    pub(crate) fn current_cwd(&self) -> Option<&str> {
+        match &self.phase {
+            ChatPhase::Active(s) => s.cwd.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Active info-bar message for the app-level `InfoBar`, expiring it first if
     /// it has outlived [`crate::widgets::INFO_BAR_TTL`] so the bar auto-hides.
     pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
@@ -2554,6 +2567,10 @@ impl Chat {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn take_help_request(&mut self) -> bool {
+        std::mem::take(&mut self.help_requested)
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
@@ -2969,7 +2986,7 @@ fn carve_todo_area(tracker: &crate::todo_tracker::TodoTracker, area: Rect) -> (R
     }
 }
 
-fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
+fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind) {
     // Carve the TodoWrite tracker's area first (outermost split), so the
     // rest of the pane (queue sidebar, transcript, input) lays out in the
     // remaining body. When the tracker wants no space, `body == area` and
@@ -3025,7 +3042,9 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // Optional CWD line just above the input bar (bottom of conv_area).
     // Renders `<cwd> - (branch) (hash)`, all left-aligned; the branch and hash
     // segments are appended only when the daemon's git poll has resolved them.
-    let actual_conv = if let Some(ref cwd) = state.cwd {
+    let actual_conv = if pane_kind == PaneKind::Acp
+        && let Some(ref cwd) = state.cwd
+    {
         if conv_area.height > 1 {
             let cwd_row = Rect::new(
                 conv_area.x,
@@ -6940,7 +6959,7 @@ mod tests {
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
-            .draw(|frame| render(frame, &mut state, area))
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
             .expect("draw chat");
 
         let snapshot = state
@@ -8243,7 +8262,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render(frame, &mut state, area);
+                render(frame, &mut state, area, PaneKind::Chat);
             })
             .expect("draw chat");
 
@@ -8294,7 +8313,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render(frame, &mut state, area);
+                render(frame, &mut state, area, PaneKind::Chat);
             })
             .expect("draw chat");
 
@@ -8365,7 +8384,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render(frame, &mut state, area);
+                render(frame, &mut state, area, PaneKind::Chat);
             })
             .expect("draw chat");
 
@@ -8406,7 +8425,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render(frame, state, area);
+                render(frame, state, area, PaneKind::Chat);
             })
             .expect("redraw browse-mode chat");
         let selected_entry_rect = state
@@ -8489,7 +8508,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render(frame, &mut state, area);
+                render(frame, &mut state, area, PaneKind::Chat);
             })
             .expect("draw chat");
         let entry_rect = state
@@ -8578,7 +8597,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| {
-                render(frame, &mut state, area);
+                render(frame, &mut state, area, PaneKind::Chat);
             })
             .expect("draw chat");
 
