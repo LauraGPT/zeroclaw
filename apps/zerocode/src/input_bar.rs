@@ -16,7 +16,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
-use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
@@ -29,6 +28,29 @@ use crate::turn_status::TurnStatus;
 
 /// Maximum number of visible content rows before the input bar scrolls.
 const MAX_INPUT_ROWS: u16 = 5;
+
+/// Names (and aliases) the shared `zeroclaw-commands` catalogue advertises
+/// on its `Tui` surface. ZeroCode is an RPC-only front end and MUST NOT
+/// link the `zeroclaw-commands` backend crate (enforced by
+/// `scripts/ci/zerocode_no_zeroclaw_dep_gate.sh`), so it cannot call
+/// `commands_for_surface(CommandSurface::Tui)` directly. Instead we mirror
+/// that surface's names here as the RPC-side contract.
+///
+/// Parity is guarded from the crate side: `zeroclaw-commands`'
+/// `tui_surface_advertises_help_model_and_new_only` test pins the Tui
+/// surface to exactly `{help, new (alias new-session), model}`. If that
+/// set changes, this list must be updated to match — the assertion in
+/// `derived_slash_command_set_matches_expected_twelve_entries` fails loudly
+/// if the union below drifts from the expected advertised set.
+const CATALOGUE_TUI_COMMANDS: &[&str] = &[
+    // `help` (no aliases)
+    "help",
+    // `new` and its `new-session` alias
+    "new",
+    "new-session",
+    // `model` (no aliases)
+    "model",
+];
 
 /// TUI-only slash commands: no channel/runtime counterpart exists in the
 /// shared `zeroclaw-commands` catalogue, so they have nothing to compose
@@ -51,8 +73,9 @@ const TUI_ONLY_COMMANDS: &[&str] = &[
 /// from this list, so the set ZeroCode advertises and the set it recognizes
 /// can never drift apart.
 static SLASH_COMMANDS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    let mut names: Vec<String> = commands_for_surface(CommandSurface::Tui)
-        .flat_map(|spec| std::iter::once(spec.name).chain(spec.aliases.iter().copied()))
+    let mut names: Vec<String> = CATALOGUE_TUI_COMMANDS
+        .iter()
+        .copied()
         .chain(TUI_ONLY_COMMANDS.iter().copied())
         .map(|name| format!("/{name}"))
         .collect();
