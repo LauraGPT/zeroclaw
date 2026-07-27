@@ -20869,7 +20869,15 @@ impl Config {
         // helper `ensure_map_key_for_prop_path` (src/main.rs) uses: never gate
         // this on the earlier `get_map_keys` pre-check, or a bogus tail field
         // on an already-existing alias would delete a legitimate config entry.
-        if matches!(self.create_map_key(section, alias), Ok(true)) && self.get_prop(path).is_err() {
+        if matches!(self.create_map_key(section, alias), Ok(true))
+            && self.get_prop(path).is_err()
+            // A missing entry under a dynamic secret map is a valid first
+            // write, not an unknown schema tail. `get_prop` can only read
+            // keys that already exist, while the generated `set_prop`
+            // intentionally inserts them. The static secret classifier
+            // recognizes the map prefix without requiring the key to exist.
+            && !Self::prop_is_secret(path)
+        {
             let _ = self.delete_map_key(section, alias);
         }
         false
@@ -33648,6 +33656,29 @@ api_key = "op://zeroclaw/provider/openai-api-key"
                 .get_map_keys("providers.models.anthropic")
                 .is_some_and(|keys| keys.iter().any(|k| k == "default")),
             "a pre-existing alias must never be deleted for a typo'd tail field"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_preserves_first_dynamic_secret_map_write() {
+        let mut config = Config::default();
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo";
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        config
+            .set_prop(path, "bar")
+            .expect("a new dynamic secret-map key must be insertable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Foo"))
+                .map(String::as_str),
+            Some("bar")
         );
     }
 
