@@ -18,7 +18,8 @@ use crate::mcp_prompt::{McpGetPromptResult, McpPromptsListResult};
 use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
 use crate::mcp_resource::{McpResourceContents, McpResourcesListResult};
 use crate::mcp_transport::{
-    McpRequestLifecycle, McpTransportError, SharedMcpTransportConn, create_shared_transport,
+    McpRecoveryGate, McpRequestLifecycle, McpTransportError, SharedMcpTransportConn,
+    create_shared_transport,
 };
 use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 
@@ -237,6 +238,16 @@ impl RecoveryBarrier {
     }
 }
 
+impl McpRecoveryGate for RecoveryBarrier {
+    fn arm(&self, epoch: u64) {
+        RecoveryBarrier::arm(self, epoch);
+    }
+
+    fn write_blocked(&self) -> bool {
+        self.is_poisoned() || self.recovery_pending()
+    }
+}
+
 /// RAII guard that arms the recovery barrier synchronously if a write's outcome
 /// became unknown, at the moment its `send_request` future completes or is
 /// cancelled. Held under the serial gate and dropped before it, so a queued
@@ -428,38 +439,49 @@ impl McpServer {
         request: &JsonRpcRequest,
         lifecycle: &McpRequestLifecycle,
     ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
-        // Fail closed / wait for recovery before touching the write path. A
-        // request whose outcome became unknown publishes the recovery-needed
-        // state synchronously, so any writer that reaches here after that point
-        // must not POST/write on the ambiguous session until reset +
-        // re-handshake succeed.
-        self.wait_recovery_ready().await?;
-        let serial_guard = match &self.serial_gate {
-            Some(gate) => Some(gate.lock().await),
-            None => None,
-        };
-        // Re-check under the serial gate. A concurrent HTTP/SSE writer may have
-        // been queued on this gate when the outcome-unknown state was armed;
-        // acquiring the gate serializes us behind it, so this second check
-        // guarantees we never write on a session that still needs recovery.
-        if self.recovery.is_poisoned() || self.recovery.recovery_pending() {
-            drop(serial_guard);
+        loop {
+            // Fail closed / wait for recovery before touching the write path. A
+            // request whose outcome became unknown publishes the recovery-needed
+            // state synchronously, so any writer that reaches here after that point
+            // must not POST/write on the ambiguous session until reset +
+            // re-handshake succeed.
             self.wait_recovery_ready().await?;
-            return Box::pin(self.send_request(request, lifecycle)).await;
+            let serial_guard = match &self.serial_gate {
+                Some(gate) => Some(gate.lock().await),
+                None => None,
+            };
+            // Re-check under the serial gate. A concurrent HTTP/SSE writer may have
+            // been queued on this gate when the outcome-unknown state was armed;
+            // acquiring the gate serializes us behind it, so this second check
+            // guarantees we never write on a session that still needs recovery.
+            if self.recovery.is_poisoned() || self.recovery.recovery_pending() {
+                drop(serial_guard);
+                continue;
+            }
+            // Arm the recovery barrier synchronously the instant this write's
+            // outcome becomes unknown — *before* the serial gate is released.
+            // Declared after `serial_guard` so it drops first: the next queued
+            // writer therefore observes the armed barrier under the gate and waits,
+            // instead of racing onto the ambiguous session.
+            let barrier_arm = WriteBarrierArm {
+                recovery: &self.recovery,
+                lifecycle,
+            };
+            let result = self.transport.send_and_recv(request, lifecycle).await;
+            drop(barrier_arm);
+            drop(serial_guard);
+
+            if matches!(
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.downcast_ref::<McpTransportError>()),
+                Some(McpTransportError::RecoveryPending)
+            ) {
+                continue;
+            }
+            return result;
         }
-        // Arm the recovery barrier synchronously the instant this write's
-        // outcome becomes unknown — *before* the serial gate is released.
-        // Declared after `serial_guard` so it drops first: the next queued
-        // writer therefore observes the armed barrier under the gate and waits,
-        // instead of racing onto the ambiguous session.
-        let barrier_arm = WriteBarrierArm {
-            recovery: &self.recovery,
-            lifecycle,
-        };
-        let result = self.transport.send_and_recv(request, lifecycle).await;
-        drop(barrier_arm);
-        drop(serial_guard);
-        result
     }
 
     /// Block until no recovery is pending, or fail closed if recovery has
@@ -606,9 +628,11 @@ impl McpServer {
                 )
             };
             let request = JsonRpcRequest::new(id, rpc_method, params.clone());
-            let lifecycle = Arc::new(McpRequestLifecycle::coordinated(Arc::clone(
-                &self.epoch_gate,
-            )));
+            let recovery_gate: Arc<dyn McpRecoveryGate> = self.recovery.clone();
+            let lifecycle = Arc::new(McpRequestLifecycle::coordinated(
+                Arc::clone(&self.epoch_gate),
+                Some(recovery_gate),
+            ));
             let mut cancellation_guard = OutcomeUnknownGuard::new(
                 self.clone(),
                 Arc::clone(&lifecycle),
@@ -1370,7 +1394,7 @@ impl McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp_transport::create_transport;
+    use crate::mcp_transport::{StdioTransport, StdioWriteTestHook, create_transport};
     use zeroclaw_config::schema::McpTransport;
 
     #[cfg(unix)]
@@ -2065,9 +2089,9 @@ mod tests {
         }
     }
 
-    /// Blocker #1 regression: a second call queued while the first call's
-    /// outcome is unknown must wait for reset + re-handshake and must never
-    /// write on the ambiguous session before recovery completes.
+    /// A second serialized call queued while the first call's outcome is
+    /// unknown must wait for reset + re-handshake and must never write on the
+    /// ambiguous session before recovery completes.
     #[tokio::test]
     async fn queued_write_waits_for_recovery_after_outcome_unknown() {
         let tool_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2147,9 +2171,9 @@ mod tests {
         }
     }
 
-    /// Blocker #1 regression: after a post-write outcome-unknown request whose
-    /// recovery re-handshake fails, later calls must fail closed instead of
-    /// writing on an unrecovered/unhandshaken session.
+    /// After a post-write outcome-unknown request whose recovery re-handshake
+    /// fails, later calls must fail closed instead of writing on an
+    /// unrecovered/unhandshaken session.
     #[tokio::test]
     async fn failed_rehandshake_fails_closed_for_later_calls() {
         let tool_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2628,6 +2652,141 @@ done
             .await
             .expect("fresh child should accept subsequent call");
         assert_eq!(result, json!({"ok":true}));
+    }
+
+    /// A stdio writer already queued on the transport state must re-check a
+    /// recovery published by the cancelled writer before emitting any bytes.
+    /// This exercises the real stdio boundary without an HTTP/SSE serial gate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_queued_writer_waits_for_recovery_at_writer_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script_path = temp.path().join("queued-writer-mcp.sh");
+        let requests = temp.path().join("requests.log");
+        let generations = temp.path().join("generations.log");
+        write_executable_script(
+            &script_path,
+            br#"#!/bin/sh
+printf '%s\n' "$$" >> "$2"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$1"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"queued-writer\",\"version\":\"1\"}}}"
+      ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"ok\":true}}"
+      ;;
+  esac
+done
+"#,
+        );
+
+        let config = stdio_test_config(
+            "queued-writer",
+            &script_path,
+            vec![
+                requests.display().to_string(),
+                generations.display().to_string(),
+            ],
+            5,
+        );
+        let transport = Arc::new(StdioTransport::new(&config).expect("build transport"));
+        let hook = Arc::new(StdioWriteTestHook::new());
+        hook.pause_next_payload();
+        transport.set_write_test_hook(Arc::clone(&hook));
+        let shared_transport: Arc<dyn SharedMcpTransportConn> = transport.clone();
+        let server = server_with_transport("queued-writer", shared_transport, 5);
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::fs::read_to_string(&generations)
+                    .await
+                    .is_ok_and(|log| log.lines().count() == 1)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial stdio child did not start");
+
+        // Pause the first request after its JSON payload has crossed the OS
+        // stdin boundary but before newline/flush completes. `state` remains
+        // locked and the request outcome is unknown.
+        let first_server = server.clone();
+        let first = zeroclaw_spawn::spawn!(async move {
+            first_server.call_tool("side_effect", json!({})).await
+        });
+        timeout(Duration::from_secs(3), hook.wait_for_payload_pause())
+            .await
+            .expect("first stdio write did not reach the post-payload pause");
+
+        // Enter a second call before cancellation and prove it reached the
+        // transport, where it is queued on the same stdio state lock.
+        let second_server = server.clone();
+        let second =
+            zeroclaw_spawn::spawn!(
+                async move { second_server.call_tool("probe", json!({})).await }
+            );
+        timeout(Duration::from_secs(3), hook.wait_for_attempts(2))
+            .await
+            .expect("second stdio writer did not queue on transport state");
+
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("first call must be cancelled")
+                .is_cancelled()
+        );
+
+        let second_result = timeout(Duration::from_secs(5), second)
+            .await
+            .expect("second call hung behind recovery")
+            .expect("second task failed")
+            .expect("second call failed after recovery");
+        assert_eq!(second_result, json!({"ok": true}));
+
+        let request_log = tokio::fs::read_to_string(&requests)
+            .await
+            .expect("read request log");
+        let tool_writes = request_log
+            .lines()
+            .filter(|line| line.contains(r#""method":"tools/call""#))
+            .count();
+        assert_eq!(
+            tool_writes, 1,
+            "queued writer reached the ambiguous child before recovery"
+        );
+        let request_lines = request_log.lines().collect::<Vec<_>>();
+        let initialized_index = request_lines
+            .iter()
+            .position(|line| line.contains(r#""method":"notifications/initialized""#))
+            .expect("recovery handshake notification missing");
+        let tool_index = request_lines
+            .iter()
+            .position(|line| line.contains(r#""method":"tools/call""#))
+            .expect("recovered tool write missing");
+        assert!(
+            initialized_index < tool_index,
+            "queued tool write occurred before recovery handshake completed"
+        );
+
+        let generation_log = tokio::fs::read_to_string(&generations)
+            .await
+            .expect("read generation log");
+        assert_eq!(
+            generation_log.lines().count(),
+            2,
+            "expected exactly one recovery respawn"
+        );
+
+        drop(server);
+        SharedMcpTransportConn::close(transport.as_ref())
+            .await
+            .expect("close transport");
     }
 
     // ── Server capabilities parsing ──────────────────────────────────────────

@@ -93,6 +93,12 @@ pub enum McpTransportError {
     /// (e.g. SSE EOF or connection reset).
     #[error("MCP transport connection closed")]
     TransportClosed,
+
+    /// A recovery was published after this request entered the transport but
+    /// before it crossed the concrete writer boundary. The caller must wait
+    /// for that recovery instead of treating this as a connection failure.
+    #[error("MCP transport write blocked by pending recovery")]
+    RecoveryPending,
 }
 
 const REQUEST_PRE_WRITE: u8 = 0;
@@ -106,15 +112,20 @@ pub(crate) struct McpRequestLifecycle {
     phase: AtomicU8,
     epoch: AtomicU64,
     epoch_gate: Option<Arc<RwLock<u64>>>,
+    recovery_gate: Option<Arc<dyn McpRecoveryGate>>,
     fixed_epoch: u64,
 }
 
 impl McpRequestLifecycle {
-    pub(crate) fn coordinated(epoch_gate: Arc<RwLock<u64>>) -> Self {
+    pub(crate) fn coordinated(
+        epoch_gate: Arc<RwLock<u64>>,
+        recovery_gate: Option<Arc<dyn McpRecoveryGate>>,
+    ) -> Self {
         Self {
             phase: AtomicU8::new(REQUEST_PRE_WRITE),
             epoch: AtomicU64::new(0),
             epoch_gate: Some(epoch_gate),
+            recovery_gate,
             fixed_epoch: 0,
         }
     }
@@ -124,6 +135,7 @@ impl McpRequestLifecycle {
             phase: AtomicU8::new(REQUEST_PRE_WRITE),
             epoch: AtomicU64::new(0),
             epoch_gate: None,
+            recovery_gate: None,
             fixed_epoch: epoch,
         }
     }
@@ -164,6 +176,72 @@ impl McpRequestLifecycle {
     pub(crate) fn pre_write_epoch(&self) -> Option<u64> {
         (self.phase.load(Ordering::Acquire) == REQUEST_PRE_WRITE)
             .then(|| self.epoch.load(Ordering::Acquire))
+    }
+
+    fn check_writer_boundary(&self) -> Result<()> {
+        let blocked = self
+            .recovery_gate
+            .as_ref()
+            .is_some_and(|gate| gate.write_blocked());
+        if blocked {
+            return Err(McpTransportError::RecoveryPending.into());
+        }
+        Ok(())
+    }
+
+    fn arm_recovery_if_unknown(&self) {
+        if let Some(epoch) = self.outcome_unknown_epoch()
+            && let Some(gate) = &self.recovery_gate
+        {
+            gate.arm(epoch);
+        }
+    }
+}
+
+/// Coordination surface shared by the client recovery state and concrete
+/// transport writer boundaries.
+pub(crate) trait McpRecoveryGate: Send + Sync {
+    fn arm(&self, epoch: u64);
+    fn write_blocked(&self) -> bool;
+}
+
+/// Owns the concrete stdio state boundary while a write is being prepared.
+///
+/// Its explicit `Drop` publishes recovery before releasing `state`; this is
+/// stronger than relying on local-variable drop order across an async
+/// cancellation point.
+struct StdioWriterBoundary<'a> {
+    state: Option<tokio::sync::MutexGuard<'a, StdioState>>,
+    lifecycle: &'a McpRequestLifecycle,
+}
+
+impl<'a> StdioWriterBoundary<'a> {
+    fn new(
+        state: tokio::sync::MutexGuard<'a, StdioState>,
+        lifecycle: &'a McpRequestLifecycle,
+    ) -> Result<Self> {
+        lifecycle.check_writer_boundary()?;
+        Ok(Self {
+            state: Some(state),
+            lifecycle,
+        })
+    }
+
+    fn state_mut(&mut self) -> Result<&mut StdioState> {
+        self.state
+            .as_deref_mut()
+            .ok_or_else(|| anyhow::Error::msg("stdio writer state was already released"))
+    }
+
+    fn release_state(&mut self) {
+        drop(self.state.take());
+    }
+}
+
+impl Drop for StdioWriterBoundary<'_> {
+    fn drop(&mut self) {
+        self.lifecycle.arm_recovery_if_unknown();
+        self.release_state();
     }
 }
 
@@ -293,6 +371,60 @@ pub struct StdioTransport {
     /// child-exit watcher when the direct child process exits. Read
     /// synchronously by `health_check`.
     child_exited: Arc<AtomicBool>,
+    #[cfg(test)]
+    write_test_hook: ParkingMutex<Option<Arc<StdioWriteTestHook>>>,
+}
+
+#[cfg(test)]
+pub(crate) struct StdioWriteTestHook {
+    attempts: std::sync::atomic::AtomicUsize,
+    attempts_changed: Notify,
+    pause_next_payload: AtomicBool,
+    payload_paused: Notify,
+    release_payload: Notify,
+}
+
+#[cfg(test)]
+impl StdioWriteTestHook {
+    pub(crate) fn new() -> Self {
+        Self {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            attempts_changed: Notify::new(),
+            pause_next_payload: AtomicBool::new(false),
+            payload_paused: Notify::new(),
+            release_payload: Notify::new(),
+        }
+    }
+
+    pub(crate) fn pause_next_payload(&self) {
+        self.pause_next_payload.store(true, Ordering::Release);
+    }
+
+    pub(crate) async fn wait_for_attempts(&self, expected: usize) {
+        loop {
+            let changed = self.attempts_changed.notified();
+            if self.attempts.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) async fn wait_for_payload_pause(&self) {
+        self.payload_paused.notified().await;
+    }
+
+    fn note_attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::AcqRel);
+        self.attempts_changed.notify_waiters();
+    }
+
+    async fn pause_after_payload_if_armed(&self) {
+        if self.pause_next_payload.swap(false, Ordering::AcqRel) {
+            self.payload_paused.notify_one();
+            self.release_payload.notified().await;
+        }
+    }
 }
 
 impl StdioTransport {
@@ -319,7 +451,14 @@ impl StdioTransport {
             alive,
             active_generation,
             child_exited,
+            #[cfg(test)]
+            write_test_hook: ParkingMutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_write_test_hook(&self, hook: Arc<StdioWriteTestHook>) {
+        *self.write_test_hook.lock() = Some(hook);
     }
 
     fn spawn(
@@ -395,11 +534,17 @@ impl StdioTransport {
         })
     }
 
-    async fn send_raw(stdin: &mut tokio::process::ChildStdin, line: &str) -> Result<()> {
+    async fn send_raw(&self, stdin: &mut tokio::process::ChildStdin, line: &str) -> Result<()> {
         stdin
             .write_all(line.as_bytes())
             .await
             .context("failed to write to MCP server stdin")?;
+        #[cfg(test)]
+        let write_test_hook = self.write_test_hook.lock().clone();
+        #[cfg(test)]
+        if let Some(hook) = write_test_hook {
+            hook.pause_after_payload_if_armed().await;
+        }
         stdin
             .write_all(b"\n")
             .await
@@ -627,7 +772,17 @@ impl SharedMcpTransportConn for StdioTransport {
     ) -> Result<JsonRpcResponse> {
         let line = serde_json::to_string(request)?;
         let epoch_guard = lifecycle.begin_write().await;
-        let mut state = self.state.lock().await;
+        #[cfg(test)]
+        if let Some(hook) = self.write_test_hook.lock().clone() {
+            hook.note_attempt();
+        }
+        let state = self.state.lock().await;
+        // Re-check recovery only after acquiring the real stdio writer
+        // boundary. If an earlier writer was cancelled while holding `state`,
+        // its boundary guard publishes recovery before releasing `state`, so
+        // this queued writer cannot race onto the ambiguous child.
+        let mut write_boundary = StdioWriterBoundary::new(state, lifecycle)?;
+        let state = write_boundary.state_mut()?;
         if state.closed {
             return Err(McpTransportError::TransportClosed.into());
         }
@@ -659,15 +814,16 @@ impl SharedMcpTransportConn for StdioTransport {
         };
 
         lifecycle.mark_outcome_unknown(epoch_guard.epoch());
-        if let Err(error) = Self::send_raw(&mut conn.stdin, &line).await {
+        if let Err(error) = self.send_raw(&mut conn.stdin, &line).await {
             self.alive.store(false, Ordering::Release);
             return Err(error);
         }
-        drop(state);
+        write_boundary.release_state();
         drop(epoch_guard);
 
         let Some((_pending_guard, receiver)) = receiver else {
             lifecycle.mark_completed();
+            drop(write_boundary);
             return Ok(JsonRpcResponse {
                 jsonrpc: crate::mcp_protocol::JSONRPC_VERSION.to_string(),
                 id: None,
@@ -679,6 +835,7 @@ impl SharedMcpTransportConn for StdioTransport {
             .await
             .map_err(|_| McpTransportError::TransportClosed)?;
         lifecycle.mark_completed();
+        drop(write_boundary);
         Ok(response)
     }
 
@@ -1809,10 +1966,10 @@ mod tests {
             .expect("close transport");
     }
 
-    /// Blocker #2 regression: when the direct child exits but a descendant
-    /// keeps the inherited stdout pipe open (so the reader never sees EOF),
-    /// `health_check` must still report the transport unhealthy. It relies on
-    /// the nonblocking direct-child-exit watcher, not on stdout EOF.
+    /// When the direct child exits but a descendant keeps the inherited stdout
+    /// pipe open (so the reader never sees EOF), `health_check` must still
+    /// report the transport unhealthy. It relies on the nonblocking
+    /// direct-child-exit watcher, not on stdout EOF.
     #[cfg(unix)]
     #[tokio::test]
     async fn health_check_detects_direct_child_exit_with_inherited_stdout_open() {
@@ -1820,10 +1977,10 @@ mod tests {
             name: "stdio-orphan-stdout".into(),
             transport: McpTransport::Stdio,
             command: "/bin/sh".into(),
-            // Background a long-lived process that inherits stdout, then the
-            // direct shell child exits immediately. stdout stays open via the
-            // descendant, so the reader loop never observes EOF.
-            args: vec!["-c".into(), "sleep 60 & exit 0".into()],
+            // Background a bounded process that inherits stdout, then the
+            // direct shell child exits immediately. stdout stays open long
+            // enough to prove the direct-child watcher wins over EOF.
+            args: vec!["-c".into(), "sleep 2 & exit 0".into()],
             ..Default::default()
         };
         let transport = StdioTransport::new(&config).expect("build transport");
@@ -1876,7 +2033,7 @@ mod tests {
 
         let epoch_gate = Arc::new(RwLock::new(0));
         let epoch_writer = epoch_gate.write().await;
-        let lifecycle = McpRequestLifecycle::coordinated(Arc::clone(&epoch_gate));
+        let lifecycle = McpRequestLifecycle::coordinated(Arc::clone(&epoch_gate), None);
         let request = JsonRpcRequest::new(7, "tools/call", serde_json::json!({}));
         let mut send = Box::pin(SharedMcpTransportConn::send_and_recv(
             &transport, &request, &lifecycle,
