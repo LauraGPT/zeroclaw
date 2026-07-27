@@ -421,7 +421,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     //
     // This orientation is runtime-owned and must survive the compact/finite
     // `max_system_prompt_chars` budget: it is what stops small local models
-    // (issue #8999) from reading the timestamp prefix as a log/API payload.
+    // from reading the timestamp prefix as a log/API payload.
     // Because truncation below keeps only the *top* portion of the prompt,
     // the orientation is re-emitted inside the retained budget after any
     // truncation rather than left in the truncatable tail.
@@ -654,8 +654,7 @@ mod tests {
 
     #[test]
     fn timestamp_orientation_survives_finite_budget_truncation() {
-        // Regression for #9325 review (Audacity88, CHANGES_REQUESTED):
-        // finite `max_system_prompt_chars` is a supported production config,
+        // Regression guard: finite `max_system_prompt_chars` is a supported production config,
         // and the runtime-owned timestamp orientation must survive it rather
         // than being chopped off in the truncatable tail. Register enough
         // tools and pick a budget small enough to force the truncation path.
