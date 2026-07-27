@@ -80,8 +80,13 @@ jobs:
           fi
 
           version="${RELEASE_TAG#v}"
-          asset_name="zeroclaw-x86_64-pc-windows-msvc.zip"
-          zip_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/zeroclaw-x86_64-pc-windows-msvc.zip"
+          canonical_url="$(jq -r '.autoupdate.architecture["64bit"].url' dist/scoop/zeroclaw.json)"
+          asset_name="${canonical_url##*/}"
+          if [[ -z "$asset_name" || "$asset_name" == "null" ]]; then
+            echo "::error::could not derive Scoop asset name from dist/scoop/zeroclaw.json (.autoupdate.architecture[\"64bit\"].url)"
+            exit 1
+          fi
+          zip_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${asset_name}"
           sums_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/SHA256SUMS"
 
           sha256="$(curl -fsSL "$sums_url" | awk -v asset="$asset_name" '$2 == asset {print $1}')"

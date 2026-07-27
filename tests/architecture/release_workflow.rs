@@ -110,6 +110,43 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
         );
     }
 
+    // The Windows Scoop asset name must be derived from the canonical
+    // manifest (dist/scoop/zeroclaw.json), not hardcoded in the workflow.
+    // Read the canonical file at test time so this gate tracks whatever
+    // asset name the manifest actually declares.
+    let canonical_manifest_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("dist/scoop/zeroclaw.json");
+    let canonical_manifest_raw =
+        fs::read_to_string(&canonical_manifest_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read {}: {error}",
+                canonical_manifest_path.display()
+            )
+        });
+    let canonical_manifest: serde_json::Value = serde_json::from_str(&canonical_manifest_raw)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to parse {}: {error}",
+                canonical_manifest_path.display()
+            )
+        });
+    let canonical_url = canonical_manifest["autoupdate"]["architecture"]["64bit"]["url"]
+        .as_str()
+        .expect("dist/scoop/zeroclaw.json must define .autoupdate.architecture[\"64bit\"].url");
+    let canonical_asset = canonical_url
+        .rsplit('/')
+        .next()
+        .expect("canonical Scoop asset URL must contain a path separator");
+
+    assert!(
+        !scoop.contains(&format!("asset_name=\"{canonical_asset}\"")),
+        "pub-scoop.yml must derive the Scoop asset name from dist/scoop/zeroclaw.json, not hardcode it (#9322)"
+    );
+    assert!(
+        scoop.contains("asset_name=\"${canonical_url##*/}\""),
+        "pub-scoop.yml must derive asset_name from the canonical manifest URL basename (#9322)"
+    );
+
     let aur = workflow("pub-aur.yml");
     assert!(
         !aur.contains("ssh -T -o"),
