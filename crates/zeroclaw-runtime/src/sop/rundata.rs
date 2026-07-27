@@ -27,7 +27,8 @@ impl RunData {
     }
 
     pub fn insert_output_str(&mut self, step_number: u32, output: &str) {
-        self.insert_output(step_number, parse_step_output_value(output));
+        let value = serde_json::from_str(output).unwrap_or_else(|_| Value::String(output.into()));
+        self.insert_output(step_number, value);
     }
 
     pub fn merge(&mut self, other: RunData) {
@@ -56,83 +57,65 @@ impl RunData {
     }
 }
 
-/// Parse a SOP step's raw output text into a JSON value.
+/// Parse a model step's raw output text into a JSON value.
 ///
-/// Step schemas expect a bare JSON object, but chat-tuned models often wrap it in
-/// prose and Markdown code fences (` ```json … ``` `) — notably under Anthropic's
-/// OAuth "Claude Code" identity, but common across providers. This recovers the
-/// JSON object from those wrappers before falling back to the raw string, so a
-/// well-formed answer buried in prose validates instead of failing as
-/// `expected object, got string`. Purely additive: output that already parses as
-/// JSON is returned unchanged, and genuinely non-JSON output still yields
-/// `Value::String`.
-pub(crate) fn parse_step_output_value(raw: &str) -> Value {
+/// Exact JSON remains the first and schema-independent path. Fuzzy recovery is
+/// deliberately limited to outputs with a declared schema: trigger payloads and
+/// other raw strings must not lose their surrounding instructions just because
+/// they contain a JSON example. A recovered candidate must be the only complete
+/// object/array in the text and satisfy the declared output schema.
+pub(crate) fn parse_step_output_value(raw: &str, output_schema: Option<&Value>) -> Value {
     let trimmed = raw.trim();
 
-    // 1. Fast path: the output is already valid JSON.
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         return value;
     }
 
-    // 2. The body of a Markdown code fence, e.g. ```json { … } ```.
-    if let Some(body) = fenced_block_body(trimmed)
-        && let Ok(value) = serde_json::from_str::<Value>(body.trim())
-    {
-        return value;
+    let Some(schema) = output_schema else {
+        return Value::String(raw.into());
+    };
+    let Some(candidate) = unique_embedded_container(trimmed) else {
+        return Value::String(raw.into());
+    };
+    if super::schema::validate_value(schema, &candidate).is_ok() {
+        candidate
+    } else {
+        Value::String(raw.into())
     }
-
-    // 3. The first brace-balanced { … } object embedded in surrounding prose.
-    if let Some(candidate) = first_balanced_object(trimmed)
-        && let Ok(value) = serde_json::from_str::<Value>(candidate)
-    {
-        return value;
-    }
-
-    // 4. Not recoverable as JSON — preserve the raw text (previous behavior).
-    Value::String(raw.into())
 }
 
-/// Body of the first Markdown code fence, skipping an optional info string on the
-/// opening line (` ```json `). Returns `None` when there is no closing fence.
-fn fenced_block_body(text: &str) -> Option<&str> {
-    let after_open = &text[text.find("```")? + 3..];
-    let body_start = after_open.find('\n').map(|nl| nl + 1)?;
-    let body = &after_open[body_start..];
-    let close = body.find("```")?;
-    Some(&body[..close])
-}
+/// Return one complete embedded JSON object or array. Advancing past a parsed
+/// container prevents nested objects (for example, an object inside an array)
+/// from becoming competing candidates. A second top-level candidate makes the
+/// output ambiguous and therefore unrecoverable.
+fn unique_embedded_container(text: &str) -> Option<Value> {
+    let mut candidate = None;
+    let mut cursor = 0;
 
-/// First brace-balanced `{ … }` substring, ignoring braces inside string literals
-/// so an embedded `"{"` / `"}"` cannot unbalance the scan.
-fn first_balanced_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, &b) in bytes[start..].iter().enumerate() {
-        if in_string {
-            match b {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..=start + offset]);
+    while cursor < text.len() {
+        let Some((relative_start, opening)) = text[cursor..]
+            .char_indices()
+            .find(|(_, ch)| matches!(ch, '{' | '['))
+        else {
+            break;
+        };
+        let start = cursor + relative_start;
+        let mut stream = serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>();
+        match stream.next() {
+            Some(Ok(value)) if value.is_object() || value.is_array() => {
+                if candidate.is_some() {
+                    return None;
                 }
+                candidate = Some(value);
+                cursor = start + stream.byte_offset();
             }
-            _ => {}
+            _ => {
+                cursor = start + opening.len_utf8();
+            }
         }
     }
-    None
+
+    candidate
 }
 
 #[cfg(test)]
@@ -161,7 +144,8 @@ mod tests {
         let raw = "The run has ended — final status is **failed**.\n\n\
             ```json\n{\n  \"status\": \"ok\",\n  \"word_count\": 738\n}\n```\n\n\
             Summary: the run stopped safely at Step 1.";
-        let value = parse_step_output_value(raw);
+        let schema = json!({"type": "object", "required": ["status", "word_count"]});
+        let value = parse_step_output_value(raw, Some(&schema));
         assert_eq!(value["status"], "ok");
         assert_eq!(value["word_count"], 738);
     }
@@ -169,14 +153,19 @@ mod tests {
     #[test]
     fn parses_bare_fenced_json_without_lang_tag() {
         let raw = "```\n{\"outcome\": \"stopped\"}\n```";
-        assert_eq!(parse_step_output_value(raw)["outcome"], "stopped");
+        let schema = json!({"type": "object", "required": ["outcome"]});
+        assert_eq!(
+            parse_step_output_value(raw, Some(&schema))["outcome"],
+            "stopped"
+        );
     }
 
     #[test]
     fn parses_object_embedded_in_prose_without_fences() {
         let raw = "Here is the result: {\"preferences_loaded\": true} — done.";
+        let schema = json!({"type": "object", "required": ["preferences_loaded"]});
         assert_eq!(
-            parse_step_output_value(raw)["preferences_loaded"],
+            parse_step_output_value(raw, Some(&schema))["preferences_loaded"],
             Value::Bool(true)
         );
     }
@@ -184,14 +173,65 @@ mod tests {
     #[test]
     fn braces_inside_strings_do_not_unbalance_extraction() {
         let raw = "note: {\"summary\": \"contains a } brace and { another\"} tail";
-        let value = parse_step_output_value(raw);
+        let schema = json!({"type": "object", "required": ["summary"]});
+        let value = parse_step_output_value(raw, Some(&schema));
         assert_eq!(value["summary"], "contains a } brace and { another");
     }
 
     #[test]
     fn non_json_prose_still_falls_back_to_string() {
         let raw = "I could not complete the extraction step.";
-        assert_eq!(parse_step_output_value(raw), Value::String(raw.into()));
+        let schema = json!({"type": "object"});
+        assert_eq!(
+            parse_step_output_value(raw, Some(&schema)),
+            Value::String(raw.into())
+        );
+    }
+
+    #[test]
+    fn preserves_complete_array_instead_of_extracting_nested_object() {
+        let raw = "Result: [{\"approved\":true}]";
+        let schema = json!({
+            "type": "array",
+            "items": {"type": "object", "required": ["approved"]}
+        });
+
+        assert_eq!(
+            parse_step_output_value(raw, Some(&schema)),
+            json!([{"approved": true}])
+        );
+    }
+
+    #[test]
+    fn competing_json_values_fail_closed_to_original_string() {
+        let raw = "first {\"approved\":true}; second {\"approved\":false}";
+        let schema = json!({"type": "object", "required": ["approved"]});
+
+        assert_eq!(
+            parse_step_output_value(raw, Some(&schema)),
+            Value::String(raw.into())
+        );
+    }
+
+    #[test]
+    fn recovery_must_match_declared_output_shape() {
+        let raw = "Use this example: {\"approved\":true}";
+        let schema = json!({"type": "string"});
+
+        assert_eq!(
+            parse_step_output_value(raw, Some(&schema)),
+            Value::String(raw.into())
+        );
+    }
+
+    #[test]
+    fn wrapped_json_without_output_schema_stays_raw() {
+        let raw = "Use this example: {\"approved\":true}";
+
+        assert_eq!(
+            parse_step_output_value(raw, None),
+            Value::String(raw.into())
+        );
     }
 
     #[test]
