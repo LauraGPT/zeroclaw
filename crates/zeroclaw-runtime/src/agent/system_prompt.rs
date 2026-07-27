@@ -10,6 +10,8 @@ use crate::skills::Skill;
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
+const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
+const TRUNCATION_MARKER: &str = "\n\n[System prompt truncated to fit context budget]\n";
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -425,27 +427,37 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // Because truncation below keeps only the *top* portion of the prompt,
     // the orientation is re-emitted inside the retained budget after any
     // truncation rather than left in the truncatable tail.
-    const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
     prompt.push_str(TIMESTAMP_ORIENTATION);
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────
     if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
-        const TRUNCATION_MARKER: &str = "\n\n[System prompt truncated to fit context budget]\n";
         // The orientation is runtime-critical, so it must land inside the
         // budget. Reserve room for the orientation (and the truncation
         // marker) at the head-retained portion, then re-append it so it
         // always survives even when the assembled prompt overflows.
         let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
-        // Keep the top portion (identity + safety) minus the reserved tail.
-        // Saturating-sub guards against tiny budgets smaller than the reserve.
-        let mut end = max_system_prompt_chars.saturating_sub(reserved);
-        // Ensure we don't split a multi-byte UTF-8 character.
-        while end > 0 && !prompt.is_char_boundary(end) {
-            end -= 1;
+        if max_system_prompt_chars >= reserved {
+            // Keep the top portion (identity + safety) minus the reserved tail.
+            let mut end = max_system_prompt_chars - reserved;
+            // Ensure we don't split a multi-byte UTF-8 character.
+            while end > 0 && !prompt.is_char_boundary(end) {
+                end -= 1;
+            }
+            prompt.truncate(end);
+            prompt.push_str(TRUNCATION_MARKER);
+            prompt.push_str(TIMESTAMP_ORIENTATION);
+        } else {
+            // When the budget cannot hold both retained content and the
+            // critical tail, prioritize as much of the orientation as fits.
+            // This preserves the full orientation whenever possible without
+            // violating the configured prompt ceiling for very small budgets.
+            let mut end = max_system_prompt_chars.min(TIMESTAMP_ORIENTATION.len());
+            while end > 0 && !TIMESTAMP_ORIENTATION.is_char_boundary(end) {
+                end -= 1;
+            }
+            prompt.clear();
+            prompt.push_str(&TIMESTAMP_ORIENTATION[..end]);
         }
-        prompt.truncate(end);
-        prompt.push_str(TRUNCATION_MARKER);
-        prompt.push_str(TIMESTAMP_ORIENTATION);
     }
 
     if prompt.is_empty() {
@@ -721,6 +733,49 @@ mod tests {
                 prompt.contains("timestamp metadata added by the runtime"),
                 "compact={compact}: timestamp orientation must survive finite-budget truncation; prompt was:\n{prompt}"
             );
+            assert!(
+                prompt.len() <= budget,
+                "compact={compact}: prompt length {} exceeded budget {budget}",
+                prompt.len()
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_orientation_respects_budgets_at_and_below_reserved_tail() {
+        let tools = [(
+            "shell",
+            "Run a shell command with enough description to overflow",
+        )];
+        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
+
+        for compact in [false, true] {
+            for budget in [
+                1,
+                TIMESTAMP_ORIENTATION.len() - 1,
+                TIMESTAMP_ORIENTATION.len(),
+                reserved - 1,
+                reserved,
+            ] {
+                let prompt = prompt_with_finite_budget(compact, budget, &tools);
+                assert!(
+                    prompt.len() <= budget,
+                    "compact={compact}: prompt length {} exceeded budget {budget}",
+                    prompt.len()
+                );
+
+                if budget >= TIMESTAMP_ORIENTATION.len() {
+                    assert!(
+                        prompt.ends_with(TIMESTAMP_ORIENTATION),
+                        "compact={compact}: full orientation must survive budget {budget}: {prompt}"
+                    );
+                } else {
+                    assert!(
+                        TIMESTAMP_ORIENTATION.starts_with(&prompt),
+                        "compact={compact}: tiny budget {budget} must retain a bounded orientation prefix: {prompt}"
+                    );
+                }
+            }
         }
     }
 
