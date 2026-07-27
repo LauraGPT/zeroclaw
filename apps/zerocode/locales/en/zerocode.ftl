@@ -447,6 +447,7 @@ zc-chat-help-new-session = New session
 zc-chat-help-acp-memory = History saved & resumable; persistent memory isolated
 zc-chat-session-list-resume-title = Saved sessions (Enter=resume, Esc=new)
 zc-chat-session-list-resume-note = Session history saved & resumable · Persistent memory isolated
+zc-chat-agent-picker-acp-memory-note = Session history saved & resumable · Persistent memory isolated
 zc-chat-session-list-switch-title = Sessions (Enter=switch, Esc=close)
 zc-elicit-help-toggle = Toggle choice
 zc-elicit-help-confirm = Confirm choice

@@ -947,6 +947,8 @@ impl Chat {
                     list_state,
                     *loading,
                     &self.pane_kind.name(),
+                    (self.pane_kind == PaneKind::Acp)
+                        .then(|| crate::i18n::t("zc-chat-agent-picker-acp-memory-note")),
                 );
                 self.pick_agent_list_area = list_area;
             }
@@ -2620,7 +2622,7 @@ impl crate::widgets::HelpContext for Chat {
                         .chain(action_key_labels(C::BrowseDown))
                         .chain(action_key_labels(C::BrowseUpVim))
                         .chain(action_key_labels(C::BrowseDownVim));
-                    HelpNode::entries(vec![
+                    let mut entries = vec![
                         E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
                         E::new(
                             action_key_labels(ModalAction::Confirm),
@@ -2630,7 +2632,15 @@ impl crate::widgets::HelpContext for Chat {
                             action_key_labels(GlobalAction::Quit),
                             crate::i18n::t("zc-chat-help-quit"),
                         ),
-                    ])
+                    ];
+                    // On the ACP (Code) pane the agent picker is the
+                    // no-saved-session entry point, so include the
+                    // history-vs-persistent-memory disclosure here too. Kept out
+                    // of the Chat pane's picker.
+                    if self.pane_kind == PaneKind::Acp {
+                        entries.push(E::desc(crate::i18n::t("zc-chat-help-acp-memory")));
+                    }
+                    HelpNode::entries(entries)
                 }
             }
             ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
@@ -2861,6 +2871,7 @@ fn draw_agent_picker(
     list_state: &mut ListState,
     loading: bool,
     tab_title: &str,
+    acp_memory_note: Option<String>,
 ) -> Rect {
     let block = Block::default()
         .title(Span::styled(format!(" {tab_title} "), theme::title_style()))
@@ -2916,6 +2927,18 @@ fn draw_agent_picker(
         .collect();
     let list = List::new(items).highlight_style(theme::list_highlight_style());
     frame.render_stateful_widget(list, chunks[1], list_state);
+
+    // On the ACP no-saved-session path (a fresh Code start with nothing to
+    // resume) the resume picker never appears, so surface the same
+    // history-vs-persistent-memory disclosure in the agent picker's footer
+    // slot. Only rendered for the Code (ACP) pane — Chat passes `None` — so the
+    // Code-specific copy stays out of the Chat picker.
+    if let Some(note) = acp_memory_note {
+        let note_line =
+            Paragraph::new(Span::styled(note, theme::dim_style())).wrap(Wrap { trim: true });
+        frame.render_widget(note_line, chunks[2]);
+    }
+
     // The list rect is unbordered, but `mouse::list_click_index` assumes a
     // 1-cell top border. Hand back a rect shifted up one row (and one taller) so
     // the helper's border compensation lands on the true first item.
@@ -4191,19 +4214,54 @@ fn session_list_overlay_area(area: Rect) -> Rect {
 }
 
 /// Rows to reserve for the dim footer `note` so it renders in full when
-/// wrapped at `inner_width`. ratatui wraps the note on word boundaries; for the
-/// session-list disclosure copy that tracks `ceil(display_width / inner_width)`.
-/// Capped at [`MAX_NOTE_ROWS`] so the note can never swallow the whole list.
+/// wrapped at `inner_width`. ratatui's `Wrap { trim: true }` breaks on word
+/// boundaries, so the row count is *not* `ceil(display_width / inner_width)` —
+/// a word that would overflow the current line is pushed whole to the next one,
+/// which can cost an extra row. We mirror that word-boundary packing here so a
+/// narrow inner width (e.g. the 80x24 default) reserves enough rows for every
+/// wrapped line. Capped at [`MAX_NOTE_ROWS`] so the note can never swallow the
+/// whole list.
 fn note_reserved_rows(note: &str, inner_width: u16) -> u16 {
-    use unicode_width::UnicodeWidthStr;
-
     const MAX_NOTE_ROWS: u16 = 3;
 
     if inner_width == 0 {
         return 1;
     }
-    let width = UnicodeWidthStr::width(note) as u16;
-    width.div_ceil(inner_width).clamp(1, MAX_NOTE_ROWS)
+    wrapped_line_count(note, inner_width).clamp(1, MAX_NOTE_ROWS)
+}
+
+/// Number of terminal rows `text` occupies when wrapped at `inner_width` using
+/// the same word-boundary rule as ratatui's `Wrap { trim: true }`: whitespace
+/// is collapsed to single-space word separators, each word is placed on the
+/// current line when it fits (with a separating space when the line is
+/// non-empty), otherwise it starts a new line. A single word wider than
+/// `inner_width` still occupies its own line (ratatui hard-breaks it, but for
+/// reservation purposes one row is the correct lower bound and the cap guards
+/// the upper bound). Returns at least 1.
+fn wrapped_line_count(text: &str, inner_width: u16) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+
+    if inner_width == 0 {
+        return 1;
+    }
+    let inner = inner_width as usize;
+    let mut lines: u16 = 1;
+    let mut col: usize = 0;
+    for word in text.split_whitespace() {
+        let w = UnicodeWidthStr::width(word);
+        if col == 0 {
+            // First word on a line always goes here (even if it overflows).
+            col = w;
+        } else if col + 1 + w <= inner {
+            // Word plus its separating space fits on the current line.
+            col += 1 + w;
+        } else {
+            // Word doesn't fit — wrap it to a fresh line.
+            lines = lines.saturating_add(1);
+            col = w;
+        }
+    }
+    lines
 }
 
 fn render_session_list_overlay(
@@ -9279,8 +9337,14 @@ mod tests {
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         // Default phase is PickAgent — not the Code session picker — for
         // both Chat and Acp panes, so the memory-isolation entry must not
-        // appear here.
-        let chat = Chat::new(client, PaneKind::Chat);
+        // appear here. Force a non-loading PickAgent so this exercises the
+        // real (non-loading) help branch and genuinely proves the pane gate.
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["agent-a".to_string()],
+            list_state: ListState::default(),
+            loading: false,
+        };
 
         let help = crate::widgets::HelpContext::help_context(&chat);
         let has_memory_note = help.entries.iter().any(|e| e.action.contains("isolated"));
@@ -9289,6 +9353,138 @@ mod tests {
             "non-PickSession help (e.g. Chat pane) must not surface the Code-only \
              memory-isolation note: {help:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn pick_agent_help_context_states_memory_isolation_on_acp_pane() {
+        // No-saved-session boundary from the linked issue: a first-time Code
+        // user (or any user with no resumable ACP history) lands in the *agent*
+        // picker, not the resume picker, so the disclosure must be reachable
+        // there too — but only on the Code (ACP) pane.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["agent-a".to_string()],
+            list_state: ListState::default(),
+            loading: false,
+        };
+
+        let help = crate::widgets::HelpContext::help_context(&chat);
+        let has_memory_note = help.entries.iter().any(|e| e.action.contains("isolated"));
+        assert!(
+            has_memory_note,
+            "ACP agent picker (no-saved-session path) help must surface the \
+             history-vs-persistent-memory disclosure: {help:?}"
+        );
+    }
+
+    #[test]
+    fn agent_picker_renders_memory_isolation_note_on_acp_pane() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // The multi-agent no-saved-session path renders the agent picker; on the
+        // Code (ACP) pane it must carry the memory-isolation disclosure in its
+        // footer so the distinction is visible before starting Code work.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_agent_picker(
+                    frame,
+                    area,
+                    &agents,
+                    &mut list_state,
+                    false,
+                    &PaneKind::Acp.name(),
+                    Some(crate::i18n::t("zc-chat-agent-picker-acp-memory-note")),
+                );
+            })
+            .expect("draw agent picker with acp note");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            text.contains("resumable") && text.contains("isolated"),
+            "ACP agent picker must render the full memory-isolation note: {text:?}"
+        );
+    }
+
+    #[test]
+    fn agent_picker_omits_memory_isolation_note_on_chat_pane() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // The Chat pane reaches the same PickAgent phase but must NOT surface the
+        // Code-only disclosure — the render call site passes `None`.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_agent_picker(
+                    frame,
+                    area,
+                    &agents,
+                    &mut list_state,
+                    false,
+                    &PaneKind::Chat.name(),
+                    None,
+                );
+            })
+            .expect("draw agent picker without note");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            !text.contains("isolated"),
+            "Chat pane agent picker must not render the Code memory-isolation note: {text:?}"
+        );
+    }
+
+    #[test]
+    fn note_reserved_rows_accounts_for_word_boundary_wrapping() {
+        // Regression for the 🟡: a naive ceil(width / inner) undercounts because
+        // ratatui wraps on word boundaries. The disclosure note is 62 display
+        // cells; at inner width 31, ceil(62/31)=2, but word-boundary packing
+        // pushes the overflowing word to a third line.
+        let note = crate::i18n::t("zc-chat-agent-picker-acp-memory-note");
+        // Sanity: the copy is wide enough for the boundary to bite.
+        assert!(
+            unicode_width::UnicodeWidthStr::width(note.as_str()) > 31,
+            "test copy must exceed the narrow inner width to exercise wrapping"
+        );
+        assert!(
+            note_reserved_rows(&note, 31) >= 3,
+            "31-cell inner width must reserve 3 rows for the word-wrapped note, \
+             not the 2 a naive ceil would give"
+        );
+        // Wide terminal: fits on one line.
+        assert_eq!(note_reserved_rows(&note, 200), 1);
+        // Cap holds — never swallow the list.
+        assert!(note_reserved_rows(&note, 1) <= 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_matches_word_boundary_packing() {
+        // "aaaa bbbb cc" is 12 cells; at inner width 7 word packing yields
+        // ["aaaa", "bbb cc"] → 2 lines (a naive ceil(12/7) also gives 2 here,
+        // but the boundary case below diverges).
+        assert_eq!(wrapped_line_count("aaaa bbb cc", 7), 2);
+        // "aaaa bbbb" is 9 cells; inner width 5: ceil(9/5)=2, but "bbbb" cannot
+        // share the first line with "aaaa " (4+1+4=9 > 5) → 2 lines. Extend to
+        // three words that each barely overflow to prove per-word wrapping.
+        assert_eq!(wrapped_line_count("aaaa bbbb cccc", 5), 3);
+        // Empty / single word.
+        assert_eq!(wrapped_line_count("", 10), 1);
+        assert_eq!(wrapped_line_count("word", 10), 1);
     }
 
     #[test]
