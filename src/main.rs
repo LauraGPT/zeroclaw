@@ -1635,9 +1635,12 @@ async fn run_quickstart_cli(
             .map(|(_, label)| fit_quickstart_selector_row(label, row_budget))
             .collect();
 
-        let prompt = t(
-            "cli-quickstart-open-selector-prompt",
-            "Open a selector (Enter), or pick Create. Esc to quit.",
+        let prompt = fit_quickstart_selector_row(
+            &t(
+                "cli-quickstart-open-selector-prompt",
+                "Open a selector (Enter), or pick Create. Esc to quit.",
+            ),
+            row_budget,
         );
         let pick = if quickstart_labels_are_unique(&labels) {
             FuzzySelect::new()
@@ -8267,6 +8270,37 @@ mod tests {
         assert_eq!(quickstart_selector_row_budget(2), None);
         assert_eq!(quickstart_selector_row_budget(3), Some(0));
         assert_eq!(quickstart_selector_row_budget(4), Some(1));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_prompt_stays_within_final_terminal_budget() {
+        let prompts = [
+            "Open a selector (Enter), or pick Create. Esc to quit.",
+            "選択肢を開くには Enter、終了するには Esc を押してください。",
+            "Open a selector\nwithout adding a physical terminal row.",
+        ];
+
+        for terminal_width in [3, 4, 20, 40, 80] {
+            let budget = quickstart_selector_row_budget(terminal_width).unwrap();
+            for prompt in prompts {
+                let fitted = fit_quickstart_selector_row(prompt, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "agent-runtime")]
