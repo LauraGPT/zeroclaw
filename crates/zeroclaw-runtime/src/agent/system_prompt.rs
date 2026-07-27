@@ -418,18 +418,34 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // Emitted unconditionally: small local models mistake the enrichment
     // prefix for log/API data without this orientation. The prefix format
     // is canonical in agent.rs `Agent::enrich_user_message` — keep in sync.
-    prompt.push_str("This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n");
+    //
+    // This orientation is runtime-owned and must survive the compact/finite
+    // `max_system_prompt_chars` budget: it is what stops small local models
+    // (issue #8999) from reading the timestamp prefix as a log/API payload.
+    // Because truncation below keeps only the *top* portion of the prompt,
+    // the orientation is re-emitted inside the retained budget after any
+    // truncation rather than left in the truncatable tail.
+    const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
+    prompt.push_str(TIMESTAMP_ORIENTATION);
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────
     if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
-        // Truncate on a char boundary, keeping the top portion (identity + safety).
-        let mut end = max_system_prompt_chars;
+        const TRUNCATION_MARKER: &str = "\n\n[System prompt truncated to fit context budget]\n";
+        // The orientation is runtime-critical, so it must land inside the
+        // budget. Reserve room for the orientation (and the truncation
+        // marker) at the head-retained portion, then re-append it so it
+        // always survives even when the assembled prompt overflows.
+        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
+        // Keep the top portion (identity + safety) minus the reserved tail.
+        // Saturating-sub guards against tiny budgets smaller than the reserve.
+        let mut end = max_system_prompt_chars.saturating_sub(reserved);
         // Ensure we don't split a multi-byte UTF-8 character.
-        while !prompt.is_char_boundary(end) && end > 0 {
+        while end > 0 && !prompt.is_char_boundary(end) {
             end -= 1;
         }
         prompt.truncate(end);
-        prompt.push_str("\n\n[System prompt truncated to fit context budget]\n");
+        prompt.push_str(TRUNCATION_MARKER);
+        prompt.push_str(TIMESTAMP_ORIENTATION);
     }
 
     if prompt.is_empty() {
@@ -503,6 +519,30 @@ mod tests {
             SkillsPromptInjectionMode::Full,
             compact_context,
             0,
+            true,
+            false,
+        )
+    }
+
+    /// Build a prompt with a finite `max_system_prompt_chars` budget and
+    /// enough registered tools to overflow it, forcing the truncation path.
+    fn prompt_with_finite_budget(
+        compact_context: bool,
+        max_system_prompt_chars: usize,
+        tools: &[(&str, &str)],
+    ) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            tools,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            compact_context,
+            max_system_prompt_chars,
             true,
             false,
         )
@@ -610,6 +650,79 @@ mod tests {
             prompt.contains("timestamp metadata added by the runtime"),
             "full system prompt must carry the timestamp orientation too: {prompt}"
         );
+    }
+
+    #[test]
+    fn timestamp_orientation_survives_finite_budget_truncation() {
+        // Regression for #9325 review (Audacity88, CHANGES_REQUESTED):
+        // finite `max_system_prompt_chars` is a supported production config,
+        // and the runtime-owned timestamp orientation must survive it rather
+        // than being chopped off in the truncatable tail. Register enough
+        // tools and pick a budget small enough to force the truncation path.
+        let tools: [(&str, &str); 12] = [
+            (
+                "shell",
+                "Run a shell command with a long description to add bulk",
+            ),
+            (
+                "file_read",
+                "Read a file with a long description to add bulk",
+            ),
+            (
+                "file_write",
+                "Write a file with a long description to add bulk",
+            ),
+            (
+                "file_edit",
+                "Edit a file with a long description to add bulk",
+            ),
+            (
+                "http_request",
+                "Make an HTTP request with a long description to add bulk",
+            ),
+            (
+                "web_search",
+                "Search the web with a long description to add bulk",
+            ),
+            (
+                "web_fetch",
+                "Fetch a page with a long description to add bulk",
+            ),
+            ("calculator", "Do math with a long description to add bulk"),
+            ("weather", "Get weather with a long description to add bulk"),
+            (
+                "memory_store",
+                "Store memory with a long description to add bulk",
+            ),
+            (
+                "memory_recall",
+                "Recall memory with a long description to add bulk",
+            ),
+            (
+                "canvas",
+                "Render to a canvas with a long description to add bulk",
+            ),
+        ];
+
+        for compact in [false, true] {
+            // A budget well below the assembled prompt length so truncation
+            // definitely runs, but large enough to hold the retained head plus
+            // the reserved orientation.
+            let budget = 600;
+            let prompt = prompt_with_finite_budget(compact, budget, &tools);
+
+            // Truncation must actually have fired (otherwise the test proves
+            // nothing about the retained-budget guarantee).
+            assert!(
+                prompt.contains("[System prompt truncated to fit context budget]"),
+                "compact={compact}: expected truncation to fire at budget {budget}; prompt was:\n{prompt}"
+            );
+            // The runtime-owned orientation must survive inside the budget.
+            assert!(
+                prompt.contains("timestamp metadata added by the runtime"),
+                "compact={compact}: timestamp orientation must survive finite-budget truncation; prompt was:\n{prompt}"
+            );
+        }
     }
 
     #[test]
