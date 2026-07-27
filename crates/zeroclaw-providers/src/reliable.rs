@@ -14,9 +14,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub(crate) type CredentialResolver = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 pub(crate) type CredentialProviderFactory =
-    Arc<dyn Fn(&str) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+    Arc<dyn Fn() -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+pub(crate) type CredentialResolver = Arc<dyn Fn() -> Vec<CredentialAttempt> + Send + Sync>;
+
+pub(crate) struct CredentialAttempt {
+    key: String,
+    build: CredentialProviderFactory,
+}
+
+impl CredentialAttempt {
+    pub(crate) fn new(key: String, build: CredentialProviderFactory) -> Self {
+        Self { key, build }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_for_test(&self) -> anyhow::Result<Box<dyn ModelProvider>> {
+        (self.build)()
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct CredentialId([u8; 32]);
@@ -29,6 +45,7 @@ impl CredentialId {
 
 struct SelectedCredential {
     key: String,
+    build: CredentialProviderFactory,
 }
 
 struct BoundProvider {
@@ -44,25 +61,27 @@ struct ProviderPin {
 
 pub(crate) struct CredentialRotation {
     resolve: CredentialResolver,
-    build: CredentialProviderFactory,
     cooldowns: Mutex<HashMap<CredentialId, Instant>>,
 }
 
 impl CredentialRotation {
-    pub(crate) fn new(resolve: CredentialResolver, build: CredentialProviderFactory) -> Arc<Self> {
+    pub(crate) fn new(resolve: CredentialResolver) -> Arc<Self> {
         Arc::new(Self {
             resolve,
-            build,
             cooldowns: Mutex::new(HashMap::new()),
         })
     }
 
-    fn pool(&self) -> Vec<String> {
+    fn pool(&self) -> Vec<CredentialAttempt> {
         let mut pool = Vec::new();
-        for key in (self.resolve)() {
-            let key = key.trim();
-            if !key.is_empty() && !pool.iter().any(|existing| existing == key) {
-                pool.push(key.to_string());
+        for attempt in (self.resolve)() {
+            let key = attempt.key.trim();
+            if !key.is_empty()
+                && !pool
+                    .iter()
+                    .any(|existing: &CredentialAttempt| existing.key == key)
+            {
+                pool.push(attempt);
             }
         }
         pool
@@ -79,16 +98,19 @@ impl CredentialRotation {
             .cooldowns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let live_ids: Vec<_> = pool.iter().map(|key| CredentialId::of(key)).collect();
+        let live_ids: Vec<_> = pool
+            .iter()
+            .map(|attempt| CredentialId::of(&attempt.key))
+            .collect();
         cooldowns.retain(|id, deadline| now < *deadline && live_ids.contains(id));
 
         let first = start_after.map_or(0, |slot| (slot + 1) % pool.len());
         (0..pool.len()).find_map(|offset| {
             let slot_index = (first + offset) % pool.len();
-            (!cooldowns.contains_key(&CredentialId::of(&pool[slot_index]))).then(|| {
-                SelectedCredential {
-                    key: pool[slot_index].clone(),
-                }
+            let attempt = &pool[slot_index];
+            (!cooldowns.contains_key(&CredentialId::of(&attempt.key))).then(|| SelectedCredential {
+                key: attempt.key.clone(),
+                build: Arc::clone(&attempt.build),
             })
         })
     }
@@ -106,9 +128,14 @@ impl CredentialRotation {
             .cooldowns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let live_ids: Vec<_> = pool.iter().map(|key| CredentialId::of(key)).collect();
+        let live_ids: Vec<_> = pool
+            .iter()
+            .map(|attempt| CredentialId::of(&attempt.key))
+            .collect();
         cooldowns.retain(|id, _| live_ids.contains(id));
-        let current_slot = pool.iter().position(|key| key == &credential.key);
+        let current_slot = pool
+            .iter()
+            .position(|attempt| attempt.key == credential.key);
         if current_slot.is_some() {
             cooldowns.insert(CredentialId::of(&credential.key), Instant::now() + cooldown);
         }
@@ -120,7 +147,7 @@ impl CredentialRotation {
         selected: SelectedCredential,
         pin: Option<&ProviderPin>,
     ) -> anyhow::Result<BoundProvider> {
-        let provider = (self.build)(&selected.key)?;
+        let provider = (selected.build)()?;
         let provider: Box<dyn ModelProvider> = match pin {
             Some(pin) => Box::new(
                 crate::model_pin::ModelPinnedProvider::builder(&pin.alias)
@@ -1000,6 +1027,14 @@ impl ReliableModelProviderEntry {
             ),
             credential_rotation: None,
         }
+    }
+
+    pub(crate) fn with_credential_rotation(
+        mut self,
+        rotation: Option<Arc<CredentialRotation>>,
+    ) -> Self {
+        self.credential_rotation = rotation;
+        self
     }
 
     /// Model this entry serves for `requested_model`: the pinned model when
@@ -2876,17 +2911,31 @@ mod tests {
             seen: Arc::clone(&seen),
             rate_limit_barrier: barrier.clone(),
         });
-        let resolve: CredentialResolver = Arc::new(move || keys.clone());
-        let build_seen = Arc::clone(&seen);
-        let build: CredentialProviderFactory = Arc::new(move |key| {
-            Ok(Box::new(KeyedMock {
-                key: key.to_string(),
-                seen: Arc::clone(&build_seen),
-                rate_limit_barrier: barrier.clone(),
-            }))
+        let resolve_seen = Arc::clone(&seen);
+        let resolve: CredentialResolver = Arc::new(move || {
+            keys.iter()
+                .map(|key| {
+                    let attempt_key = key.clone();
+                    let build_key = key.clone();
+                    let build_seen = Arc::clone(&resolve_seen);
+                    let build_barrier = barrier.clone();
+                    let build: CredentialProviderFactory = Arc::new(move || {
+                        Ok(Box::new(KeyedMock {
+                            key: build_key.clone(),
+                            seen: Arc::clone(&build_seen),
+                            rate_limit_barrier: build_barrier.clone(),
+                        }))
+                    });
+                    CredentialAttempt::new(attempt_key, build)
+                })
+                .collect()
         });
         ReliableModelProvider::new("test", vec![("primary".into(), original)], max_retries, 1)
-            .with_credential_rotation(CredentialRotation::new(resolve, build))
+            .with_credential_rotation(CredentialRotation::new(resolve))
+    }
+
+    fn unbound_attempt(key: &str) -> CredentialAttempt {
+        CredentialAttempt::new(key.to_string(), Arc::new(|| anyhow::bail!("not used")))
     }
 
     /// Mock that records which model was used for each call.
@@ -3854,27 +3903,31 @@ mod tests {
 
     #[test]
     fn credential_pool_deduplicates_blank_and_duplicate_keys() {
-        let rotation = CredentialRotation::new(
-            Arc::new(|| {
-                vec![
-                    "primary".into(),
-                    " ".into(),
-                    "secondary".into(),
-                    "primary".into(),
-                ]
-            }),
-            Arc::new(|_| anyhow::bail!("not used")),
-        );
+        let rotation = CredentialRotation::new(Arc::new(|| {
+            ["primary", " ", "secondary", "primary"]
+                .into_iter()
+                .map(unbound_attempt)
+                .collect()
+        }));
 
-        assert_eq!(rotation.pool(), vec!["primary", "secondary"]);
+        assert_eq!(
+            rotation
+                .pool()
+                .into_iter()
+                .map(|attempt| attempt.key)
+                .collect::<Vec<_>>(),
+            vec!["primary", "secondary"]
+        );
     }
 
     #[test]
     fn credential_cooldown_is_bound_to_the_exact_selected_slot() {
-        let rotation = CredentialRotation::new(
-            Arc::new(|| vec!["primary".into(), "healthy".into()]),
-            Arc::new(|_| anyhow::bail!("not used")),
-        );
+        let rotation = CredentialRotation::new(Arc::new(|| {
+            ["primary", "healthy"]
+                .into_iter()
+                .map(unbound_attempt)
+                .collect()
+        }));
         let primary = rotation.select(None).expect("primary credential");
         assert_eq!(primary.key, "primary");
         rotation.cool_down(
@@ -3888,17 +3941,23 @@ mod tests {
 
     #[test]
     fn credential_cooldown_survives_live_pool_reordering() {
-        let keys = Arc::new(parking_lot::Mutex::new(vec!["a".into(), "b".into()]));
+        let keys = Arc::new(parking_lot::Mutex::new(vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]));
         let resolve_keys = Arc::clone(&keys);
-        let rotation = CredentialRotation::new(
-            Arc::new(move || resolve_keys.lock().clone()),
-            Arc::new(|_| anyhow::bail!("not used")),
-        );
+        let rotation = CredentialRotation::new(Arc::new(move || {
+            resolve_keys
+                .lock()
+                .iter()
+                .map(|key| unbound_attempt(key))
+                .collect()
+        }));
         let a = rotation.select(None).expect("credential a");
         let (_, a_slot) = rotation.cool_down(&a, &anyhow::Error::msg("429 Too Many Requests"));
         let b = rotation.select(a_slot).expect("credential b");
 
-        *keys.lock() = vec!["b".into(), "a".into(), "c".into()];
+        *keys.lock() = vec!["b".to_string(), "a".to_string(), "c".to_string()];
         let (_, b_slot) = rotation.cool_down(&b, &anyhow::Error::msg("429 Too Many Requests"));
         let selected = rotation.select(b_slot).expect("credential c");
 
