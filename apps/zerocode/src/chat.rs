@@ -2897,12 +2897,16 @@ fn draw_agent_picker(
         return Rect::default();
     }
 
+    let note_rows = acp_memory_note
+        .as_deref()
+        .map(|note| note_reserved_rows(note, inner.width))
+        .unwrap_or(1);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(note_rows),
         ])
         .split(inner);
 
@@ -4227,41 +4231,12 @@ fn note_reserved_rows(note: &str, inner_width: u16) -> u16 {
     if inner_width == 0 {
         return 1;
     }
-    wrapped_line_count(note, inner_width).clamp(1, MAX_NOTE_ROWS)
-}
-
-/// Number of terminal rows `text` occupies when wrapped at `inner_width` using
-/// the same word-boundary rule as ratatui's `Wrap { trim: true }`: whitespace
-/// is collapsed to single-space word separators, each word is placed on the
-/// current line when it fits (with a separating space when the line is
-/// non-empty), otherwise it starts a new line. A single word wider than
-/// `inner_width` still occupies its own line (ratatui hard-breaks it, but for
-/// reservation purposes one row is the correct lower bound and the cap guards
-/// the upper bound). Returns at least 1.
-fn wrapped_line_count(text: &str, inner_width: u16) -> u16 {
-    use unicode_width::UnicodeWidthStr;
-
-    if inner_width == 0 {
-        return 1;
-    }
-    let inner = inner_width as usize;
-    let mut lines: u16 = 1;
-    let mut col: usize = 0;
-    for word in text.split_whitespace() {
-        let w = UnicodeWidthStr::width(word);
-        if col == 0 {
-            // First word on a line always goes here (even if it overflows).
-            col = w;
-        } else if col + 1 + w <= inner {
-            // Word plus its separating space fits on the current line.
-            col += 1 + w;
-        } else {
-            // Word doesn't fit — wrap it to a fresh line.
-            lines = lines.saturating_add(1);
-            col = w;
-        }
-    }
-    lines
+    Paragraph::new(note)
+        .wrap(Wrap { trim: true })
+        .line_count(inner_width)
+        .try_into()
+        .unwrap_or(u16::MAX)
+        .clamp(1, MAX_NOTE_ROWS)
 }
 
 fn render_session_list_overlay(
@@ -8087,7 +8062,7 @@ mod tests {
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Acp);
-        let area = Rect::new(0, 0, 100, 30);
+        let area = Rect::new(0, 0, 35, 30);
         let overlay_area = session_list_overlay_area(area);
         let mut state = ChatState::new(
             "sess-old".to_string(),
@@ -9451,12 +9426,7 @@ mod tests {
 
     #[test]
     fn note_reserved_rows_accounts_for_word_boundary_wrapping() {
-        // Regression for the 🟡: a naive ceil(width / inner) undercounts because
-        // ratatui wraps on word boundaries. The disclosure note is 62 display
-        // cells; at inner width 31, ceil(62/31)=2, but word-boundary packing
-        // pushes the overflowing word to a third line.
         let note = crate::i18n::t("zc-chat-agent-picker-acp-memory-note");
-        // Sanity: the copy is wide enough for the boundary to bite.
         assert!(
             unicode_width::UnicodeWidthStr::width(note.as_str()) > 31,
             "test copy must exceed the narrow inner width to exercise wrapping"
@@ -9473,18 +9443,10 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_line_count_matches_word_boundary_packing() {
-        // "aaaa bbbb cc" is 12 cells; at inner width 7 word packing yields
-        // ["aaaa", "bbb cc"] → 2 lines (a naive ceil(12/7) also gives 2 here,
-        // but the boundary case below diverges).
-        assert_eq!(wrapped_line_count("aaaa bbb cc", 7), 2);
-        // "aaaa bbbb" is 9 cells; inner width 5: ceil(9/5)=2, but "bbbb" cannot
-        // share the first line with "aaaa " (4+1+4=9 > 5) → 2 lines. Extend to
-        // three words that each barely overflow to prove per-word wrapping.
-        assert_eq!(wrapped_line_count("aaaa bbbb cccc", 5), 3);
-        // Empty / single word.
-        assert_eq!(wrapped_line_count("", 10), 1);
-        assert_eq!(wrapped_line_count("word", 10), 1);
+    fn note_reserved_rows_uses_paragraph_hard_wrapping_for_long_words() {
+        assert_eq!(note_reserved_rows("abcdefghijkl", 5), 3);
+        assert_eq!(note_reserved_rows("", 10), 1);
+        assert_eq!(note_reserved_rows("word", 10), 1);
     }
 
     #[test]
