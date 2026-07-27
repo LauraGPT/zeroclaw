@@ -1,10 +1,15 @@
 //! Agent-loop tool that sends a message to a configured peer on a
 //! shared channel.
 
+use crate::agent::cost::{
+    TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext, TurnUsage,
+    tool_loop_cost_tracking_context_for_agent,
+};
 use crate::cron::scheduler::deliver_announcement;
 use crate::peers::resolve_peer_set;
 use anyhow::Result;
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
@@ -186,15 +191,24 @@ impl Tool for SendMessageToPeerTool {
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
             let body = message.clone();
+            // Build the recipient's cost-tracking context from `&cfg` before
+            // `cfg` moves into `process_message` below — a detached
+            // `zeroclaw_spawn::spawn!` task does not inherit the caller's
+            // task-locals, so the recipient's turn would otherwise run with
+            // no cost context and its spend would go unrecorded.
+            let cost_ctx = tool_loop_cost_tracking_context_for_agent(&cfg, &recipient_alias);
+            let turn_usage = cost_ctx
+                .as_ref()
+                .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
-                if let Err(e) = crate::agent::loop_::process_message(
+                let turn = crate::agent::loop_::process_message(
                     cfg,
                     &recipient_alias,
                     &body,
                     None,
                     zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                )
-                .await
+                );
+                if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"sender": sender, "recipient": recipient_alias, "error": format!("{}", e)})), "peer-message in-process delivery failed");
                 }
@@ -222,6 +236,28 @@ impl Tool for SendMessageToPeerTool {
             }),
         }
     }
+}
+
+/// Run `inner` under the recipient's cost-tracking task-locals so its usage
+/// is recorded and its budget enforced, mirroring the scope the gateway
+/// chat path installs around `process_message` in
+/// `zeroclaw-gateway/src/lib.rs`. Split out from `execute` so the
+/// scope-install itself can be exercised directly in tests, independent of
+/// the detached-spawn plumbing around it.
+async fn deliver_peer_turn_with_cost_scope<F, T>(
+    cost_ctx: Option<ToolLoopCostTrackingContext>,
+    turn_usage: Option<Arc<Mutex<TurnUsage>>>,
+    inner: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    TOOL_LOOP_TURN_USAGE
+        .scope(
+            turn_usage,
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(cost_ctx, inner),
+        )
+        .await
 }
 
 fn build_description() -> String {
@@ -686,6 +722,146 @@ mod tests {
             "peer map length {} exceeded budget {}",
             peer_map.len(),
             MAX_PEER_MAP_CHARS
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_turn_cost_scope_records_spend_against_recipient_alias() {
+        use crate::agent::cost::record_tool_loop_cost_usage;
+        use crate::agent::turn::provider_call::enforce_tool_loop_budget;
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::CostConfig;
+        use zeroclaw_providers::traits::TokenUsage;
+
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            CostTracker::new(
+                CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let usage = TokenUsage {
+            input_tokens: Some(1_000),
+            cached_input_tokens: None,
+            output_tokens: Some(200),
+        };
+
+        // Vacuity control: outside of any scope (as the detached spawn body
+        // ran before this fix), the real consumer must be a no-op — this
+        // proves the scope-install below is load-bearing, not incidental.
+        let unscoped = record_tool_loop_cost_usage("mock-provider", "test-model", &usage);
+        assert!(
+            unscoped.is_none(),
+            "record_tool_loop_cost_usage must be a no-op with no cost context scoped"
+        );
+        assert_eq!(
+            tracker.get_summary().expect("cost summary").request_count,
+            0,
+            "vacuity control must not have persisted a record"
+        );
+
+        // Same two task-locals `deliver_peer_turn_with_cost_scope` installs,
+        // aliased to the RECIPIENT (not the sender) — exercising the real
+        // production consumer (`record_tool_loop_cost_usage`) and the real
+        // budget gate (`enforce_tool_loop_budget`) through it.
+        let cost_ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
+            .with_agent_alias("recipient");
+        let turn_usage = Arc::new(Mutex::new(TurnUsage::default()));
+
+        let recorded = deliver_peer_turn_with_cost_scope(
+            Some(cost_ctx),
+            Some(Arc::clone(&turn_usage)),
+            async { record_tool_loop_cost_usage("mock-provider", "test-model", &usage) },
+        )
+        .await;
+
+        let (total_tokens, cost_usd) =
+            recorded.expect("scoped consumer must record the recipient's usage");
+        let expected_cost = (1_000.0 * 3.0 / 1_000_000.0) + (200.0 * 15.0 / 1_000_000.0);
+        assert_eq!(total_tokens, 1_200);
+        assert!((cost_usd - expected_cost).abs() < 1e-12);
+
+        let summary = tracker.get_summary().expect("cost summary");
+        assert_eq!(
+            summary.request_count, 1,
+            "the recipient's turn usage must be persisted to the shared tracker"
+        );
+
+        let recipient_summary = tracker
+            .get_summary_for_agent("recipient")
+            .expect("recipient summary");
+        assert_eq!(
+            recipient_summary.request_count, 1,
+            "spend must be attributed to the recipient alias, not left unattributed"
+        );
+        assert!((recipient_summary.session_cost_usd - expected_cost).abs() < 1e-9);
+
+        let sender_summary = tracker
+            .get_summary_for_agent("sender")
+            .expect("sender summary");
+        assert_eq!(
+            sender_summary.request_count, 0,
+            "spend must not bleed onto an unrelated (sender) alias"
+        );
+
+        let snapshot = *turn_usage.lock();
+        assert_eq!(snapshot.input_tokens, 1_000);
+        assert_eq!(snapshot.output_tokens, 200);
+
+        // Budget enforcement: a recipient whose spend already exceeds a
+        // configured daily ceiling must be blocked on the next call while
+        // still scoped to its own context — proving per-agent budget
+        // enforcement rides the same scope this fix installs.
+        let capped_workspace = tempfile::TempDir::new().expect("second temp dir");
+        let capped_tracker = Arc::new(
+            CostTracker::new(
+                CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    daily_limit_usd: expected_cost / 2.0,
+                    ..CostConfig::default()
+                },
+                capped_workspace.path(),
+            )
+            .expect("capped cost tracker should initialize"),
+        );
+        let capped_pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let capped_ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&capped_tracker), capped_pricing)
+                .with_agent_alias("recipient");
+        let capped_turn_usage = Arc::new(Mutex::new(TurnUsage::default()));
+
+        let budget_result =
+            deliver_peer_turn_with_cost_scope(Some(capped_ctx), Some(capped_turn_usage), async {
+                record_tool_loop_cost_usage("mock-provider", "test-model", &usage);
+                enforce_tool_loop_budget()
+            })
+            .await;
+
+        assert!(
+            budget_result.is_err(),
+            "a recipient turn over its configured daily budget must be rejected \
+             by enforce_tool_loop_budget once it is scoped to that recipient's \
+             cost context"
         );
     }
 }
