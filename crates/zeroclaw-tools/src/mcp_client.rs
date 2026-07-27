@@ -164,6 +164,96 @@ struct McpServerInner {
     capabilities: McpServerCapabilities,
 }
 
+// ── Recovery barrier ────────────────────────────────────────────────────────
+
+/// Synchronously-published gate that blocks new writes while a post-write
+/// outcome-unknown request is being recovered.
+///
+/// When a request's outcome becomes unknown after its bytes may have reached
+/// the server, `arm` is called *synchronously* — before any lock the failing
+/// request held is released — so that a second write already queued on the
+/// serial/epoch gate observes the recovery-needed state and waits, instead of
+/// racing ahead onto the ambiguous session. `finish` clears the gate once
+/// reset + re-handshake succeed; `poison` leaves it permanently closed after a
+/// failed recovery so later writes fail closed rather than proceeding without a
+/// successful MCP handshake.
+struct RecoveryBarrier {
+    /// The epoch that must be recovered before writes may resume. `None` means
+    /// no recovery is pending.
+    needed_epoch: std::sync::Mutex<Option<u64>>,
+    /// Set once recovery has permanently failed; the connection is unusable.
+    poisoned: std::sync::atomic::AtomicBool,
+    /// Pulsed whenever the recovery-needed state changes (cleared or poisoned)
+    /// so writers waiting in `wait_ready` wake up.
+    notify: tokio::sync::Notify,
+}
+
+impl RecoveryBarrier {
+    fn new() -> Self {
+        Self {
+            needed_epoch: std::sync::Mutex::new(None),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Publish that the observed epoch now needs recovery before any further
+    /// write. Idempotent for a given epoch; a newer epoch supersedes an older
+    /// pending one. This is intentionally synchronous (no `.await`) so it takes
+    /// effect the instant an outcome becomes unknown.
+    fn arm(&self, epoch: u64) {
+        let mut needed = self.needed_epoch.lock().unwrap();
+        match *needed {
+            Some(existing) if existing >= epoch => {}
+            _ => *needed = Some(epoch),
+        }
+    }
+
+    /// Clear the recovery-needed state after a successful reset + re-handshake
+    /// for `recovered_epoch`, then wake any waiting writers.
+    fn finish(&self, recovered_epoch: u64) {
+        {
+            let mut needed = self.needed_epoch.lock().unwrap();
+            if matches!(*needed, Some(pending) if pending <= recovered_epoch) {
+                *needed = None;
+            }
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// Mark recovery as permanently failed. Subsequent writers fail closed.
+    fn poison(&self) {
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn recovery_pending(&self) -> bool {
+        self.needed_epoch.lock().unwrap().is_some()
+    }
+}
+
+/// RAII guard that arms the recovery barrier synchronously if a write's outcome
+/// became unknown, at the moment its `send_request` future completes or is
+/// cancelled. Held under the serial gate and dropped before it, so a queued
+/// writer observes the armed barrier before it can acquire the gate.
+struct WriteBarrierArm<'a> {
+    recovery: &'a RecoveryBarrier,
+    lifecycle: &'a McpRequestLifecycle,
+}
+
+impl Drop for WriteBarrierArm<'_> {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.lifecycle.outcome_unknown_epoch() {
+            self.recovery.arm(epoch);
+        }
+    }
+}
+
 // ── McpServer ──────────────────────────────────────────────────────────────
 
 /// A live connection to one MCP server (any transport).
@@ -175,6 +265,10 @@ pub struct McpServer {
     /// Preserves the existing single-request behavior for HTTP/SSE while
     /// allowing stdio requests to multiplex by response id.
     serial_gate: Option<Arc<Mutex<()>>>,
+    /// Synchronously-published gate that holds back new writes until an
+    /// outcome-unknown request has been recovered (or fails them closed after a
+    /// failed recovery).
+    recovery: Arc<RecoveryBarrier>,
 }
 
 struct OutcomeUnknownGuard {
@@ -286,6 +380,7 @@ impl McpServer {
             transport,
             epoch_gate,
             serial_gate,
+            recovery: Arc::new(RecoveryBarrier::new()),
         })
     }
 
@@ -333,13 +428,65 @@ impl McpServer {
         request: &JsonRpcRequest,
         lifecycle: &McpRequestLifecycle,
     ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+        // Fail closed / wait for recovery before touching the write path. A
+        // request whose outcome became unknown publishes the recovery-needed
+        // state synchronously, so any writer that reaches here after that point
+        // must not POST/write on the ambiguous session until reset +
+        // re-handshake succeed.
+        self.wait_recovery_ready().await?;
         let serial_guard = match &self.serial_gate {
             Some(gate) => Some(gate.lock().await),
             None => None,
         };
+        // Re-check under the serial gate. A concurrent HTTP/SSE writer may have
+        // been queued on this gate when the outcome-unknown state was armed;
+        // acquiring the gate serializes us behind it, so this second check
+        // guarantees we never write on a session that still needs recovery.
+        if self.recovery.is_poisoned() || self.recovery.recovery_pending() {
+            drop(serial_guard);
+            self.wait_recovery_ready().await?;
+            return Box::pin(self.send_request(request, lifecycle)).await;
+        }
+        // Arm the recovery barrier synchronously the instant this write's
+        // outcome becomes unknown — *before* the serial gate is released.
+        // Declared after `serial_guard` so it drops first: the next queued
+        // writer therefore observes the armed barrier under the gate and waits,
+        // instead of racing onto the ambiguous session.
+        let barrier_arm = WriteBarrierArm {
+            recovery: &self.recovery,
+            lifecycle,
+        };
         let result = self.transport.send_and_recv(request, lifecycle).await;
+        drop(barrier_arm);
         drop(serial_guard);
         result
+    }
+
+    /// Block until no recovery is pending, or fail closed if recovery has
+    /// permanently failed. Returns immediately when the connection is healthy.
+    async fn wait_recovery_ready(&self) -> Result<()> {
+        loop {
+            if self.recovery.is_poisoned() {
+                let server_name = self.inner.lock().await.config.name.clone();
+                bail!(
+                    "MCP server `{server_name}` is unavailable: a prior request's outcome became \
+                     unknown and recovery failed; not writing on an unrecovered session"
+                );
+            }
+            if !self.recovery.recovery_pending() {
+                return Ok(());
+            }
+            // Register for a wakeup *before* re-checking so we cannot miss a
+            // concurrent `finish`/`poison` pulse.
+            let notified = self.recovery.notify.notified();
+            if self.recovery.is_poisoned() {
+                continue;
+            }
+            if !self.recovery.recovery_pending() {
+                return Ok(());
+            }
+            notified.await;
+        }
     }
 
     fn start_recovery(
@@ -367,6 +514,12 @@ impl McpServer {
     }
 
     fn spawn_recovery(&self, observed_epoch: u64, operation: String) {
+        // Publish the recovery-needed state synchronously so any writer that
+        // queues after this point waits for reset + re-handshake instead of
+        // racing onto the ambiguous session. This runs before the detached
+        // recovery task is scheduled and before the failing request releases
+        // its locks.
+        self.recovery.arm(observed_epoch);
         // Dropping a Tokio JoinHandle detaches the task. Recovery therefore
         // continues even if the request future that initiated it is cancelled.
         drop(self.start_recovery(observed_epoch, operation));
@@ -381,11 +534,18 @@ impl McpServer {
         };
         let mut epoch = self.epoch_gate.write().await;
         if *epoch != observed_epoch {
+            // Another recovery already advanced past this epoch; the connection
+            // is live again, so release any writers still waiting on the
+            // barrier for this (or an older) epoch.
+            self.recovery.finish(observed_epoch);
             return Ok(());
         }
         let server_name = self.inner.lock().await.config.name.clone();
 
         if let Err(reset_error) = self.transport.reset().await {
+            // A failed reset leaves the session unrecoverable: fail closed so
+            // later writes do not proceed without a successful handshake.
+            self.recovery.poison();
             let close_result = self.transport.close().await;
             return match close_result {
                 Ok(()) => Err(reset_error).with_context(|| {
@@ -401,6 +561,10 @@ impl McpServer {
         let refreshed = match handshake(self.transport.as_ref(), &server_name, *epoch).await {
             Ok(capabilities) => capabilities,
             Err(handshake_error) => {
+                // A failed re-handshake leaves the connection without a live
+                // MCP session; poison the barrier so later tool calls fail
+                // closed instead of writing on an unhandshaken transport.
+                self.recovery.poison();
                 let close_result = self.transport.close().await;
                 return match close_result {
                     Ok(()) => Err(handshake_error).with_context(|| {
@@ -416,6 +580,9 @@ impl McpServer {
 
         self.inner.lock().await.capabilities = refreshed;
         *epoch = epoch.wrapping_add(1);
+        // Reset + re-handshake succeeded: clear the recovery-needed state and
+        // release any writers waiting on the barrier.
+        self.recovery.finish(observed_epoch);
         drop(serial_guard);
         Ok(())
     }
@@ -789,6 +956,7 @@ impl McpRegistry {
                 transport,
                 epoch_gate: Arc::new(RwLock::new(0)),
                 serial_gate: None,
+                recovery: Arc::new(RecoveryBarrier::new()),
             }
         }
 
@@ -941,6 +1109,7 @@ impl McpRegistry {
             transport,
             epoch_gate: Arc::new(RwLock::new(0)),
             serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
         }
     }
 
@@ -1548,6 +1717,7 @@ mod tests {
             transport,
             epoch_gate: Arc::new(RwLock::new(0)),
             serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
         }
     }
 
@@ -1811,6 +1981,208 @@ mod tests {
         assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// Like `server_with_transport` but with an HTTP/SSE-style serial gate so a
+    /// second concurrent write queues behind the first.
+    fn server_with_serialized_transport(
+        name: &str,
+        transport: Arc<dyn SharedMcpTransportConn>,
+        timeout_secs: u64,
+    ) -> McpServer {
+        let mut server = server_with_transport(name, transport, timeout_secs);
+        server.serial_gate = Some(Arc::new(Mutex::new(())));
+        server
+    }
+
+    /// Transport whose first `tools/call` marks the outcome unknown after
+    /// "writing" and then hangs (the caller cancels it). A later `reset` +
+    /// re-handshake succeeds. Records the exact ordering of writes vs. reset so
+    /// tests can prove a queued second call never writes on the ambiguous
+    /// session before recovery completes.
+    struct QueuedAfterUnknownTransport {
+        tool_writes: Arc<std::sync::atomic::AtomicUsize>,
+        reset_done: Arc<std::sync::atomic::AtomicBool>,
+        wrote_before_reset: Arc<std::sync::atomic::AtomicBool>,
+        first_entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for QueuedAfterUnknownTransport {
+        async fn send_and_recv(
+            &self,
+            request: &JsonRpcRequest,
+            lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            match request.method.as_str() {
+                "tools/call" => {
+                    let n = self.tool_writes.fetch_add(1, Ordering::SeqCst);
+                    if !self.reset_done.load(Ordering::SeqCst) && n > 0 {
+                        // A write reached the transport while recovery had not
+                        // yet reset the session — the exact bug we guard.
+                        self.wrote_before_reset.store(true, Ordering::SeqCst);
+                    }
+                    if n == 0 {
+                        // First call: outcome becomes unknown after the write,
+                        // then the future hangs until the caller cancels it.
+                        lifecycle.mark_outcome_unknown(0);
+                        self.first_entered.notify_one();
+                        std::future::pending::<()>().await;
+                        unreachable!("cancelled before resuming");
+                    }
+                    Ok(crate::mcp_protocol::JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: request.id.clone(),
+                        result: Some(json!({"ok": true})),
+                        error: None,
+                    })
+                }
+                "initialize" => Ok(crate::mcp_protocol::JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: request.id.clone(),
+                    result: Some(json!({
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "queued", "version": "1"}
+                    })),
+                    error: None,
+                }),
+                "notifications/initialized" => Ok(crate::mcp_protocol::JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: None,
+                    result: None,
+                    error: None,
+                }),
+                other => panic!("unexpected method {other}"),
+            }
+        }
+
+        async fn reset(&self) -> Result<()> {
+            self.reset_done.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Blocker #1 regression: a second call queued while the first call's
+    /// outcome is unknown must wait for reset + re-handshake and must never
+    /// write on the ambiguous session before recovery completes.
+    #[tokio::test]
+    async fn queued_write_waits_for_recovery_after_outcome_unknown() {
+        let tool_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reset_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wrote_before_reset = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(QueuedAfterUnknownTransport {
+            tool_writes: Arc::clone(&tool_writes),
+            reset_done: Arc::clone(&reset_done),
+            wrote_before_reset: Arc::clone(&wrote_before_reset),
+            first_entered: Arc::clone(&first_entered),
+        });
+        let server = server_with_serialized_transport("queued", transport, 5);
+
+        // First call writes, marks outcome-unknown, then hangs; cancel it.
+        let first_server = server.clone();
+        let first = zeroclaw_spawn::spawn!(async move {
+            first_server.call_tool("side_effect", json!({})).await
+        });
+        first_entered.notified().await;
+        first.abort();
+        let _ = first.await;
+
+        // The queued second call must not resolve until recovery reset the
+        // session, and must never write before that reset.
+        let second = timeout(Duration::from_secs(3), server.call_tool("probe", json!({})))
+            .await
+            .expect("second call must not hang behind recovery")
+            .expect("second call must succeed on the recovered session");
+        assert_eq!(second, json!({"ok": true}));
+        assert!(
+            !wrote_before_reset.load(Ordering::SeqCst),
+            "second call wrote on the ambiguous session before reset/re-handshake"
+        );
+        assert!(
+            reset_done.load(Ordering::SeqCst),
+            "recovery must have reset the session before the second write"
+        );
+        // Two tool writes total: the cancelled first and the recovered second.
+        assert_eq!(tool_writes.load(Ordering::SeqCst), 2);
+    }
+
+    /// Transport whose first `tools/call` becomes outcome-unknown after writing,
+    /// but whose recovery re-handshake permanently fails.
+    struct FailedRehandshakeTransport {
+        tool_writes: Arc<std::sync::atomic::AtomicUsize>,
+        first_entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for FailedRehandshakeTransport {
+        async fn send_and_recv(
+            &self,
+            request: &JsonRpcRequest,
+            lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            match request.method.as_str() {
+                "tools/call" => {
+                    self.tool_writes.fetch_add(1, Ordering::SeqCst);
+                    lifecycle.mark_outcome_unknown(0);
+                    self.first_entered.notify_one();
+                    std::future::pending::<()>().await;
+                    unreachable!("cancelled before resuming");
+                }
+                // Re-handshake fails: `initialize` errors during recovery.
+                "initialize" => bail!("re-handshake refused"),
+                other => panic!("unexpected method {other}"),
+            }
+        }
+
+        async fn reset(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Blocker #1 regression: after a post-write outcome-unknown request whose
+    /// recovery re-handshake fails, later calls must fail closed instead of
+    /// writing on an unrecovered/unhandshaken session.
+    #[tokio::test]
+    async fn failed_rehandshake_fails_closed_for_later_calls() {
+        let tool_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FailedRehandshakeTransport {
+            tool_writes: Arc::clone(&tool_writes),
+            first_entered: Arc::clone(&first_entered),
+        });
+        let server = server_with_serialized_transport("failing", transport, 5);
+
+        let first_server = server.clone();
+        let first = zeroclaw_spawn::spawn!(async move {
+            first_server.call_tool("side_effect", json!({})).await
+        });
+        first_entered.notified().await;
+        first.abort();
+        let _ = first.await;
+
+        // Recovery (detached) must poison the barrier once its re-handshake
+        // fails; the next call then fails closed without writing.
+        let error = timeout(Duration::from_secs(3), server.call_tool("probe", json!({})))
+            .await
+            .expect("later call must not hang behind a failed recovery")
+            .expect_err("later call must fail closed after failed re-handshake");
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("unavailable") || detail.contains("recovery failed"),
+            "expected fail-closed error, got: {detail}"
+        );
+        // Only the first (cancelled) call ever wrote a tool request.
+        assert_eq!(tool_writes.load(Ordering::SeqCst), 1);
+    }
+
     /// Build an `McpServer` whose transport yields `result` on every call.
     fn server_returning(result: serde_json::Value) -> McpServer {
         let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FakeTransport { result });
@@ -1831,6 +2203,7 @@ mod tests {
             transport,
             epoch_gate: Arc::new(RwLock::new(0)),
             serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
         }
     }
 
@@ -1857,6 +2230,7 @@ mod tests {
             transport,
             epoch_gate: Arc::new(RwLock::new(0)),
             serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
         }
     }
 

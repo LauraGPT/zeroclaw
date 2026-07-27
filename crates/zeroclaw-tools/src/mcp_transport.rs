@@ -20,6 +20,11 @@ use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 /// Maximum bytes for a single JSON-RPC response.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 
+/// How often the stdio child-exit watcher polls the direct child process for
+/// exit. Short enough that a dead child is surfaced to health checks promptly,
+/// long enough to stay negligible against idle transports.
+const STDIO_CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Timeout for init/list operations.
 const RECV_TIMEOUT_SECS: u64 = 30;
 
@@ -244,9 +249,30 @@ impl Drop for StdioPendingGuard {
 
 struct StdioConn {
     generation: u64,
-    child: Child,
+    /// Shared so both the child-exit watcher (nonblocking `try_wait`) and the
+    /// reaper (`start_kill` + `wait`) can access the direct child without a
+    /// second `Child` handle.
+    child: Arc<tokio::sync::Mutex<Child>>,
     stdin: tokio::process::ChildStdin,
     reader: tokio::task::JoinHandle<()>,
+    /// Set to `true` by the child-exit watcher when the *direct* child process
+    /// exits, independent of whether its stdout pipe has reached EOF (a
+    /// descendant may keep the inherited pipe open). Health checks consult this
+    /// so a dead child is never reported healthy.
+    child_exited: Arc<AtomicBool>,
+    /// Background task that watches the direct child for exit.
+    exit_watcher: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StdioConn {
+    fn drop(&mut self) {
+        // Abort the background tasks so their `Arc<Mutex<Child>>` clone is
+        // released. This lets the last `Child` owner drop, which — combined
+        // with `kill_on_drop(true)` — reaps the direct child when a connection
+        // is dropped without going through `reap_conn` (e.g. registry teardown).
+        self.reader.abort();
+        self.exit_watcher.abort();
+    }
 }
 
 #[derive(Default)]
@@ -262,6 +288,11 @@ pub struct StdioTransport {
     pending: PendingMap,
     alive: Arc<AtomicBool>,
     active_generation: Arc<AtomicU64>,
+    /// Direct-child exit signal for the active connection, independent of
+    /// stdout EOF. Reset to `false` on every spawn and set to `true` by the
+    /// child-exit watcher when the direct child process exits. Read
+    /// synchronously by `health_check`.
+    child_exited: Arc<AtomicBool>,
 }
 
 impl StdioTransport {
@@ -269,12 +300,14 @@ impl StdioTransport {
         let pending = Arc::new(ParkingMutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(false));
         let active_generation = Arc::new(AtomicU64::new(1));
+        let child_exited = Arc::new(AtomicBool::new(false));
         let conn = Self::spawn(
             config,
             1,
             Arc::clone(&pending),
             Arc::clone(&alive),
             Arc::clone(&active_generation),
+            Arc::clone(&child_exited),
         )?;
         Ok(Self {
             config: config.clone(),
@@ -285,6 +318,7 @@ impl StdioTransport {
             pending,
             alive,
             active_generation,
+            child_exited,
         })
     }
 
@@ -294,6 +328,7 @@ impl StdioTransport {
         pending: PendingMap,
         alive: Arc<AtomicBool>,
         active_generation: Arc<AtomicU64>,
+        child_exited: Arc<AtomicBool>,
     ) -> Result<StdioConn> {
         let mut child = Command::new(&config.command)
             .args(&config.args)
@@ -331,7 +366,9 @@ impl StdioTransport {
             );
             anyhow::Error::msg(format!("no stdout on MCP server `{}`", config.name))
         })?;
+        // Fresh generation starts alive and not-exited.
         alive.store(true, Ordering::Release);
+        child_exited.store(false, Ordering::Release);
         let server_name = config.name.clone();
         let reader = zeroclaw_spawn::spawn!(stdio_read_loop(
             server_name,
@@ -342,11 +379,19 @@ impl StdioTransport {
             active_generation,
         ));
 
+        let child = Arc::new(tokio::sync::Mutex::new(child));
+        let watcher_child = Arc::clone(&child);
+        let watcher_flag = Arc::clone(&child_exited);
+        let exit_watcher =
+            zeroclaw_spawn::spawn!(stdio_child_exit_watcher(watcher_child, watcher_flag,));
+
         Ok(StdioConn {
             generation,
             child,
             stdin,
             reader,
+            child_exited,
+            exit_watcher,
         })
     }
 
@@ -363,26 +408,64 @@ impl StdioTransport {
         Ok(())
     }
 
-    async fn reap_conn(mut conn: StdioConn, server_name: &str) -> Result<()> {
+    async fn reap_conn(conn: StdioConn, server_name: &str) -> Result<()> {
+        // Stop the background tasks so they release their `Arc<Mutex<Child>>`
+        // clone and cannot race the reaping `wait`. We abort via `&self`
+        // handles (JoinHandle::abort) rather than moving the handles out, since
+        // `StdioConn`'s `Drop` impl also aborts them on scope exit.
         conn.reader.abort();
-        let _ = conn.reader.await;
-        drop(conn.stdin);
+        conn.exit_watcher.abort();
 
-        if conn
-            .child
+        let child = Arc::clone(&conn.child);
+        let mut child = child.lock().await;
+        if child
             .try_wait()
             .with_context(|| format!("failed to inspect MCP server `{server_name}` child"))?
             .is_none()
         {
-            conn.child
+            child
                 .start_kill()
                 .with_context(|| format!("failed to kill MCP server `{server_name}` child"))?;
-            conn.child
+            child
                 .wait()
                 .await
                 .with_context(|| format!("failed to reap MCP server `{server_name}` child"))?;
         }
+        // The direct child is now gone regardless of stdout pipe state.
+        conn.child_exited.store(true, Ordering::Release);
         Ok(())
+    }
+}
+
+/// Watch the *direct* child process for exit, independent of its stdout pipe.
+///
+/// A misbehaving MCP server can spawn a descendant that inherits stdout and
+/// keeps the pipe open after the direct child exits; the stdout reader would
+/// then never see EOF. This nonblocking watcher polls `try_wait` so a dead
+/// direct child is observed and surfaced through `health_check` even while the
+/// inherited pipe stays open.
+async fn stdio_child_exit_watcher(
+    child: Arc<tokio::sync::Mutex<Child>>,
+    child_exited: Arc<AtomicBool>,
+) {
+    loop {
+        {
+            let mut guard = child.lock().await;
+            match guard.try_wait() {
+                Ok(Some(_status)) => {
+                    child_exited.store(true, Ordering::Release);
+                    return;
+                }
+                Ok(None) => {}
+                // Treat an inspection error as a dead child: fail closed rather
+                // than reporting a possibly-exited process as healthy.
+                Err(_) => {
+                    child_exited.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(STDIO_CHILD_POLL_INTERVAL).await;
     }
 }
 
@@ -619,6 +702,7 @@ impl SharedMcpTransportConn for StdioTransport {
             Arc::clone(&self.pending),
             Arc::clone(&self.alive),
             Arc::clone(&self.active_generation),
+            Arc::clone(&self.child_exited),
         )?;
         state.conn = Some(conn);
         Ok(())
@@ -640,7 +724,12 @@ impl SharedMcpTransportConn for StdioTransport {
     }
 
     fn health_check(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
+        // Healthy only when the reader still owns a live stream *and* the direct
+        // child has not exited. The `child_exited` flag is driven by a
+        // `try_wait`-based watcher independent of stdout EOF, so a parent that
+        // exits while a descendant keeps the inherited stdout pipe open is
+        // reported unhealthy instead of falsely alive.
+        self.alive.load(Ordering::Acquire) && !self.child_exited.load(Ordering::Acquire)
     }
 }
 
@@ -1716,6 +1805,47 @@ mod tests {
         );
         assert!(transport.pending.lock().is_empty());
         SharedMcpTransportConn::close(transport.as_ref())
+            .await
+            .expect("close transport");
+    }
+
+    /// Blocker #2 regression: when the direct child exits but a descendant
+    /// keeps the inherited stdout pipe open (so the reader never sees EOF),
+    /// `health_check` must still report the transport unhealthy. It relies on
+    /// the nonblocking direct-child-exit watcher, not on stdout EOF.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_check_detects_direct_child_exit_with_inherited_stdout_open() {
+        let config = McpServerConfig {
+            name: "stdio-orphan-stdout".into(),
+            transport: McpTransport::Stdio,
+            command: "/bin/sh".into(),
+            // Background a long-lived process that inherits stdout, then the
+            // direct shell child exits immediately. stdout stays open via the
+            // descendant, so the reader loop never observes EOF.
+            args: vec!["-c".into(), "sleep 60 & exit 0".into()],
+            ..Default::default()
+        };
+        let transport = StdioTransport::new(&config).expect("build transport");
+
+        // Once the direct child exits, the watcher must flip health to false
+        // even though stdout (held by the descendant) never reached EOF.
+        let became_unhealthy = timeout(Duration::from_secs(5), async {
+            loop {
+                if !SharedMcpTransportConn::health_check(&transport) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            became_unhealthy.is_ok(),
+            "health_check kept reporting healthy after the direct child exited \
+             (inherited stdout stayed open, so EOF alone is insufficient)"
+        );
+
+        SharedMcpTransportConn::close(&transport)
             .await
             .expect("close transport");
     }
