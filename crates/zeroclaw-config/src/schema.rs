@@ -18931,9 +18931,10 @@ impl Config {
                      implemented in the runtime; this setting has no effect. It is also a \
                      bare model id reused by agents resolving to different providers \
                      ({detail}), which names no provider of its own and would be ambiguous \
-                     for at least one of them if compression were read again. Migrate to \
-                     context_compression.summary_provider (or an agent-level \
-                     summary_provider), which is self-contained and names its own provider."
+                     for at least one of them if compression were read again. Remove the \
+                     unsupported context_compression setting (every context_compression \
+                     field, including summary_provider, is currently inert), or wait for a \
+                     separately accepted compression design before configuring it."
                 ),
                 format!("runtime_profiles.{profile_alias}.context_compression.summary_model"),
             ));
@@ -34484,6 +34485,23 @@ allowed_users = []
         assert!(
             w.message.contains("alpha -> custom.p1") && w.message.contains("beta -> custom.p2"),
             "message must keep naming the affected agents and providers: {}",
+            w.message
+        );
+        // The remediation must NOT send the operator to another inert
+        // context_compression field: this PR's per-field pass classifies a
+        // non-default `summary_provider` as unsupported/inert too, so
+        // "migrate to context_compression.summary_provider" would just produce
+        // another no-effect setting and another warning.
+        assert!(
+            !w.message
+                .contains("Migrate to context_compression.summary_provider"),
+            "remediation must not recommend migrating to the inert summary_provider: {}",
+            w.message
+        );
+        assert!(
+            w.message
+                .contains("Remove the unsupported context_compression setting"),
+            "remediation should tell the operator to remove the inert setting: {}",
             w.message
         );
     }
