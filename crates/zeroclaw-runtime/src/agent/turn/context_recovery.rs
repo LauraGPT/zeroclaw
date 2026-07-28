@@ -389,7 +389,7 @@ mod tests {
     fn append_context_exhausted_notice_appends_terminal_message_on_overflow() {
         let mut history = vec![ChatMessage::user("only turn")];
         let mut out: Vec<ChatMessage> = Vec::new();
-        let e = anyhow::anyhow!("maximum context length exceeded");
+        let e = anyhow::Error::msg("maximum context length exceeded");
 
         let appended = append_context_exhausted_notice(&e, &mut history, Some(&mut out));
 
@@ -420,7 +420,7 @@ mod tests {
         let mut history = vec![ChatMessage::user("only turn")];
         let history_len_before = history.len();
         let mut out: Vec<ChatMessage> = Vec::new();
-        let e = anyhow::anyhow!("connection reset by peer");
+        let e = anyhow::Error::msg("connection reset by peer");
 
         let appended = append_context_exhausted_notice(&e, &mut history, Some(&mut out));
 
