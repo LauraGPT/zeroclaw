@@ -1,7 +1,9 @@
 //! LLM-failure recording and in-loop context-overflow recovery.
 
 use super::context::TurnCtx;
-use super::outcome::is_tool_loop_cancelled;
+use super::outcome::{
+    StreamCancelledAfterOutput, StreamInterruptedAfterOutput, is_tool_loop_cancelled,
+};
 use crate::agent::history::estimate_history_tokens;
 use crate::agent::history_trim::trim_to_recent_turns;
 use crate::observability::{Observer, ObserverEvent};
@@ -158,6 +160,36 @@ pub(crate) async fn try_recover_context_overflow(
         }
     }
     false
+}
+
+/// After in-loop context recovery has failed, append a terminal assistant notice when the
+/// turn is ending on context-window exhaustion, so the caller and user see a clear stop
+/// reason instead of a silent idle return. Returns whether a notice was appended. Mirrors
+/// the adjacent stream-interrupted/cancelled terminal notices.
+pub(crate) fn append_context_exhausted_notice(
+    e: &anyhow::Error,
+    history: &mut Vec<ChatMessage>,
+    new_messages_out: Option<&mut Vec<ChatMessage>>,
+) -> bool {
+    // A stream interruption/cancellation already carries its own terminal notice, and its
+    // Display can embed a provider error that matches the context-window hints below; skip
+    // so a single failure never produces two terminal messages.
+    if e.downcast_ref::<StreamInterruptedAfterOutput>().is_some()
+        || e.downcast_ref::<StreamCancelledAfterOutput>().is_some()
+    {
+        return false;
+    }
+    if !zeroclaw_providers::reliable::is_context_window_exceeded(e) {
+        return false;
+    }
+    let msg = ChatMessage::assistant(crate::i18n::get_required_cli_string(
+        "turn-context-exhausted",
+    ));
+    if let Some(out) = new_messages_out {
+        out.push(msg.clone());
+    }
+    history.push(msg);
+    true
 }
 
 #[cfg(test)]
@@ -351,5 +383,87 @@ mod tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    #[test]
+    fn append_context_exhausted_notice_appends_terminal_message_on_overflow() {
+        let mut history = vec![ChatMessage::user("only turn")];
+        let mut out: Vec<ChatMessage> = Vec::new();
+        let e = anyhow::anyhow!("maximum context length exceeded");
+
+        let appended = append_context_exhausted_notice(&e, &mut history, Some(&mut out));
+
+        assert!(appended, "overflow error must append a terminal notice");
+        assert_eq!(out.len(), 1, "the notice must mirror into new_messages_out");
+        let last = history.last().expect("history must carry the notice");
+        assert_eq!(last.role, "assistant");
+        let expected = crate::i18n::get_required_cli_string("turn-context-exhausted");
+        assert_eq!(last.content, expected);
+        // "window" appears in the rendered message but not in the Fluent key name
+        // itself, so this catches a missing/misspelled key (which would render as
+        // the literal `{turn-context-exhausted}` fallback) that a same-fn
+        // `assert_eq!` against `expected` cannot.
+        assert!(
+            last.content.to_lowercase().contains("window"),
+            "notice must render the real Fluent message, not a missing-key fallback: {}",
+            last.content
+        );
+        assert!(
+            !last.content.starts_with('{'),
+            "notice must not be the missing-key fallback shape: {}",
+            last.content
+        );
+    }
+
+    #[test]
+    fn append_context_exhausted_notice_noop_on_non_overflow_error() {
+        let mut history = vec![ChatMessage::user("only turn")];
+        let history_len_before = history.len();
+        let mut out: Vec<ChatMessage> = Vec::new();
+        let e = anyhow::anyhow!("connection reset by peer");
+
+        let appended = append_context_exhausted_notice(&e, &mut history, Some(&mut out));
+
+        assert!(!appended, "non-overflow error must not append a notice");
+        assert!(
+            out.is_empty(),
+            "no message should be mirrored on a non-overflow error"
+        );
+        assert_eq!(
+            history.len(),
+            history_len_before,
+            "history must be unchanged on a non-overflow error"
+        );
+    }
+
+    #[test]
+    fn append_context_exhausted_notice_skips_stream_interrupted_error() {
+        // The stream-interrupted arm already appended its own terminal notice, and its
+        // Display embeds the raw provider message, which can itself look like a
+        // context-window hint. The helper must not append a second notice for it.
+        let mut history = vec![ChatMessage::user("only turn")];
+        let history_len_before = history.len();
+        let mut out: Vec<ChatMessage> = Vec::new();
+        let interrupted = StreamInterruptedAfterOutput {
+            partial_text: "partial reply".to_string(),
+            message: "model_provider stream error: maximum context length exceeded".to_string(),
+        };
+        let e = anyhow::Error::new(interrupted);
+
+        let appended = append_context_exhausted_notice(&e, &mut history, Some(&mut out));
+
+        assert!(
+            !appended,
+            "a stream-interrupted error must not get a second terminal notice"
+        );
+        assert!(
+            out.is_empty(),
+            "no message should be mirrored for a stream-interrupted error"
+        );
+        assert_eq!(
+            history.len(),
+            history_len_before,
+            "history must be unchanged for a stream-interrupted error"
+        );
     }
 }

@@ -26,7 +26,9 @@ pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
-pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
+pub(crate) use context_recovery::{
+    append_context_exhausted_notice, record_llm_failure, try_recover_context_overflow,
+};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
@@ -717,6 +719,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     }
                     history.push(msg);
                 }
+                // Recovery could not trim the history further: leave a terminal
+                // notice instead of returning the error with no visible reason,
+                // so the user does not see the agent go idle silently.
+                append_context_exhausted_notice(&e, history, new_messages_out.as_deref_mut());
                 return Err(e);
             }
         };
