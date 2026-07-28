@@ -297,6 +297,32 @@ export function decideSop(
   );
 }
 
+export interface SopCancelResult {
+  run_id: string;
+  sop_name: string;
+  status: SopRunStatus;
+  already_terminal: boolean;
+}
+
+/// Request a durable operator cancellation of a running SOP. Safe cancel: the
+/// step in flight finishes on its own and the run stops at the next step
+/// boundary, not mid-step. Idempotent - cancelling an already-terminal run
+/// (completed, failed, or already cancelled) returns 200 with
+/// `already_terminal: true` rather than erroring.
+export function cancelSop(
+  name: string,
+  runId: string,
+  reason?: string,
+): Promise<SopCancelResult> {
+  return apiFetch<SopCancelResult>(
+    `/api/sops/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/cancel`,
+    {
+      method: 'POST',
+      body: JSON.stringify(reason ? { reason } : {}),
+    },
+  );
+}
+
 /// Index a run overlay's node states by step number. Shared by every view
 /// that projects run state onto graph nodes.
 export function overlayStateByStep(

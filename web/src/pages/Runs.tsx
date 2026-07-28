@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Activity, ExternalLink, Loader2 } from 'lucide-react';
-import { runStatusBadge, type SopRunSummary } from '@/lib/sops';
+import { Activity, ExternalLink, Loader2, Square } from 'lucide-react';
+import { cancelSop, isTerminalRunStatus, runStatusBadge, type SopRunSummary } from '@/lib/sops';
 import { basePath } from '@/lib/basePath';
 import { getToken } from '@/lib/auth';
 import { formatRelative } from '@/lib/format';
@@ -29,6 +29,7 @@ export default function Runs() {
   const [ready, setReady] = useState(false);
   const [disabled, setDisabled] = useState(false);
   const [activeOnly, setActiveOnly] = useState(false);
+  const [cancellingIds, setCancellingIds] = useState<Set<string>>(new Set());
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -90,6 +91,25 @@ export default function Runs() {
     const list = sortRuns(runs);
     return activeOnly ? list.filter((r) => r.active) : list;
   }, [runs, activeOnly]);
+
+  // Operator Stop, per row. The live WS broadcast pushes the run's Cancelled
+  // summary once the engine settles at the next step boundary, so the row's
+  // status badge updates itself without a manual refetch here.
+  const handleCancel = useCallback((sopName: string, runId: string) => {
+    setCancellingIds((prev) => new Set(prev).add(runId));
+    cancelSop(sopName, runId)
+      .catch(() => {
+        // Best-effort: the row is the source of truth once the next WS
+        // frame (or a reload) lands; nothing further to reconcile here.
+      })
+      .finally(() => {
+        setCancellingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(runId);
+          return next;
+        });
+      });
+  }, []);
 
   return (
     <div className="space-y-4">
@@ -162,13 +182,30 @@ export default function Runs() {
                     {r.run_id.slice(0, 8)}
                   </td>
                   <td className="px-4 py-2.5 text-right">
-                    <Link
-                      to={`/runs/${encodeURIComponent(r.sop_name)}/${encodeURIComponent(r.run_id)}`}
-                      className="inline-flex items-center gap-1 text-xs text-pc-accent hover:underline"
-                    >
-                      {t('runs.open')}
-                      <ExternalLink className="h-3 w-3" aria-hidden />
-                    </Link>
+                    <div className="flex items-center justify-end gap-2">
+                      {!isTerminalRunStatus(r.status) ? (
+                        <button
+                          type="button"
+                          disabled={cancellingIds.has(r.run_id)}
+                          onClick={() => handleCancel(r.sop_name, r.run_id)}
+                          className="inline-flex items-center gap-1 rounded border border-status-error/25 bg-status-error/10 px-2 py-1 text-xs text-status-error hover:bg-status-error/15 disabled:opacity-40"
+                        >
+                          {cancellingIds.has(r.run_id) ? (
+                            <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                          ) : (
+                            <Square className="h-3 w-3" aria-hidden fill="currentColor" />
+                          )}
+                          {t('sops.stop')}
+                        </button>
+                      ) : null}
+                      <Link
+                        to={`/runs/${encodeURIComponent(r.sop_name)}/${encodeURIComponent(r.run_id)}`}
+                        className="inline-flex items-center gap-1 text-xs text-pc-accent hover:underline"
+                      >
+                        {t('runs.open')}
+                        <ExternalLink className="h-3 w-3" aria-hidden />
+                      </Link>
+                    </div>
                   </td>
                 </tr>
               ))}

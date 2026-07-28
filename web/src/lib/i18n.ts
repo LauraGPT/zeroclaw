@@ -1153,6 +1153,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.deny': 'Deny',
     'sops.run_payload_placeholder': 'Manual trigger payload (JSON)',
     'sops.run_error': 'Run failed',
+    'sops.stop': 'Stop',
+    'sops.stop_error': 'Failed to stop run',
     'sops.run_state.pending': 'pending',
     'sops.run_state.active': 'active',
     'sops.run_state.completed': 'done',
