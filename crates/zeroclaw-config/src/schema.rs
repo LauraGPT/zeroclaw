@@ -18943,33 +18943,33 @@ impl Config {
         }
     }
 
-    /// Surface the cross-provider shape on a legacy config that has NOT
-    /// migrated to `summary_provider`. Context compression is not currently
-    /// implemented in the runtime, so this knob is already inert like every
-    /// other `context_compression` field (see
-    /// `collect_context_compression_ignored_warnings`); this diagnostic adds
-    /// cross-provider detail as a more specific companion for the same
-    /// config line. The deprecated
+    /// Surface cross-provider ambiguity in a legacy config while reporting
+    /// the current contract: context compression has no runtime consumer, so
+    /// this knob is inert like every other `context_compression` field (see
+    /// `collect_context_compression_ignored_warnings`). This diagnostic adds
+    /// config-shape detail as a more specific companion for the same line. The
+    /// deprecated
     /// `runtime_profiles.<p>.context_compression.summary_model` is a bare
     /// model id that names no provider of its own — it would need to be
     /// resolved onto each consuming agent's OWN provider were the field ever
     /// read again — so when a single profile is shared by agents resolving
     /// to MORE THAN ONE distinct provider, that one bare id is ambiguous for
-    /// at least one of them. The new `summary_provider` (agent override or
-    /// profile level) supersedes the bare id and is self-contained, so an
-    /// agent that sets it is safe and excluded from the count.
+    /// at least one of them. A `summary_provider` supplies provider identity
+    /// for this narrower diagnostic and excludes the corresponding value from
+    /// the ambiguity count; it does not make context compression functional.
     ///
-    /// This is the offline, deterministic "startup diagnostic" the review
-    /// asked for: no schema bump, no network, no model catalog. It names the
-    /// profile, the affected agents, and their differing providers, and
-    /// recommends migrating to `context_compression.summary_provider`.
+    /// The diagnostic is offline and deterministic: no schema bump, no
+    /// network, and no model catalog. It names the profile, the affected
+    /// agents, and their differing providers, then recommends removing the
+    /// unsupported setting or waiting for an accepted compression design.
     fn collect_cross_provider_summary_model_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
         for (profile_alias, profile) in &self.runtime_profiles {
-            // Only the deprecated bare summary_model is at risk; a profile-level
-            // summary_provider already supersedes it for every consumer.
+            // Only the deprecated bare summary_model lacks provider identity.
+            // A profile-level summary_provider excludes this narrower
+            // ambiguity shape, but context compression remains inert.
             if !profile
                 .context_compression
                 .summary_provider
@@ -18985,10 +18985,11 @@ impl Config {
                 continue;
             }
 
-            // Gather the agents that (a) reference this profile and (b) have no
-            // agent-level summary_provider override (an override supersedes the
-            // bare id, so the agent is safe). For each, resolve the canonical
-            // provider entry its bare summary_model would be dispatched onto.
+            // Gather agents that reference this profile and have no agent-level
+            // summary_provider identity. An override excludes that agent from
+            // this ambiguity diagnostic but does not make compression
+            // functional. Resolve the provider that would be paired with the
+            // bare model if a future implementation consumed this config.
             let mut affected: Vec<(String, String)> = Vec::new();
             for (agent_alias, agent) in &self.agents {
                 if agent.runtime_profile.trim() != profile_alias {
@@ -19001,10 +19002,10 @@ impl Config {
                 affected.push((agent_alias.clone(), provider_label));
             }
 
-            // The bug only manifests across distinct providers: a single shared
-            // bare id sent to two or more different providers. Same-provider use
-            // is the deprecated-but-correct case and stays silent here (the
-            // runtime deprecation WARN still nudges migration).
+            // Cross-provider ambiguity requires distinct providers. A
+            // same-provider bare id is still inert, but the generic
+            // context-compression warning reports that fact without this
+            // additional ambiguity detail.
             let distinct: std::collections::BTreeSet<&str> =
                 affected.iter().map(|(_, p)| p.as_str()).collect();
             if distinct.len() < 2 {

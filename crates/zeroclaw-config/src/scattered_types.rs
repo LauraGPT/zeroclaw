@@ -276,11 +276,11 @@ fn default_tool_result_retrim_chars() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
-    /// The runtime context compressor was removed; nothing in the
-    /// workspace reads this flag anymore, so setting it to `true` currently
-    /// has no effect. Defaults to `false` to match actual runtime behavior;
-    /// `Config::collect_warnings` flags an explicit `true` (see
-    /// `context_compression_unsupported`).
+    /// The runtime context compressor was removed; no runtime execution path
+    /// consumes this flag, so setting it to `true` currently has no effect.
+    /// Defaults to `false` to match actual runtime behavior;
+    /// `Config::collect_warnings` reads an explicit `true` only to report
+    /// `context_compression_unsupported`.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
     #[serde(default = "default_threshold_ratio")]
