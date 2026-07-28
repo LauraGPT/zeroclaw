@@ -268,7 +268,10 @@ impl Tool for ContentSearchTool {
                         format_rg_output(&raw_stdout, &workspace_canon, output_mode, max_results)
                     }
                     SearchBackend::Grep => {
-                        format_grep_output(&raw_stdout, &workspace_canon, output_mode, max_results)
+                        // grep receives a de-verbatimized search path (see build_grep_command), so its
+                        // output paths are de-verbatimized too — relativize against a matching prefix.
+                        let ws = strip_verbatim_prefix(&workspace_canon);
+                        format_grep_output(&raw_stdout, ws.as_ref(), output_mode, max_results)
                     }
                     SearchBackend::Internal => unreachable!(),
                 }
@@ -823,7 +826,7 @@ fn build_grep_command(
 
     cmd.arg("--");
     cmd.arg(pattern);
-    cmd.arg(search_path);
+    cmd.arg(strip_verbatim_prefix(search_path).as_ref());
 
     cmd
 }
@@ -988,6 +991,25 @@ fn relativize_path(line: &str, workspace_prefix: &str) -> String {
         return trimmed.to_string();
     }
     line.to_string()
+}
+
+/// Strip a Windows extended-length (`\\?\`) verbatim prefix so external tools
+/// such as `grep` receive a plain path they can parse. No-op for non-verbatim
+/// paths (and thus on non-Windows). Handles both the disk form `\\?\C:\..`
+/// (→ `C:\..`) and the UNC form `\\?\UNC\server\share` (→ `\\server\share`).
+fn strip_verbatim_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
+    match path.to_str() {
+        Some(s) => {
+            if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                std::borrow::Cow::Owned(std::path::PathBuf::from(format!(r"\\{rest}")))
+            } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+                std::borrow::Cow::Owned(std::path::PathBuf::from(rest))
+            } else {
+                std::borrow::Cow::Borrowed(path)
+            }
+        }
+        None => std::borrow::Cow::Borrowed(path),
+    }
 }
 
 fn parse_content_line(line: &str) -> Option<(&str, bool)> {
@@ -1509,6 +1531,46 @@ mod tests {
         // Byte index 4 splits the first Chinese character.
         let truncated = truncate_utf8(text, 4);
         assert_eq!(truncated, "abc");
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_strips_disk_form() {
+        let result = strip_verbatim_prefix(Path::new(r"\\?\C:\Users\me\ws"));
+        assert_eq!(result.as_ref(), Path::new(r"C:\Users\me\ws"));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_strips_unc_form() {
+        let result = strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\dir"));
+        assert_eq!(result.as_ref(), Path::new(r"\\server\share\dir"));
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_noop_on_plain_paths() {
+        let unix_path = Path::new("/tmp/ws/sub");
+        assert_eq!(strip_verbatim_prefix(unix_path).as_ref(), unix_path);
+
+        let windows_path = Path::new(r"C:\ws\sub");
+        let result = strip_verbatim_prefix(windows_path);
+        assert_eq!(result.as_ref(), windows_path);
+        assert!(
+            matches!(result, std::borrow::Cow::Borrowed(_)),
+            "plain paths must not be reallocated"
+        );
+    }
+
+    #[test]
+    fn build_grep_command_de_verbatimizes_search_path() {
+        let cmd = build_grep_command("pat", Path::new(r"\\?\C:\ws"), "content", None, true, 0, 0);
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args.last().copied(), Some(std::ffi::OsStr::new(r"C:\ws")));
+
+        let plain_cmd = build_grep_command("pat", Path::new(r"C:\ws"), "content", None, true, 0, 0);
+        let plain_args: Vec<&std::ffi::OsStr> = plain_cmd.get_args().collect();
+        assert_eq!(
+            plain_args.last().copied(),
+            Some(std::ffi::OsStr::new(r"C:\ws"))
+        );
     }
 
     #[tokio::test]
