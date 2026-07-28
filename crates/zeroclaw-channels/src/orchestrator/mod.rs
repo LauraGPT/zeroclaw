@@ -10060,8 +10060,8 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if channels.is_empty() {
         // Surface dangling peer-group channel references even when no
         // real-time channel is active — the general doctor and gateway API
-        // already expose this via `Config::collect_warnings()`, and #8997
-        // requires the same diagnostic on the `channel doctor` path.
+        // already expose this via `Config::collect_warnings()`, so the
+        // `channel doctor` path should report the same diagnostic.
         let dangling = { peer_group_dangling_warning_lines(&config_arc.read()) };
         if !dangling.is_empty() {
             println!("🩺 ZeroClaw Channel Doctor");
@@ -11652,8 +11652,8 @@ mod tests {
 
     #[test]
     fn channel_doctor_surfaces_dangling_peer_group_channel_warning() {
-        // #8997 requires the dangling `peer_groups.<name>.channel` diagnostic
-        // on the `zeroclaw channel doctor` path, not only the general doctor.
+        // The dangling `peer_groups.<name>.channel` diagnostic belongs on the
+        // `zeroclaw channel doctor` path, not only the general doctor.
         // `doctor_channels()` reaches the user through
         // `peer_group_dangling_warning_lines`, which is derived from the shared
         // `Config::collect_warnings()` source of truth (no second validator).
