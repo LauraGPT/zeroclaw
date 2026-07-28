@@ -77,6 +77,12 @@ pub struct Skill {
     /// then fall back to a single free-text option. See [`SkillSlashOption`].
     #[serde(default)]
     pub slash_options: Vec<SkillSlashOption>,
+    /// When `true`, this skill's full instructions stay inlined in the system
+    /// prompt even in [`zeroclaw_config::schema::SkillsPromptInjectionMode::Compact`]
+    /// mode, instead of being loaded on demand via `read_skill(name)`. Intended
+    /// for policy/critical skills that must always be visible to the model.
+    #[serde(default)]
+    pub always: bool,
     #[serde(skip)]
     pub location: Option<PathBuf>,
 }
@@ -333,6 +339,10 @@ struct SkillMeta {
     prompts: Vec<String>,
     #[serde(default)]
     slash_options: Vec<SkillSlashOption>,
+    /// See [`Skill::always`]. Declared in SKILL.toml under `[skill]` as
+    /// `always = true`.
+    #[serde(default)]
+    always: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,6 +386,8 @@ struct SkillMarkdownMeta {
     /// so a SKILL.md skill can drive native Discord slash commands — parity with
     /// SKILL.toml's `[[skill.slash_options]]`.
     slash_options: Vec<SkillSlashOption>,
+    /// See [`Skill::always`]. Parsed from a top-level `always: true` key.
+    always: bool,
 }
 
 fn default_version() -> String {
@@ -1321,6 +1333,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tools: manifest.tools,
         prompts,
         slash_options: manifest.skill.slash_options,
+        always: manifest.skill.always,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1350,6 +1363,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
+        always: parsed.meta.always,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1392,6 +1406,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
+        always: parsed.meta.always,
         location: Some(path.to_path_buf()),
     }))
 }
@@ -1478,6 +1493,7 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
             "description" => meta.description = Some(val.to_string()),
             "version" => meta.version = Some(val.to_string()),
             "author" => meta.author = Some(val.to_string()),
+            "always" => meta.always = val.eq_ignore_ascii_case("true"),
             "tags" => {
                 if val.is_empty() {
                     // YAML block list follows on subsequent lines
@@ -1629,6 +1645,7 @@ pub fn skills_to_prompt_with_mode(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
              Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
+             Skills marked `always` include full instructions below even in compact mode.\n\
              The `location` field is included for reference.\n\n\
              <available_skills>\n",
         ),
@@ -1651,10 +1668,11 @@ pub fn skills_to_prompt_with_mode(
         // In Full mode, inline both instructions and tools.
         // In Compact mode, skip instructions (loaded on demand) but keep tools
         // so the LLM knows which skill tools are available.
-        if matches!(
+        if (matches!(
             mode,
             zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
+        ) || skill.always)
+            && !skill.prompts.is_empty()
         {
             let _ = writeln!(prompt, "    <instructions>");
             for instruction in &skill.prompts {
@@ -3619,6 +3637,26 @@ version = "0.1.0"
     }
 
     #[test]
+    fn load_skill_toml_parses_always_true() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+always = true
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert!(
+            skill.always,
+            "always = true in SKILL.toml must set Skill.always"
+        );
+    }
+
+    #[test]
     fn load_skill_md_parses_slash_options_from_frontmatter() {
         let tmp = TempDir::new().unwrap();
         let md = r#"---
@@ -3667,6 +3705,34 @@ Write it.
         std::fs::write(&path, "---\nname: plain\ndescription: d\n---\n# Plain\n").unwrap();
         let skill = load_skill_md(&path, tmp.path()).unwrap();
         assert!(skill.slash_options.is_empty());
+    }
+
+    #[test]
+    fn load_skill_md_parses_always_true_from_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: policy\ndescription: Critical policy skill.\nalways: true\n---\n# Policy\n",
+        )
+        .unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+        assert!(
+            skill.always,
+            "always: true in frontmatter must set Skill.always"
+        );
+    }
+
+    #[test]
+    fn load_skill_md_defaults_always_to_false_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, "---\nname: plain\ndescription: d\n---\n# Plain\n").unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+        assert!(
+            !skill.always,
+            "always must default to false when the key is absent"
+        );
     }
 
     #[test]
@@ -4081,6 +4147,7 @@ mod prompt_callable_name_tests {
             tools: vec![tool("run.lint", "shell")],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
 
@@ -4158,6 +4225,7 @@ mod prompt_callable_name_tests {
             ],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
 
@@ -4197,6 +4265,7 @@ mod prompt_callable_name_tests {
             ],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
 

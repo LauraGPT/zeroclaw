@@ -15827,6 +15827,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
         let assembled = assemble_channel_agent_tools(
@@ -19892,6 +19893,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 
@@ -19935,6 +19937,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 
@@ -19988,6 +19991,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 
