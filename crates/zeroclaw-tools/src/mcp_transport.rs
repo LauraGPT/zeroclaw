@@ -371,11 +371,11 @@ pub struct StdioTransport {
     /// child-exit watcher when the direct child process exits. Read
     /// synchronously by `health_check`.
     child_exited: Arc<AtomicBool>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     write_test_hook: ParkingMutex<Option<Arc<StdioWriteTestHook>>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct StdioWriteTestHook {
     attempts: std::sync::atomic::AtomicUsize,
     attempts_changed: Notify,
@@ -384,7 +384,7 @@ pub(crate) struct StdioWriteTestHook {
     release_payload: Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl StdioWriteTestHook {
     pub(crate) fn new() -> Self {
         Self {
@@ -451,12 +451,12 @@ impl StdioTransport {
             alive,
             active_generation,
             child_exited,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             write_test_hook: ParkingMutex::new(None),
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_write_test_hook(&self, hook: Arc<StdioWriteTestHook>) {
         *self.write_test_hook.lock() = Some(hook);
     }
@@ -539,9 +539,9 @@ impl StdioTransport {
             .write_all(line.as_bytes())
             .await
             .context("failed to write to MCP server stdin")?;
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         let write_test_hook = self.write_test_hook.lock().clone();
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(hook) = write_test_hook {
             hook.pause_after_payload_if_armed().await;
         }
@@ -772,7 +772,7 @@ impl SharedMcpTransportConn for StdioTransport {
     ) -> Result<JsonRpcResponse> {
         let line = serde_json::to_string(request)?;
         let epoch_guard = lifecycle.begin_write().await;
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(hook) = self.write_test_hook.lock().clone() {
             hook.note_attempt();
         }

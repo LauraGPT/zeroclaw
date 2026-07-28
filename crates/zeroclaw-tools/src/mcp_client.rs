@@ -1394,7 +1394,9 @@ impl McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp_transport::{StdioTransport, StdioWriteTestHook, create_transport};
+    use crate::mcp_transport::create_transport;
+    #[cfg(unix)]
+    use crate::mcp_transport::{StdioTransport, StdioWriteTestHook};
     use zeroclaw_config::schema::McpTransport;
 
     #[cfg(unix)]
