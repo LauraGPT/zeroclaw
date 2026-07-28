@@ -205,6 +205,9 @@ struct NativeStopDetails {
     category: Option<String>,
 }
 
+const ANTHROPIC_REFUSAL_MESSAGE: &str =
+    "anthropic refusal: model declined this request (safety classifiers)";
+
 /// A Fable-class safety-classifier refusal: HTTP 200 with
 /// `stop_reason: "refusal"`. Deliberately an error so the reliability layer
 /// treats it as a fallback trigger. Never contains `explanation` text.
@@ -218,15 +221,7 @@ pub struct AnthropicRefusalError {
 
 impl std::fmt::Display for AnthropicRefusalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "anthropic model {} declined this request (safety classifiers)",
-            self.requested_model
-        )?;
-        if let Some(category) = &self.category {
-            write!(f, ", category {category}")?;
-        }
-        Ok(())
+        f.write_str(ANTHROPIC_REFUSAL_MESSAGE)
     }
 }
 
@@ -844,9 +839,11 @@ impl AnthropicModelProvider {
 
     /// Detect a native Anthropic safety-classifier refusal. Returns `Err` iff
     /// the API set `stop_reason: "refusal"`, capturing the optional category
-    /// token. Only the category (never the unstable `explanation`) is logged
-    /// or surfaced. Must run before `parse_native_response` so a refusal that
-    /// carries partial `content` still errors.
+    /// token. The category is retained for structured logs and reliability
+    /// handling but omitted from the error's `Display` output; the unstable
+    /// `explanation` is never deserialized. Must run before
+    /// `parse_native_response` so a refusal carrying partial `content` still
+    /// errors.
     fn check_refusal(
         response: &NativeChatResponse,
         requested_model: &str,
@@ -1184,8 +1181,7 @@ impl AnthropicModelProvider {
                         }
                         let _ = tx
                             .send(Err(StreamError::ModelProvider(
-                                "anthropic refusal: model declined this request (safety classifiers)"
-                                    .to_string(),
+                                ANTHROPIC_REFUSAL_MESSAGE.to_string(),
                             )))
                             .await;
                         return;
@@ -1657,8 +1653,9 @@ impl ModelProvider for AnthropicModelProvider {
                     .json()
                     .await
                     .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
-                Self::check_refusal(&parsed, &requested_model)
-                    .map_err(|e| StreamError::ModelProvider(format!("anthropic refusal: {e}")))?;
+                Self::check_refusal(&parsed, &requested_model).map_err(|_| {
+                    StreamError::ModelProvider(ANTHROPIC_REFUSAL_MESSAGE.to_string())
+                })?;
                 Ok(Self::parse_native_response(parsed))
             })
             .flat_map(|result| match result {
@@ -3632,7 +3629,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             "stop_reason": "refusal",
             "stop_details": {
                 "type": "refusal",
-                "category": "bio",
+                "category": "CATEGORY_SENTINEL",
                 "explanation": "SENTINEL_TEXT"
             },
             "usage": {"input_tokens": 10, "output_tokens": 0}
@@ -3653,6 +3650,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         let typed = err
             .downcast_ref::<AnthropicRefusalError>()
             .expect("error must downcast to AnthropicRefusalError");
+        assert_eq!(typed.category.as_deref(), Some("CATEGORY_SENTINEL"));
+        assert_eq!(format!("{err}"), ANTHROPIC_REFUSAL_MESSAGE);
+        assert_eq!(format!("{typed}"), ANTHROPIC_REFUSAL_MESSAGE);
+        assert!(!format!("{err}").contains("CATEGORY_SENTINEL"));
+        assert!(!format!("{typed}").contains("CATEGORY_SENTINEL"));
         for rendered in [
             format!("{err}"),
             format!("{err:?}"),
@@ -3712,7 +3714,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let body = serde_json::json!({
             "content": [],
             "stop_reason": "refusal",
-            "stop_details": {"type": "refusal", "category": "cyber"},
+            "stop_details": {"type": "refusal", "category": "CATEGORY_SENTINEL"},
             "usage": {"input_tokens": 5, "output_tokens": 0}
         });
         let (addr, server) = spawn_messages_server(body).await;
@@ -3742,10 +3744,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                 _ => None,
             })
             .expect("stream must yield a ModelProvider error");
-        assert!(
-            msg.contains("anthropic refusal"),
-            "unexpected error message: {msg}"
-        );
+        assert_eq!(msg, ANTHROPIC_REFUSAL_MESSAGE);
+        assert!(!msg.contains("CATEGORY_SENTINEL"));
     }
 
     #[tokio::test]
@@ -3801,9 +3801,6 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
             Err(StreamError::ModelProvider(msg)) => msg.clone(),
             _ => unreachable!(),
         };
-        assert!(
-            msg.contains("anthropic refusal"),
-            "unexpected error message: {msg}"
-        );
+        assert_eq!(msg, ANTHROPIC_REFUSAL_MESSAGE);
     }
 }
