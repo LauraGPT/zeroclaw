@@ -6,9 +6,11 @@
 //! auth. Draft endpoints (`wire-draft`, `graph-draft`) are pure: they
 //! transform the submitted SOP and never touch disk.
 
+use std::net::SocketAddr;
+
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
@@ -600,6 +602,37 @@ struct SopCancelResponse {
     sop_name: String,
     status: zeroclaw_runtime::sop::types::SopRunStatus,
     already_terminal: bool,
+    run: zeroclaw_runtime::sop::types::SopRunSummary,
+}
+
+fn authorize_sop_cancel(
+    state: &AppState,
+    peer: &SocketAddr,
+    headers: &HeaderMap,
+) -> Result<zeroclaw_runtime::sop::approval::ApprovalPrincipal, Box<Response>> {
+    if state.pairing.require_pairing() {
+        require_auth(state, headers).map_err(|error| Box::new(error.into_response()))?;
+        let subject = super::api::extract_bearer_token(headers)
+            .and_then(|token| state.pairing.authenticate_and_hash(token));
+        return Ok(zeroclaw_runtime::sop::approval::ApprovalPrincipal::http(
+            subject,
+        ));
+    }
+    if peer.ip().is_loopback() {
+        return Ok(zeroclaw_runtime::sop::approval::ApprovalPrincipal::cli(
+            None,
+        ));
+    }
+    Err(Box::new(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Remote SOP cancellation requires gateway pairing. Enable \
+                          gateway.require_pairing and pair first, or call from localhost."
+            })),
+        )
+            .into_response(),
+    ))
 }
 
 /// POST /api/sops/{name}/runs/{run_id}/cancel - operator cancellation for a
@@ -611,13 +644,15 @@ struct SopCancelResponse {
 /// cancellation or an error.
 pub async fn handle_sop_cancel(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path((name, run_id)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+    let principal = match authorize_sop_cancel(&state, &peer, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     // The body is optional (`{ "reason": ... }` or nothing at all), unlike
     // `handle_sop_decide`'s required decision payload, so an empty body is a
     // valid no-reason request rather than a parse error.
@@ -680,34 +715,48 @@ pub async fn handle_sop_cancel(
             .into_response();
     }
 
-    use zeroclaw_runtime::sop::{CancelOutcome, err_is_terminal_persistence_retained};
-    match guard.cancel_run_idempotent(&run_id, reason) {
-        Ok(Some(CancelOutcome::Cancelled)) => (
-            StatusCode::OK,
-            Json(SopCancelResponse {
-                run_id,
-                sop_name: run_sop_name,
-                status: zeroclaw_runtime::sop::types::SopRunStatus::Cancelled,
-                already_terminal: false,
-            }),
-        )
-            .into_response(),
-        Ok(Some(CancelOutcome::AlreadyTerminal(status))) => (
-            StatusCode::OK,
-            Json(SopCancelResponse {
-                run_id,
-                sop_name: run_sop_name,
-                status,
-                already_terminal: true,
-            }),
-        )
-            .into_response(),
+    use zeroclaw_runtime::sop::{CancelOutcome, err_is_cancellation_persistence_retained};
+    let outcome = guard.cancel_run_idempotent(&run_id, reason, Some(principal.voter_key()));
+    match outcome {
+        Ok(Some(outcome)) => {
+            let (code, already_terminal) = match outcome {
+                CancelOutcome::Requested | CancelOutcome::AlreadyRequested => {
+                    (StatusCode::ACCEPTED, false)
+                }
+                CancelOutcome::Cancelled => (StatusCode::OK, false),
+                CancelOutcome::AlreadyTerminal(_) => (StatusCode::OK, true),
+            };
+            let Some(run) = guard.get_run(&run_id) else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "run disappeared after cancellation transition"
+                    })),
+                )
+                    .into_response();
+            };
+            let summary = zeroclaw_runtime::sop::types::SopRunSummary::from_run(
+                run,
+                guard.active_runs().contains_key(&run_id),
+            );
+            (
+                code,
+                Json(SopCancelResponse {
+                    run_id,
+                    sop_name: run_sop_name,
+                    status: summary.status,
+                    already_terminal,
+                    run: summary,
+                }),
+            )
+                .into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("Run {run_id} not found") })),
         )
             .into_response(),
-        Err(e) if err_is_terminal_persistence_retained(&e) => (
+        Err(e) if err_is_cancellation_persistence_retained(&e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "cancellation could not be durably persisted; the run remains active - retry"
@@ -899,6 +948,14 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
         );
         headers
+    }
+
+    fn loopback_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 42_000)))
+    }
+
+    fn remote_peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 42_000)))
     }
 
     fn authoring_policy_sop() -> Sop {
@@ -1276,28 +1333,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authoring_cancel_active_run_returns_cancelled_and_persists_terminal() {
+    async fn authoring_cancel_active_run_returns_requested_and_keeps_it_active() {
         let token = "cancel-token";
         let (state, run_id) = authoring_state_with_running_run(token);
 
         let resp = handle_sop_cancel(
             State(state.clone()),
+            loopback_peer(),
             bearer(token),
             Path(("deploy".to_string(), run_id.clone())),
             Bytes::new(),
         )
         .await;
 
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "cancelled");
+        assert_eq!(json["status"], "cancel_requested");
+        assert_eq!(json["run"]["status"], "cancel_requested");
+        assert_eq!(json["run"]["active"], true);
         assert_eq!(json["already_terminal"], false);
         assert_eq!(json["run_id"], run_id.as_str());
 
-        assert_eq!(run_status(&state, &run_id), Some(SopRunStatus::Cancelled));
+        assert_eq!(
+            run_status(&state, &run_id),
+            Some(SopRunStatus::CancelRequested)
+        );
         assert!(
-            !state
+            state
                 .sop_engine
                 .as_ref()
                 .unwrap()
@@ -1305,8 +1368,22 @@ mod tests {
                 .unwrap()
                 .active_runs()
                 .contains_key(&run_id),
-            "a cancelled run must leave the engine's active set"
+            "a cancellation request must retain the active run and its claim"
         );
+        let events = state
+            .sop_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .run_events(&run_id)
+            .unwrap();
+        let requested = events
+            .iter()
+            .find(|event| event.kind == "run_cancel_requested")
+            .unwrap();
+        let expected_actor = format!("gateway:{}", PairingGuard::token_hash(token));
+        assert_eq!(requested.actor.as_deref(), Some(expected_actor.as_str()));
     }
 
     #[tokio::test]
@@ -1316,15 +1393,17 @@ mod tests {
 
         let first = handle_sop_cancel(
             State(state.clone()),
+            loopback_peer(),
             bearer(token),
             Path(("deploy".to_string(), run_id.clone())),
             Bytes::new(),
         )
         .await;
-        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
 
         let second = handle_sop_cancel(
             State(state.clone()),
+            loopback_peer(),
             bearer(token),
             Path(("deploy".to_string(), run_id.clone())),
             Bytes::from(serde_json::to_vec(&serde_json::json!({ "reason": "again" })).unwrap()),
@@ -1333,13 +1412,13 @@ mod tests {
 
         assert_eq!(
             second.status(),
-            StatusCode::OK,
-            "a repeat cancel of an already-terminal run must be idempotent, not an error"
+            StatusCode::ACCEPTED,
+            "a repeat cancellation request must be idempotent"
         );
         let body = second.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "cancelled");
-        assert_eq!(json["already_terminal"], true);
+        assert_eq!(json["status"], "cancel_requested");
+        assert_eq!(json["already_terminal"], false);
     }
 
     #[tokio::test]
@@ -1349,6 +1428,7 @@ mod tests {
 
         let resp = handle_sop_cancel(
             State(state.clone()),
+            loopback_peer(),
             HeaderMap::new(),
             Path(("deploy".to_string(), run_id.clone())),
             Bytes::new(),
@@ -1364,12 +1444,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authoring_cancel_fails_closed_remotely_when_pairing_is_disabled() {
+        let (mut state, run_id) = authoring_state_with_running_run("unused");
+        state.pairing = Arc::new(PairingGuard::new(false, &[]));
+
+        let remote = handle_sop_cancel(
+            State(state.clone()),
+            remote_peer(),
+            HeaderMap::new(),
+            Path(("deploy".to_string(), run_id.clone())),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(remote.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            run_status(&state, &run_id),
+            Some(SopRunStatus::Running),
+            "a remote unauthenticated request must not mutate the run"
+        );
+
+        let loopback = handle_sop_cancel(
+            State(state.clone()),
+            loopback_peer(),
+            HeaderMap::new(),
+            Path(("deploy".to_string(), run_id.clone())),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(loopback.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            run_status(&state, &run_id),
+            Some(SopRunStatus::CancelRequested),
+            "loopback-only access may remain unpaired"
+        );
+    }
+
+    #[tokio::test]
     async fn authoring_cancel_unknown_run_returns_404() {
         let token = "cancel-token";
         let (state, _run_id) = authoring_state_with_running_run(token);
 
         let resp = handle_sop_cancel(
             State(state.clone()),
+            loopback_peer(),
             bearer(token),
             Path(("deploy".to_string(), "nonexistent".to_string())),
             Bytes::new(),
@@ -1408,6 +1525,7 @@ mod tests {
 
         let resp = handle_sop_cancel(
             State(state.clone()),
+            loopback_peer(),
             bearer(token),
             Path(("deploy-a".to_string(), run_id.clone())),
             Bytes::new(),
@@ -1433,6 +1551,7 @@ mod tests {
 
         let resp = handle_sop_cancel(
             State(state.clone()),
+            loopback_peer(),
             bearer(token),
             Path(("deploy".to_string(), run_id.clone())),
             Bytes::from_static(b"{not json"),
@@ -1459,6 +1578,7 @@ mod tests {
         // proves the same caller cannot clear this gate via decide.
         let resp = handle_sop_cancel(
             State(state.clone()),
+            loopback_peer(),
             bearer(outsider),
             Path(("deploy".to_string(), run_id.clone())),
             Bytes::new(),

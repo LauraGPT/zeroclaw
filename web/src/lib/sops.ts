@@ -302,6 +302,7 @@ export interface SopCancelResult {
   sop_name: string;
   status: SopRunStatus;
   already_terminal: boolean;
+  run: SopRunSummary;
 }
 
 /// Request a durable operator cancellation of a running SOP. Safe cancel: the
@@ -399,6 +400,7 @@ export function runStatusTone(status: SopRunStatus | undefined): RunStateTone {
       return 'error';
     case 'waiting_approval':
     case 'paused_checkpoint':
+    case 'cancel_requested':
       return 'warning';
     default:
       return 'neutral';

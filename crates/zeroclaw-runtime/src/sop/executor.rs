@@ -114,14 +114,17 @@ pub(crate) fn drain_step_calls(sink: &StepCallSink) -> Vec<StepToolCall> {
 }
 
 /// Queue a live action when the current tool call is running inside an agent
-/// turn. Only `ExecuteStep` actions are queued; all other variants are already
-/// terminal or blocked.
+/// turn. Agent and deterministic execution actions need a driver; all other
+/// variants are already terminal or blocked.
 pub(crate) fn enqueue_live_action(
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     action: &SopRunAction,
 ) {
-    if !matches!(action, SopRunAction::ExecuteStep { .. }) {
+    if !matches!(
+        action,
+        SopRunAction::ExecuteStep { .. } | SopRunAction::DeterministicStep { .. }
+    ) {
         return;
     }
 
@@ -149,6 +152,34 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
 /// Upper bound on steps a single headless drive may execute, so a routing
 /// cycle can never pin a background task forever.
 const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
+
+/// Drive deterministic actions through a shared engine without retaining its
+/// mutex across step boundaries.
+pub(crate) async fn drive_shared_deterministic_run(
+    engine: &Arc<Mutex<SopEngine>>,
+    first_action: SopRunAction,
+) -> Result<SopRunAction> {
+    let mut action = first_action;
+    for _ in 0..MAX_HEADLESS_DRIVE_STEPS {
+        let run_id = match &action {
+            SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            terminal => return Ok(terminal.clone()),
+        };
+        let next = {
+            let mut guard = match engine.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.advance_headless_deterministic_step(&run_id, action)?
+        };
+        if !matches!(next, SopRunAction::DeterministicStep { .. }) {
+            return Ok(next);
+        }
+        action = next;
+        tokio::task::yield_now().await;
+    }
+    anyhow::bail!("SOP headless deterministic driver step budget exhausted")
+}
 
 /// Spawn a background task that drives a resumed SOP action to its next
 /// blocking or terminal state. Gate-clearing surfaces without an ambient agent
@@ -202,6 +233,36 @@ async fn drive_headless_run(
                 step,
                 context,
             } => {
+                let cancel_at_boundary = {
+                    let mut guard = match engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.finish_requested_cancellation(&run_id)
+                };
+                match cancel_at_boundary {
+                    Ok(Some(cancelled)) => {
+                        action = cancelled;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
+                            "SOP headless driver: failed to finish requested cancellation"
+                        );
+                        return;
+                    }
+                }
                 let agent_alias = step
                     .agent
                     .clone()
@@ -284,21 +345,14 @@ async fn drive_headless_run(
                         Ok(g) => g,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    guard.drive_headless_deterministic(&run_id, action)
+                    guard.advance_headless_deterministic_step(&run_id, action)
                 };
                 match next {
-                    Ok(SopRunAction::DeterministicStep { .. }) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"run_id": run_id})),
-                            "SOP headless driver: deterministic drive made no progress"
-                        );
-                        return;
+                    Ok(next @ SopRunAction::DeterministicStep { .. }) => {
+                        action = next;
+                        // Give a waiting cancel request a scheduling point before
+                        // this task attempts to reacquire the shared engine lock.
+                        tokio::task::yield_now().await;
                     }
                     Ok(next) => action = next,
                     Err(e) => {

@@ -72,8 +72,8 @@ export default function RunDetail() {
 
   // Operator Stop: safe cancel, not mid-step interruption. The engine lets the
   // step already in flight finish and stops the run at the next step
-  // boundary, so the refreshed overlay may briefly still show `running`
-  // before the terminal `cancelled` status lands.
+  // boundary. The refreshed overlay shows the truthful `cancel_requested`
+  // intermediate state while that work drains.
   const handleCancel = useCallback(() => {
     if (!sop || !runId) return;
     setCancelling(true);
@@ -91,7 +91,10 @@ export default function RunDetail() {
   }, [sop, runId, setOverlay]);
 
   const gated = overlay ? overlay.waiting || overlay.paused : false;
-  const stoppable = overlay ? !isTerminalRunStatus(overlay.status) : false;
+  const stopping = overlay?.status === 'cancel_requested';
+  const stoppable = overlay
+    ? !isTerminalRunStatus(overlay.status) && !stopping
+    : false;
   const error = loadError ?? overlayError;
 
   return (
@@ -160,19 +163,19 @@ export default function RunDetail() {
                   </button>
                 </>
               ) : null}
-              {stoppable ? (
+              {stoppable || stopping ? (
                 <button
                   type="button"
-                  disabled={cancelling}
+                  disabled={cancelling || stopping}
                   onClick={handleCancel}
                   className="inline-flex items-center gap-1 rounded border border-status-error/25 bg-status-error/10 px-3 py-1.5 text-sm text-status-error hover:bg-status-error/15 disabled:opacity-40"
                 >
-                  {cancelling ? (
+                  {cancelling || stopping ? (
                     <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
                   ) : (
                     <Square className="h-4 w-4" aria-hidden fill="currentColor" />
                   )}
-                  {t('sops.stop')}
+                  {stopping ? t('sops.stopping') : t('sops.stop')}
                 </button>
               ) : null}
             </div>

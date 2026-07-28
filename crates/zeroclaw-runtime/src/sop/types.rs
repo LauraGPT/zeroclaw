@@ -694,6 +694,10 @@ pub struct SopEvent {
 pub enum SopRunStatus {
     Pending,
     Running,
+    /// An operator requested cancellation while work was in flight. The run
+    /// remains active and keeps its admission claim until the driver reaches
+    /// the next supported step boundary.
+    CancelRequested,
     WaitingApproval,
     /// Paused at a checkpoint in a deterministic workflow.
     PausedCheckpoint,
@@ -707,6 +711,7 @@ impl fmt::Display for SopRunStatus {
         match self {
             Self::Pending => write!(f, "pending"),
             Self::Running => write!(f, "running"),
+            Self::CancelRequested => write!(f, "cancel_requested"),
             Self::WaitingApproval => write!(f, "waiting_approval"),
             Self::PausedCheckpoint => write!(f, "paused_checkpoint"),
             Self::Completed => write!(f, "completed"),
