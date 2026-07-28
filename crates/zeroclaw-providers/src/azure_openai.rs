@@ -341,10 +341,13 @@ impl AzureOpenAiModelProvider {
                 "<failed to read Azure OpenAI error response body>".to_string()
             });
             if tools_count > 0
-                && request.reasoning_effort.is_some()
+                && request
+                    .reasoning_effort
+                    .as_deref()
+                    .is_some_and(|effort| !effort.eq_ignore_ascii_case("none"))
                 && super::rejects_tools_with_reasoning_effort(status, &body)
             {
-                request.reasoning_effort = None;
+                request.reasoning_effort = Some("none".to_string());
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
@@ -353,11 +356,12 @@ impl AzureOpenAiModelProvider {
                             "alias": &self.alias,
                             "request_api": "chat_completions",
                             "tools_count": tools_count,
-                            "reasoning_effort_omitted": true,
-                            "reasoning_effort_omission_reason": "endpoint_rejected_tools_with_reasoning",
+                            "reasoning_effort_overridden": true,
+                            "reasoning_effort_fallback": "none",
+                            "reasoning_effort_override_reason": "endpoint_rejected_tools_with_reasoning",
                             "status": status.as_u16(),
                         })),
-                    "azure_openai: retrying without reasoning effort after endpoint capability rejection"
+                    "azure_openai: retrying with reasoning effort disabled after endpoint capability rejection"
                 );
                 continue;
             }
@@ -851,7 +855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_capability_rejection_retries_once_without_reasoning_effort() {
+    async fn endpoint_capability_rejection_retries_once_with_reasoning_disabled() {
         use axum::Json;
         use axum::Router;
         use axum::http::StatusCode;
@@ -868,7 +872,10 @@ mod tests {
                 let bodies = Arc::clone(&bodies_for_route);
                 async move {
                     let rejects = body.get("tools").is_some()
-                        && body.get("reasoning_effort").is_some();
+                        && body
+                            .get("reasoning_effort")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("none");
                     bodies.lock().unwrap().push(body);
                     if rejects {
                         return (
@@ -925,8 +932,18 @@ mod tests {
 
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2, "fallback must retry exactly once");
-        assert!(bodies[0].get("reasoning_effort").is_some());
-        assert!(bodies[1].get("reasoning_effort").is_none());
+        assert_eq!(
+            bodies[0]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none")
+        );
         assert!(bodies.iter().all(|body| body.get("tools").is_some()));
         server.abort();
     }

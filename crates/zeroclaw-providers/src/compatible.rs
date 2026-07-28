@@ -1321,6 +1321,28 @@ struct NativeChatRequest {
     extra_body: Option<serde_json::Value>,
 }
 
+/// Override the reasoning effort on the actual serialized request body.
+///
+/// `extra_body` is flattened into [`NativeChatRequest`] and can supply the
+/// canonical top-level value seen by the endpoint, so fallback decisions must
+/// inspect and mutate the wire payload rather than only the typed field.
+fn set_reasoning_effort_none(payload: &mut serde_json::Value) -> bool {
+    let Some(object) = payload.as_object_mut() else {
+        return false;
+    };
+    match object.get("reasoning_effort") {
+        None => false,
+        Some(serde_json::Value::String(effort)) if effort.eq_ignore_ascii_case("none") => false,
+        Some(_) => {
+            object.insert(
+                "reasoning_effort".to_string(),
+                serde_json::Value::String("none".to_string()),
+            );
+            true
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct NativeMessage {
     role: String,
@@ -2829,40 +2851,75 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             temperature,
             !merge,
         );
+        let mut payload = serde_json::to_value(request)?;
+        let tools_count = payload
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
 
         let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(
-                self.http_client().post(&url).json(&request),
-                credential.as_deref(),
-            )
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
+        let response = loop {
+            let response = match self
+                .apply_auth_header(
+                    self.http_client().post(&url).json(&payload),
+                    credential.as_deref(),
+                )
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "{} native tool call transport failed: {error}; falling back to history path",
+                            self.name
+                        )
+                    );
+                    let text = self.chat_with_history(messages, model, temperature).await?;
+                    return Ok(ProviderChatResponse {
+                        text: Some(text),
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                    });
+                }
+            };
+            if response.status().is_success() {
+                break response;
+            }
+
+            let status = response.status();
+            let error = response.text().await?;
+            if tools_count > 0
+                && super::rejects_tools_with_reasoning_effort(status, &error)
+                && set_reasoning_effort_none(&mut payload)
+            {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    &format!(
-                        "{} native tool call transport failed: {error}; falling back to history path",
-                        self.name
-                    )
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "provider": &self.name,
+                            "alias": &self.alias,
+                            "request_api": "chat_completions",
+                            "model": model,
+                            "stream": false,
+                            "tools_count": tools_count,
+                            "reasoning_effort_overridden": true,
+                            "reasoning_effort_fallback": "none",
+                            "reasoning_effort_override_reason": "endpoint_rejected_tools_with_reasoning",
+                            "status": status.as_u16(),
+                        })),
+                    "compatible provider retrying with reasoning effort disabled after endpoint capability rejection"
                 );
-                let text = self.chat_with_history(messages, model, temperature).await?;
-                return Ok(ProviderChatResponse {
-                    text: Some(text),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                });
+                continue;
             }
-        };
 
-        if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
-        }
+            return Err(super::api_error_from_parts(&self.name, status, &error));
+        };
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
@@ -2925,16 +2982,20 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         };
 
         let tools = self.convert_tool_specs_for_model(request.tools, model);
-        let mut native_request = self.build_native_tool_chat_request(
+        let native_request = self.build_native_tool_chat_request(
             &effective_messages,
             tools,
             model,
             temperature,
             !merge,
         );
-        let tools_count = native_request.tools.as_ref().map_or(0, Vec::len);
+        let mut payload = serde_json::to_value(native_request)?;
+        let tools_count = payload
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
         let reasoning_effort_omitted =
-            self.reasoning_effort.is_some() && native_request.reasoning_effort.is_none();
+            self.reasoning_effort.is_some() && payload.get("reasoning_effort").is_none();
         let reasoning_effort_omission_reason =
             reasoning_effort_omitted.then_some("model_ineligible");
         if ::zeroclaw_log::debug_enabled() {
@@ -2949,7 +3010,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         "stream": false,
                         "native_tool_calling": self.native_tool_calling,
                         "tools_count": tools_count,
-                        "tool_choice": native_request.tool_choice.as_deref(),
+                        "tool_choice": payload.get("tool_choice"),
                         "reasoning_effort_omitted": reasoning_effort_omitted,
                         "reasoning_effort_omission_reason": reasoning_effort_omission_reason,
                     })),
@@ -2961,7 +3022,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let response = loop {
             let response = match self
                 .apply_auth_header(
-                    self.http_client().post(&url).json(&native_request),
+                    self.http_client().post(&url).json(&payload),
                     credential.as_deref(),
                 )
                 .send()
@@ -2979,10 +3040,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let sanitized = super::sanitize_api_error(&error);
 
             if tools_count > 0
-                && native_request.reasoning_effort.is_some()
                 && super::rejects_tools_with_reasoning_effort(status, &error)
+                && set_reasoning_effort_none(&mut payload)
             {
-                native_request.reasoning_effort = None;
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
@@ -2994,11 +3054,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                             "model": model,
                             "stream": false,
                             "tools_count": tools_count,
-                            "reasoning_effort_omitted": true,
-                            "reasoning_effort_omission_reason": "endpoint_rejected_tools_with_reasoning",
+                            "reasoning_effort_overridden": true,
+                            "reasoning_effort_fallback": "none",
+                            "reasoning_effort_override_reason": "endpoint_rejected_tools_with_reasoning",
                             "status": status.as_u16(),
                         })),
-                    "compatible provider retrying without reasoning effort after endpoint capability rejection"
+                    "compatible provider retrying with reasoning effort disabled after endpoint capability rejection"
                 );
                 continue;
             }
@@ -3224,12 +3285,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Err(_) => format!("HTTP error: {}", status),
                 };
                 if tools_count > 0
-                    && payload.get("reasoning_effort").is_some()
                     && super::rejects_tools_with_reasoning_effort(status, &error)
+                    && set_reasoning_effort_none(&mut payload)
                 {
-                    if let Some(object) = payload.as_object_mut() {
-                        object.remove("reasoning_effort");
-                    }
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
@@ -3241,11 +3299,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                                 "model": &model,
                                 "stream": options_enabled,
                                 "tools_count": tools_count,
-                                "reasoning_effort_omitted": true,
-                                "reasoning_effort_omission_reason": "endpoint_rejected_tools_with_reasoning",
+                                "reasoning_effort_overridden": true,
+                                "reasoning_effort_fallback": "none",
+                                "reasoning_effort_override_reason": "endpoint_rejected_tools_with_reasoning",
                                 "status": status.as_u16(),
                             })),
-                        "compatible streaming provider retrying without reasoning effort after endpoint capability rejection"
+                        "compatible streaming provider retrying with reasoning effort disabled after endpoint capability rejection"
                     );
                     continue;
                 }
@@ -3809,7 +3868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejecting_endpoint_retries_once_without_reasoning_effort() {
+    async fn rejecting_endpoint_retries_once_with_reasoning_disabled() {
         use axum::Json;
         use axum::Router;
         use axum::http::StatusCode;
@@ -3826,7 +3885,10 @@ mod tests {
                 let bodies = Arc::clone(&bodies_for_route);
                 async move {
                     let rejects = body.get("tools").is_some()
-                        && body.get("reasoning_effort").is_some();
+                        && body
+                            .get("reasoning_effort")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("none");
                     bodies.lock().unwrap().push(body);
                     if rejects {
                         return (
@@ -3859,6 +3921,7 @@ mod tests {
             .credential(None)
             .auth_style(AuthStyle::Bearer)
             .reasoning_effort(Some("high".to_string()))
+            .extra_body(serde_json::json!({"reasoning_effort": "xhigh"}))
             .build();
         let messages = vec![ChatMessage::user("hello")];
         let tools = vec![zeroclaw_api::tool::ToolSpec::new(
@@ -3887,18 +3950,22 @@ mod tests {
             bodies[0]
                 .get("reasoning_effort")
                 .and_then(serde_json::Value::as_str),
-            Some("high")
+            Some("xhigh"),
+            "provider extra body must be reflected in the canonical wire payload"
         );
-        assert!(
-            bodies[1].get("reasoning_effort").is_none(),
-            "retry must omit only reasoning_effort"
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none"),
+            "retry must explicitly disable reasoning"
         );
         assert!(bodies.iter().all(|body| body.get("tools").is_some()));
         server.abort();
     }
 
     #[tokio::test]
-    async fn streaming_rejection_retries_once_without_reasoning_effort() {
+    async fn streaming_rejection_retries_once_with_reasoning_disabled() {
         use axum::Json;
         use axum::Router;
         use axum::http::StatusCode;
@@ -3916,7 +3983,10 @@ mod tests {
                 let bodies = Arc::clone(&bodies_for_route);
                 async move {
                     let rejects = body.get("tools").is_some()
-                        && body.get("reasoning_effort").is_some();
+                        && body
+                            .get("reasoning_effort")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("none");
                     bodies.lock().unwrap().push(body);
                     if rejects {
                         return (
@@ -3988,8 +4058,107 @@ mod tests {
 
         let bodies = bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2, "stream fallback must retry exactly once");
-        assert!(bodies[0].get("reasoning_effort").is_some());
-        assert!(bodies[1].get("reasoning_effort").is_none());
+        assert_eq!(
+            bodies[0]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none")
+        );
+        assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_retries_once_with_reasoning_disabled() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let rejects = body.get("tools").is_some()
+                        && body
+                            .get("reasoning_effort")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("none");
+                    bodies.lock().unwrap().push(body);
+                    if rejects {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "Function tools with reasoning effort are not supported",
+                                    "param": "reasoning_effort"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+
+        let response = provider
+            .chat_with_tools(&messages, &tools, "gpt-5", None)
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "fallback must be bounded to one retry");
+        assert_eq!(
+            bodies[0]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none")
+        );
         assert!(bodies.iter().all(|body| body.get("tools").is_some()));
         server.abort();
     }

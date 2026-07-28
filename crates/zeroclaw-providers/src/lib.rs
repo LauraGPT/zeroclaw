@@ -846,9 +846,10 @@ pub fn sanitize_api_error(input: &str) -> String {
 /// Whether an endpoint explicitly rejected combining function tools with
 /// `reasoning_effort`.
 ///
-/// This predicate is intentionally narrow: callers may retry once without the
-/// effort field only when the endpoint itself reports this exact capability
-/// mismatch. Other reasoning or tool errors must propagate unchanged.
+/// This predicate is intentionally narrow: callers may retry once with
+/// `reasoning_effort: "none"` only when the endpoint itself reports this exact
+/// capability mismatch. Other reasoning or tool errors must propagate
+/// unchanged.
 pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, body: &str) -> bool {
     if !matches!(
         status,
@@ -857,10 +858,29 @@ pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, b
         return false;
     }
 
-    let lower = body.to_ascii_lowercase();
-    let mentions_reasoning_effort =
-        lower.contains("reasoning_effort") || lower.contains("reasoning effort");
-    let mentions_tools = lower.contains("tool");
+    let (message, parameter) = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => {
+            let message = value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .or_else(|| value.get("detail"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let parameter = value
+                .pointer("/error/param")
+                .or_else(|| value.get("param"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            (message, parameter)
+        }
+        Err(_) => (body.to_ascii_lowercase(), String::new()),
+    };
+    let mentions_reasoning_effort = parameter == "reasoning_effort"
+        || message.contains("reasoning_effort")
+        || message.contains("reasoning effort");
+    let mentions_tools = message.contains("tool");
     let reports_incompatibility = [
         "not supported",
         "unsupported",
@@ -870,7 +890,7 @@ pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, b
         "not allowed",
     ]
     .iter()
-    .any(|hint| lower.contains(hint));
+    .any(|hint| message.contains(hint));
 
     mentions_reasoning_effort && mentions_tools && reports_incompatibility
 }
@@ -3487,6 +3507,18 @@ mod tests {
         assert!(!rejects_tools_with_reasoning_effort(
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"function tools are not supported"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported for this model"},"model":"tool-model"}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported for this model"},"request_id":"tool-call-123"}"#
+        ));
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "Function tools with reasoning_effort are incompatible"
         ));
     }
 
