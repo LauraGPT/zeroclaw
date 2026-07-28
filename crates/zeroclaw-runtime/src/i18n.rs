@@ -1146,8 +1146,8 @@ mod tests {
         }
     }
 
-    /// Argless `channel-approval-*` keys (#9409): must be defined, non-empty,
-    /// in every committed locale.
+    /// Argless `channel-approval-*` keys must be defined and non-empty in
+    /// every committed locale.
     const CHANNEL_APPROVAL_ARGLESS_KEYS: &[&str] = &[
         "channel-approval-heading",
         "channel-approval-heading-shout",
@@ -1182,7 +1182,7 @@ mod tests {
 
     #[test]
     fn channel_approval_keys_are_defined_in_every_locale() {
-        // Key-parity + keyword-preservation guard (#9409): every new
+        // Key-parity + keyword-preservation guard: every new
         // `channel-approval-*` key must be defined in all 5 committed
         // locales, and the reply-keyword args (yes/no/always,
         // approve/deny/always) — and the token/tool args — must survive
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[test]
     fn channel_approval_en_catalogue_matches_expected_literals() {
-        // Byte-exact regression guard (#9409): the `en` values are the
+        // Byte-exact regression guard: the `en` values are the
         // source of truth the button/text-reply adapters compose their
         // rendered prompts from. Pinning them here proves a future catalogue
         // edit can't silently change the English UI text.

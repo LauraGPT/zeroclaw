@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn every_approval_key_referenced_by_adapters_resolves() {
-        // Catalogue guard (#9409): a typo'd Fluent key at any adapter call
+        // Catalogue guard: a typo'd Fluent key at any adapter call
         // site would render the `{key}` missing-string sentinel at runtime
         // and, for the adapters without a dedicated `request_approval` test
         // (discord/slack/signal/whatsapp), be caught by nothing else.
