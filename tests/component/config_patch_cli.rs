@@ -376,7 +376,8 @@ fn config_patch_json_value_coercion_failure_emits_structured_error_envelope() {
 #[test]
 fn config_patch_human_missing_value_field_emits_readable_error_without_json_envelope() {
     // Mirrors `config_patch_json_missing_value_field_emits_structured_error_envelope`
-    // but on the no-`--json` branch: the compatibility half of the #9239 contract.
+    // but on the no-`--json` branch: the compatibility half of the
+    // machine-readable/human-readable output contract.
     let config_dir = tempfile::tempdir().expect("temp config dir");
     let stderr = run_cli_patch_human(
         config_dir.path(),
