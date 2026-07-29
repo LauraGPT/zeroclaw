@@ -881,4 +881,212 @@ mod tests {
              when unrelated sender spend exhausted it"
         );
     }
+
+    /// The test above exercises `deliver_peer_turn_with_cost_scope` directly
+    /// with isolated trackers. This test drives the REAL tool boundary:
+    /// `execute()` -> canonical-recipient resolution -> cost-context
+    /// builder -> detached-spawn -> `process_message` -> a real (mocked at
+    /// the HTTP layer) provider dispatch -> `record_tool_loop_cost_usage`.
+    /// A local Ollama-shaped HTTP server stands in for the network so the
+    /// recipient's turn completes deterministically without a real model
+    /// provider dependency.
+    #[tokio::test]
+    async fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget()
+    {
+        use crate::agent::turn::provider_call::enforce_tool_loop_budget;
+        use crate::cost::CostTracker;
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{
+            CostConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        // `[providers.models.ollama.*]` dispatches through the shared
+        // OpenAI-compatible client (`factory::build_ollama_compat_provider`),
+        // not the native `/api/chat` wire format, so the fake stands in at
+        // the OpenAI-compatible `/v1/chat/completions` boundary.
+        type RequestCount = Arc<Mutex<u32>>;
+        async fn capture_chat(
+            State(count): State<RequestCount>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            *count.lock() += 1;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "peer turn complete"}}],
+                "usage": {"prompt_tokens": 1_000, "completion_tokens": 200}
+            }))
+        }
+
+        let request_count: RequestCount = Arc::new(Mutex::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat))
+            .with_state(request_count.clone());
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        // Isolated data_dir: `Config::default()` points at the real
+        // `~/.zeroclaw/data`, and `execute()` resolves cost tracking off the
+        // process-global `CostTracker` singleton, so an isolated, unique
+        // ledger path is required to avoid touching real user state and to
+        // give this test a clean-slate budget.
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.cost = CostConfig {
+            enabled: true,
+            track_per_agent: true,
+            ..CostConfig::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(5),
+                    pricing: HashMap::from([
+                        ("mock-model.input".to_string(), 3.0),
+                        ("mock-model.output".to_string(), 15.0),
+                    ]),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let tool = SendMessageToPeerTool::new(Arc::new(config.clone()), "sender");
+        let result = tool
+            .execute(json!({
+                "channel": "telegram.prod",
+                "target": "recipient",
+                "message": "produce a one-line status update for the on-call rotation"
+            }))
+            .await
+            .expect("execute should accept the peer send for detached delivery");
+        assert!(
+            result.success,
+            "execute should accept the send for in-process delivery: {result:?}"
+        );
+
+        // `execute()` already resolved the recipient's cost context off the
+        // process-global tracker (synchronously, before the detached spawn).
+        // Fetch the SAME Arc: same data_dir means same ledger path, so
+        // `CostTracker::resolve_global` reuses it rather than building a
+        // second one, to observe what the detached turn records.
+        let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+            .expect("execute() must have resolved a process-global cost tracker for an enabled cost config");
+
+        // The recipient's turn runs inside a detached `zeroclaw_spawn::spawn!`
+        // task that `execute()` does not join. Poll for its completion with a
+        // bounded, sleep-free yield loop (the same pattern already used for
+        // detached-task synchronization in `rpc/dispatch.rs`), never a fixed
+        // sleep.
+        let mut recipient_summary = None;
+        for _ in 0..20_000 {
+            let summary = tracker
+                .get_summary_for_agent("recipient")
+                .expect("recipient cost summary should be queryable");
+            if summary.request_count >= 1 {
+                recipient_summary = Some(summary);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let recipient_summary = recipient_summary.expect(
+            "the detached recipient turn must complete and record usage against the \
+             recipient alias; if this fires, execute() is no longer threading the \
+             cost-tracking scope into the spawned process_message future",
+        );
+
+        // (1) Usage lands on the recipient alias in the per-agent ledger,
+        // through the REAL tool boundary end to end - not just the helper.
+        assert_eq!(recipient_summary.request_count, 1);
+        assert_eq!(recipient_summary.total_tokens, 1_200);
+        let expected_cost = (1_000.0 * 3.0 / 1_000_000.0) + (200.0 * 15.0 / 1_000_000.0);
+        assert!(
+            (recipient_summary.session_cost_usd - expected_cost).abs() < 1e-9,
+            "unexpected recipient cost: {} vs expected {expected_cost}",
+            recipient_summary.session_cost_usd
+        );
+
+        let sender_summary = tracker
+            .get_summary_for_agent("sender")
+            .expect("sender cost summary should be queryable");
+        assert_eq!(
+            sender_summary.request_count, 0,
+            "spend must not bleed onto the sending agent's alias"
+        );
+
+        assert_eq!(
+            *request_count.lock(),
+            1,
+            "the recipient turn must have made exactly one real provider call \
+             through the mock endpoint"
+        );
+
+        // (2) The recipient turn's provider call participates in the
+        // shared, process-wide budget: lower the daily cap below what the
+        // recipient just spent, then prove an UNRELATED agent's subsequent
+        // budget check - through the same tracker Arc `execute()` resolved
+        // - now observes it as exceeded. This proves the recipient's real,
+        // execute()-triggered spend landed in the one ledger every agent's
+        // budget check consults, not a silo the recipient alias owns
+        // exclusively.
+        tracker.update_config(CostConfig {
+            enabled: true,
+            track_per_agent: true,
+            daily_limit_usd: recipient_summary.session_cost_usd / 2.0,
+            ..CostConfig::default()
+        });
+        let unrelated_ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(HashMap::new()))
+                .with_agent_alias("unrelated-agent");
+        let budget_result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(unrelated_ctx), async { enforce_tool_loop_budget() })
+            .await;
+        assert!(
+            budget_result.is_err(),
+            "the recipient turn's real spend must count against the shared \
+             process-wide daily budget, blocking an unrelated agent's next call"
+        );
+
+        server.abort();
+    }
 }
