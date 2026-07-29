@@ -114,7 +114,7 @@ impl<'a> SopIngress<'a> {
             } else {
                 SopIngressUnavailable::MissingEngineAndAudit
             };
-            log_ingress_unavailable(source, reason);
+            log_ingress_unavailable(source, reason, topic);
             return SopIngressOutcome::Unavailable(reason);
         };
 
@@ -131,14 +131,14 @@ impl<'a> SopIngress<'a> {
                     "sop_dispatch",
                     format!("SOP engine lock poisoned: {e}"),
                 );
-                log_ingress_unavailable(source, reason);
+                log_ingress_unavailable(source, reason, topic);
                 return SopIngressOutcome::Unavailable(reason);
             }
         };
 
         let Some(audit) = self.audit else {
             let reason = SopIngressUnavailable::MissingAudit;
-            log_ingress_unavailable(source, reason);
+            log_ingress_unavailable(source, reason, topic);
             return SopIngressOutcome::Unavailable(reason);
         };
 
@@ -160,17 +160,84 @@ impl<'a> SopIngress<'a> {
     }
 }
 
-fn log_ingress_unavailable(source: SopTriggerSource, reason: SopIngressUnavailable) {
+/// Log a dropped ingress event. `topic` carries the channel/alias attribution
+/// (e.g. "channel/alias") so operators can identify which ingress instance
+/// failed; `payload` is never passed here or logged, since it is untrusted.
+fn log_ingress_unavailable(
+    source: SopTriggerSource,
+    reason: SopIngressUnavailable,
+    topic: Option<&str>,
+) {
+    let mut attrs = ::serde_json::json!({
+        "source": source.to_string(),
+        "reason": reason.as_str(),
+    });
+    if let Some(topic) = topic {
+        attrs["topic"] = ::serde_json::Value::String(topic.to_string());
+    }
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "source": source.to_string(),
-                "reason": reason.as_str(),
-            })),
+            .with_attrs(attrs),
         "SOP ingress: dropping event because required runtime handles are unavailable"
     );
+}
+
+// ── Trigger-source drift guard ───────────────────────────────────
+
+/// How a [`SopTriggerSource`] variant currently reaches the SOP matcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SopIngressKind {
+    /// Reaches `dispatch_sop_event_filtered` through the borrowed, optional-handle
+    /// [`SopIngress`] adapter (or its `dispatch_untrusted_fan_in` wrapper), which owns
+    /// handle validation and source-interest gating for untrusted transport fan-in.
+    SharedIngress,
+    /// Reaches the matcher through a dedicated internal call path that already owns
+    /// non-optional engine/audit handles (e.g. the daemon-owned cron tick, or the
+    /// `sop_execute` tool's direct `start_run`), so it never passes through `SopIngress`.
+    DedicatedInternalDispatch,
+    /// Defined and matched, but no live producer feeds it yet (see the doc comment
+    /// on the corresponding `SopTrigger` variant).
+    NotYetLive,
+}
+
+/// Classify every [`SopTriggerSource`] as [`SopIngressKind::SharedIngress`],
+/// [`SopIngressKind::DedicatedInternalDispatch`], or [`SopIngressKind::NotYetLive`].
+///
+/// Deliberately has NO wildcard arm: adding a new `SopTriggerSource` variant without
+/// classifying it here is a compile error. That compile-time failure is the drift
+/// guard - it forces a conscious decision about how a new trigger source enters (or
+/// does not yet enter) the SOP dispatch path, instead of silently falling through.
+pub fn ingress_kind(source: SopTriggerSource) -> SopIngressKind {
+    match source {
+        // Routed through `SopIngress` by the MQTT listener (orchestrator/mqtt.rs).
+        SopTriggerSource::Mqtt => SopIngressKind::SharedIngress,
+        // `SopTrigger::Webhook` doc: "Defined and matched, but no live route feeds it."
+        SopTriggerSource::Webhook => SopIngressKind::NotYetLive,
+        // `check_sop_cron_triggers` calls `dispatch_sop_event` directly with the
+        // daemon's owned, non-optional engine/audit handles; never through `SopIngress`.
+        SopTriggerSource::Cron => SopIngressKind::DedicatedInternalDispatch,
+        // `SopTrigger::Peripheral` doc: "no peripheral listener feeds it"; the
+        // `dispatch_peripheral_signal` helper exists but has no live caller.
+        SopTriggerSource::Peripheral => SopIngressKind::NotYetLive,
+        // Routed through `dispatch_untrusted_fan_in` (-> `SopIngress`) by the
+        // filesystem watcher (channels/src/filesystem.rs).
+        SopTriggerSource::Filesystem => SopIngressKind::SharedIngress,
+        // `CalendarPoller::detect_no_shows` builds events but has no live caller that
+        // dispatches them yet (`SopTrigger::Calendar` doc: "no poller feeds it live").
+        SopTriggerSource::Calendar => SopIngressKind::NotYetLive,
+        // Routed through `SopIngress` by both channel-orchestrator call sites
+        // (`process_channel_message_body` and `dispatch_channel_sop_event`).
+        SopTriggerSource::Channel => SopIngressKind::SharedIngress,
+        // Agent-initiated via the `sop_execute` tool, which calls `engine.start_run`
+        // directly - bypassing trigger matching and `SopIngress` entirely. Per its
+        // doc comment: "Not an external fan-in."
+        SopTriggerSource::Manual => SopIngressKind::DedicatedInternalDispatch,
+        // Routed through `dispatch_untrusted_fan_in` (-> `SopIngress`) by the AMQP
+        // consumer (channels/src/amqp.rs).
+        SopTriggerSource::Amqp => SopIngressKind::SharedIngress,
+    }
 }
 
 // ── Action helpers ──────────────────────────────────────────────
@@ -3053,5 +3120,27 @@ mod tests {
             !results_need_redelivery(&second),
             "a coalesced trigger was absorbed, not lost -> acked"
         );
+    }
+
+    /// Drift guard: every `SopTriggerSource` variant must have a classification.
+    /// `ingress_kind` has no wildcard match arm, so a new variant fails to compile
+    /// until it is classified there; this test documents the iterator side of that
+    /// contract by asserting each variant actually resolves to a `SopIngressKind`.
+    #[test]
+    fn every_trigger_source_has_an_ingress_classification() {
+        use strum::IntoEnumIterator;
+
+        for source in SopTriggerSource::iter() {
+            let kind = ingress_kind(source);
+            assert!(
+                matches!(
+                    kind,
+                    SopIngressKind::SharedIngress
+                        | SopIngressKind::DedicatedInternalDispatch
+                        | SopIngressKind::NotYetLive
+                ),
+                "SopTriggerSource::{source} classified as {kind:?}"
+            );
+        }
     }
 }
