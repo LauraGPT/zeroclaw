@@ -228,8 +228,13 @@ impl Tool for ContentSearchTool {
             });
         }
 
+        // A de-verbatimized Windows path is safe to hand to legacy grep only
+        // when it still identifies the exact path that passed authorization.
+        // Otherwise use the internal backend, which opens the canonical path.
+        let backend = effective_search_backend(self.backend, &resolved_canon);
+
         // --- Multiline check for non-ripgrep fallbacks ---
-        if multiline && self.backend != SearchBackend::Ripgrep {
+        if multiline && backend != SearchBackend::Ripgrep {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -244,10 +249,11 @@ impl Tool for ContentSearchTool {
         let workspace_canon =
             std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.clone());
 
-        let formatted = match self.backend {
+        let formatted = match backend {
             SearchBackend::Ripgrep | SearchBackend::Grep => {
                 let raw_stdout = match self
                     .execute_external_search(
+                        backend,
                         pattern,
                         &resolved_canon,
                         output_mode,
@@ -263,7 +269,7 @@ impl Tool for ContentSearchTool {
                     Err(result) => return Ok(result),
                 };
 
-                match self.backend {
+                match backend {
                     SearchBackend::Ripgrep => {
                         format_rg_output(&raw_stdout, &workspace_canon, output_mode, max_results)
                     }
@@ -348,6 +354,7 @@ impl Tool for ContentSearchTool {
 impl ContentSearchTool {
     async fn execute_external_search(
         &self,
+        backend: SearchBackend,
         pattern: &str,
         resolved_canon: &Path,
         output_mode: &str,
@@ -357,7 +364,7 @@ impl ContentSearchTool {
         context_after: usize,
         multiline: bool,
     ) -> Result<String, ToolResult> {
-        let mut cmd = match self.backend {
+        let mut cmd = match backend {
             SearchBackend::Ripgrep => build_rg_command(
                 pattern,
                 resolved_canon,
@@ -1012,6 +1019,35 @@ fn strip_verbatim_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
     }
 }
 
+fn effective_search_backend(configured: SearchBackend, authorized_path: &Path) -> SearchBackend {
+    if configured == SearchBackend::Grep && !grep_plain_path_preserves_identity(authorized_path) {
+        SearchBackend::Internal
+    } else {
+        configured
+    }
+}
+
+fn grep_plain_path_preserves_identity(authorized_path: &Path) -> bool {
+    let plain_path = strip_verbatim_prefix(authorized_path);
+    if matches!(plain_path, std::borrow::Cow::Borrowed(_)) {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        // grep.exe is not guaranteed to be long-path aware. Keep paths that
+        // need extended-length handling on the internal backend even when
+        // Rust itself can reopen the plain spelling.
+        if plain_path.as_os_str().encode_wide().count() >= 260 {
+            return false;
+        }
+    }
+
+    std::fs::canonicalize(plain_path.as_ref()).is_ok_and(|round_trip| round_trip == authorized_path)
+}
+
 fn parse_content_line(line: &str) -> Option<(&str, bool)> {
     static MATCH_RE: OnceLock<regex::Regex> = OnceLock::new();
     static CONTEXT_RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -1571,6 +1607,57 @@ mod tests {
             plain_args.last().copied(),
             Some(std::ffi::OsStr::new(r"C:\ws"))
         );
+    }
+
+    #[test]
+    fn grep_backend_accepts_plain_canonical_path() {
+        let dir = TempDir::new().unwrap();
+        let authorized = std::fs::canonicalize(dir.path()).unwrap();
+
+        assert_eq!(
+            effective_search_backend(SearchBackend::Grep, &authorized),
+            SearchBackend::Grep
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn grep_backend_rejects_normalization_changing_component() {
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tricky = root.join(".. ");
+        std::fs::create_dir(&tricky).unwrap();
+        let authorized = std::fs::canonicalize(&tricky).unwrap();
+
+        let backend = effective_search_backend(SearchBackend::Grep, &authorized);
+        std::fs::remove_dir(&tricky).unwrap();
+
+        assert_eq!(backend, SearchBackend::Internal);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn grep_backend_rejects_path_that_needs_extended_length_handling() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let mut long_path = root.clone();
+        while strip_verbatim_prefix(&long_path)
+            .as_os_str()
+            .encode_wide()
+            .count()
+            < 270
+        {
+            long_path.push("extended_length_component_0123456789");
+            std::fs::create_dir(&long_path).unwrap();
+        }
+        let authorized = std::fs::canonicalize(&long_path).unwrap();
+
+        let backend = effective_search_backend(SearchBackend::Grep, &authorized);
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(backend, SearchBackend::Internal);
     }
 
     #[tokio::test]
