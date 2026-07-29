@@ -593,7 +593,17 @@ struct SchemaCleanCacheEntry {
     /// so a cache entry never keeps a replaced (e.g. MCP-reconnect) schema
     /// alive on its own.
     source: std::sync::Weak<Value>,
-    cleaned: Arc<Value>,
+    /// Single-flight cell for the deep-clean result. The map lock is only
+    /// ever held to install or look up this cell, never while the clean
+    /// itself runs: the first caller to reach [`OnceLock::get_or_init`] on a
+    /// given cell performs the deep clone, and every other caller that
+    /// reused the same entry (matched by `source`) blocks on that same
+    /// `get_or_init` call and observes the identical `Arc` once it
+    /// resolves. A `(schema, strategy)` key is therefore deep-cleaned at
+    /// most once even when several threads race a cold miss together;
+    /// unrelated keys use unrelated cells, so they still clean
+    /// concurrently.
+    cleaned: Arc<std::sync::OnceLock<Arc<Value>>>,
 }
 
 /// Bounded memo of [`SchemaCleanr::clean_shared`] results, keyed by source
@@ -624,6 +634,15 @@ struct SchemaCleanCacheEntry {
 /// `Weak` permanently refuses to upgrade, so the entry can only miss.
 pub struct SchemaCleanCache {
     entries: std::sync::Mutex<HashMap<(usize, CleaningStrategy), SchemaCleanCacheEntry>>,
+    /// Counts actual deep-clean computations (`OnceLock::get_or_init`
+    /// closure runs), as opposed to cache hits or single-flight waits.
+    /// Test-only: lets the concurrent single-flight regression assert that
+    /// N racing callers on the same key produced exactly one deep clone,
+    /// not merely that they converged on the same returned pointer (a
+    /// post-compute recheck could stabilize the pointer while still having
+    /// done the duplicate work).
+    #[cfg(test)]
+    cold_compute_count: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for SchemaCleanCache {
@@ -636,16 +655,37 @@ impl SchemaCleanCache {
     pub fn new() -> Self {
         Self {
             entries: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            cold_compute_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Memoized [`SchemaCleanr::clean_shared`]: returns the shared source
     /// `Arc` when cleaning is a no-op, and otherwise the cleaned tree —
-    /// deep-computed at most once per (live schema, strategy) pair.
+    /// deep-computed at most once per (live schema, strategy) pair, even
+    /// when multiple threads race a cold miss on the same key together.
+    ///
+    /// Single-flight: the first miss for a `(schema, strategy)` key installs
+    /// a shared [`OnceLock`](std::sync::OnceLock) cell in the map before the
+    /// lock is released. Any other thread that misses on the *same* key
+    /// (i.e. it upgrades to the same live `source`) finds that cell already
+    /// installed, reuses it, and blocks in `get_or_init` instead of starting
+    /// its own deep clone — so only the winner's closure ever runs, and
+    /// every caller, winner and waiters alike, ends up with the one
+    /// resulting `Arc`. Misses on *different* keys install independent
+    /// cells and clean fully concurrently; the map lock is never held while
+    /// a clean itself runs.
     pub fn clean_shared(&self, schema: &Arc<Value>, strategy: CleaningStrategy) -> Arc<Value> {
+        if !SchemaCleanr::needs_cleaning(schema, strategy) {
+            // No-op: nothing worth caching or single-flighting (see the
+            // struct docs — a cached no-op would self-pin its source and
+            // pollute the map with ephemeral per-call allocations).
+            return Arc::clone(schema);
+        }
+
         let key = (Arc::as_ptr(schema) as usize, strategy);
-        {
-            let entries = self
+        let cell = {
+            let mut entries = self
                 .entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -653,38 +693,39 @@ impl SchemaCleanCache {
                 && let Some(live_source) = entry.source.upgrade()
                 && Arc::ptr_eq(&live_source, schema)
             {
-                return Arc::clone(&entry.cleaned);
+                Arc::clone(&entry.cleaned)
+            } else {
+                if entries.len() >= SCHEMA_CLEAN_CACHE_CAP && !entries.contains_key(&key) {
+                    entries.retain(|_, entry| entry.source.strong_count() > 0);
+                    if entries.len() >= SCHEMA_CLEAN_CACHE_CAP {
+                        entries.clear();
+                    }
+                }
+                let cell = Arc::new(std::sync::OnceLock::new());
+                entries.insert(
+                    key,
+                    SchemaCleanCacheEntry {
+                        source: Arc::downgrade(schema),
+                        cleaned: Arc::clone(&cell),
+                    },
+                );
+                cell
             }
-        }
+        };
 
-        // Compute outside the lock; the function is pure, so a concurrent
-        // duplicate compute is wasted work, never wrong results.
-        let cleaned = SchemaCleanr::clean_shared(schema, strategy);
-        if Arc::ptr_eq(&cleaned, schema) {
-            // No-op clean: nothing worth caching (see the struct docs — a
-            // cached no-op would self-pin its source and pollute the map
-            // with ephemeral per-call allocations).
-            return cleaned;
-        }
-
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if entries.len() >= SCHEMA_CLEAN_CACHE_CAP && !entries.contains_key(&key) {
-            entries.retain(|_, entry| entry.source.strong_count() > 0);
-            if entries.len() >= SCHEMA_CLEAN_CACHE_CAP {
-                entries.clear();
-            }
-        }
-        entries.insert(
-            key,
-            SchemaCleanCacheEntry {
-                source: Arc::downgrade(schema),
-                cleaned: Arc::clone(&cleaned),
-            },
-        );
-        cleaned
+        // Outside the lock: `needs_cleaning` already proved above that this
+        // schema requires a real rewrite, so `SchemaCleanr::clean_shared`
+        // cannot take its no-op path here — it always performs (or, for
+        // waiters, would have performed) the deep clone. Only the caller
+        // that actually initializes `cell` runs the closure; concurrent
+        // callers sharing `cell` block here and all observe that same
+        // result `Arc`.
+        Arc::clone(cell.get_or_init(|| {
+            #[cfg(test)]
+            self.cold_compute_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            SchemaCleanr::clean_shared(schema, strategy)
+        }))
     }
 
     #[cfg(test)]
@@ -693,6 +734,14 @@ impl SchemaCleanCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    /// Test-only: number of times the deep-clean closure actually ran
+    /// (as opposed to cache hits or single-flight waits).
+    #[cfg(test)]
+    fn cold_compute_count(&self) -> usize {
+        self.cold_compute_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -929,6 +978,77 @@ mod tests {
             ),
             "a live schema's memo must survive the dead-entry prune"
         );
+    }
+
+    /// Regression for a single-flight gap: releasing the map lock before
+    /// cleaning let two concurrent cold misses on the *same* `(schema,
+    /// strategy)` key both deep-clean and then race to insert, so callers
+    /// could observe different allocations for what should be one memoized
+    /// result. Races many threads on a common start line against one dirty
+    /// schema and asserts both that the deep clean ran exactly once (via
+    /// the test-only compute counter, not just pointer convergence — a
+    /// post-compute recheck could stabilize the returned pointer while
+    /// still having done the duplicate work) and that every racer shares
+    /// that one allocation.
+    #[test]
+    fn schema_clean_cache_single_flights_concurrent_cold_miss_on_same_key() {
+        const RACERS: usize = 32;
+
+        let cache = Arc::new(SchemaCleanCache::new());
+        // A schema with real fan-out so a duplicate deep clone is not just
+        // wasted CPU cycles but a genuinely distinct tree.
+        let properties: Map<String, Value> = (0..64)
+            .map(|i| (format!("field_{i}"), json!({ "const": format!("v{i}") })))
+            .collect();
+        let dirty: Arc<Value> = Arc::new(json!({
+            "type": "object",
+            "properties": Value::Object(properties)
+        }));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+        let handles: Vec<_> = (0..RACERS)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let dirty = Arc::clone(&dirty);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Every racer blocks here until all RACERS threads have
+                    // started, so the misses genuinely overlap instead of
+                    // serializing through thread-spawn latency.
+                    barrier.wait();
+                    cache.clean_shared(&dirty, CleaningStrategy::Anthropic)
+                })
+            })
+            .collect();
+
+        let results: Vec<Arc<Value>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("racer thread panicked"))
+            .collect();
+
+        assert_eq!(
+            cache.cold_compute_count(),
+            1,
+            "single-flight must deep-clean exactly once for a (schema, \
+             strategy) key raced by {RACERS} concurrent callers; a count \
+             greater than 1 means concurrent misses each deep-cloned \
+             independently instead of sharing the first computation"
+        );
+
+        let first = &results[0];
+        assert!(
+            !Arc::ptr_eq(first, &dirty),
+            "dirty schema must actually be rewritten by the single \
+             computation, not shared as-is"
+        );
+        for (i, result) in results.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(first, result),
+                "racer {i} observed a different allocation than racer 0; \
+                 every concurrent caller on the same key must share the \
+                 one single-flighted result"
+            );
+        }
     }
 
     #[test]

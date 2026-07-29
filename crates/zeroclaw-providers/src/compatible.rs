@@ -3633,39 +3633,26 @@ mod tests {
         ];
 
         let converted = p.convert_tool_specs(Some(&tools)).expect("Some(tools) in");
-        let value = serde_json::to_value(&converted).unwrap();
+        let raw = serde_json::to_string(&converted).unwrap();
 
+        // Raw string, not `serde_json::Value` equality: `Value` object
+        // equality ignores key order, so it cannot pin the declared
+        // key-order delta (typed structs serialize `type`/`function`, and
+        // `name`/`description`/`parameters` within it, in field-declaration
+        // order; the `parameters` schema itself is a plain `Value` with no
+        // `preserve_order` feature enabled, so its own keys always come out
+        // alphabetical regardless of insertion order, e.g. `properties`
+        // before `type`). `const` is also rewritten to a single-value
+        // `enum` by the cleaner, exactly as the pre-typed-struct pipeline
+        // did.
         assert_eq!(
-            value,
-            serde_json::json!([
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "description": "Fetch the weather",
-                        "parameters": {
-                            "type": "object",
-                            "properties": { "city": { "type": "string" } }
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "set_mode",
-                        "description": "Set the mode",
-                        "parameters": {
-                            "type": "object",
-                            // `const` is rewritten to a single-value enum by
-                            // the cleaner, exactly as the pre-typed-struct
-                            // pipeline did.
-                            "properties": { "mode": { "enum": ["fast"] } }
-                        }
-                    }
-                }
-            ]),
-            "typed tool specs must serialize to the same wire shape as the \
-             previous json!-built payload"
+            raw,
+            concat!(
+                r#"[{"type":"function","function":{"name":"get_weather","description":"Fetch the weather","parameters":{"properties":{"city":{"type":"string"}},"type":"object"}}},"#,
+                r#"{"type":"function","function":{"name":"set_mode","description":"Set the mode","parameters":{"properties":{"mode":{"enum":["fast"]}},"type":"object"}}}]"#
+            ),
+            "typed tool specs must serialize to the same byte-for-byte wire \
+             shape (including key order) as the previous json!-built payload"
         );
     }
 
