@@ -119,6 +119,7 @@ impl FirejailSandbox {
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
+
         // Build firejail wrapper with security flags
         let mut firejail_cmd = Command::new("firejail");
         firejail_cmd.args([
@@ -137,6 +138,7 @@ impl FirejailSandbox {
         // Add the original command
         firejail_cmd.arg(&program);
         firejail_cmd.args(&args);
+
         // Replace the command
         *cmd = firejail_cmd;
         Ok(())

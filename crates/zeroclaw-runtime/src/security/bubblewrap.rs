@@ -106,6 +106,7 @@ impl BubblewrapSandbox {
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
+
         let mut bwrap_cmd = Command::new("bwrap");
         bwrap_cmd.args([
             "--ro-bind",
@@ -138,6 +139,7 @@ impl BubblewrapSandbox {
         }
         bwrap_cmd.arg(&program);
         bwrap_cmd.args(&args);
+
         *cmd = bwrap_cmd;
         Ok(())
     }
