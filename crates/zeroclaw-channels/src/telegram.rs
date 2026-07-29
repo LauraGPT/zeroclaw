@@ -611,6 +611,28 @@ enum UpdateDisposition {
     RetryTransient,
 }
 
+/// Result of routing a single update through [`TelegramChannel::process_update`].
+///
+/// Both the startup/restart probe and the main long-poll loop drive their
+/// batches of updates through the same per-update path so a queued update
+/// seen at startup gets exactly the same offset-advance discipline as one
+/// seen mid-run: the offset only moves past an update once it has been
+/// delivered or permanently skipped, never while a transient failure or a
+/// dropped receiver could still cause it to be lost.
+enum UpdateOutcome {
+    /// The update was delivered or permanently skipped; the offset has been
+    /// advanced past it and the caller should keep processing the batch.
+    Advanced,
+    /// A transient failure occurred (or the retry budget for this update was
+    /// exhausted and it was dropped). The caller should stop processing the
+    /// rest of this batch so the next poll retries starting at the
+    /// still-unadvanced offset.
+    StopBatch,
+    /// The channel receiver has been dropped; the whole listen loop must
+    /// exit immediately.
+    ReceiverClosed,
+}
+
 fn normalize_telegram_api_base(api_base: &str) -> String {
     api_base.trim_end_matches('/').to_string()
 }
@@ -3265,6 +3287,208 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         self.send_media_by_url("sendVoice", "voice", chat_id, thread_id, url, caption)
             .await
     }
+
+    /// Attempt budget for a single update stuck on `RetryTransient` before it
+    /// is dropped like a permanent skip. Shared by both the startup probe
+    /// and the main long-poll loop via [`Self::process_update`].
+    const TRANSIENT_RETRY_MAX_ATTEMPTS: u32 = 3;
+
+    /// Route a single update from a `getUpdates` batch through the shared
+    /// delivered/permanent-skip/retry-transient disposition path.
+    ///
+    /// This is called from both the startup/restart probe and the main
+    /// long-poll loop so a queued update sitting in the probe's first batch
+    /// is handled identically to one seen mid-run: `offset` only advances
+    /// past an update once it has been delivered (`tx.send` succeeded) or
+    /// permanently skipped, never while a transient failure or a dropped
+    /// `tx` receiver could still cause it to be lost.
+    async fn process_update(
+        &self,
+        update: &serde_json::Value,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        offset: &mut i64,
+        transient_retry: &mut Option<(i64, u32)>,
+    ) -> UpdateOutcome {
+        let uid = update.get("update_id").and_then(serde_json::Value::as_i64);
+
+        // ── Handle callback_query (inline keyboard taps) ──
+        if let Some(cb) = update.get("callback_query") {
+            let cb_id = cb
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let cb_data = cb
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+
+            if let Some(rest) = cb_data.strip_prefix("approval:")
+                && let Some((approval_id, action)) = rest.rsplit_once(':')
+            {
+                let response = match action {
+                    "approve" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
+                    "always" => Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove),
+                    "deny" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
+                    other => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"other": other})),
+                            "Unknown approval callback action"
+                        );
+                        None
+                    }
+                };
+
+                if let Some(resp) = response
+                    && let Some(sender) = self.pending_approvals.lock().await.remove(approval_id)
+                {
+                    let _ = sender.send(resp);
+                }
+
+                // Answer the callback query to dismiss the spinner.
+                let answer_text = match action {
+                    "approve" => "✅ Approved",
+                    "always" => "✅✅ Always approved",
+                    "deny" => "❌ Denied",
+                    _ => "⚠️ Unknown action",
+                };
+                let answer_body = serde_json::json!({
+                    "callback_query_id": cb_id,
+                    "text": answer_text,
+                });
+                if let Err(e) = self
+                    .http_client()
+                    .post(self.api_url("answerCallbackQuery"))
+                    .json(&answer_body)
+                    .send()
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                        "answerCallbackQuery failed"
+                    );
+                }
+            }
+
+            // callback_query is not a regular message; it carries no
+            // fallible I/O, so it's always safe to acknowledge.
+            if let Some(uid) = uid {
+                *offset = uid + 1;
+            }
+            return UpdateOutcome::Advanced;
+        }
+
+        // `parse_update_message` handles text messages and has no fallible
+        // I/O, so its `None` always means "not applicable", fall through to
+        // the voice parser next. The voice and attachment parsers can
+        // additionally fail transiently on download/transcription I/O; a
+        // transient failure must abort this update's processing entirely
+        // (not fall through to the next parser) so the offset stays put and
+        // the next poll retries it.
+        let disposition = if let Some(m) = self.parse_update_message(update) {
+            UpdateDisposition::Parsed(Box::new(m))
+        } else {
+            match self.try_parse_voice_message(update).await {
+                UpdateDisposition::SkipPermanent => self.try_parse_attachment_message(update).await,
+                other => other,
+            }
+        };
+
+        let msg = match disposition {
+            UpdateDisposition::Parsed(m) => m,
+            UpdateDisposition::SkipPermanent => {
+                Box::pin(self.handle_unauthorized_message(update)).await;
+                if let Some(uid) = uid {
+                    *offset = uid + 1;
+                    *transient_retry = None;
+                }
+                return UpdateOutcome::Advanced;
+            }
+            UpdateDisposition::RetryTransient => {
+                if let Some(uid) = uid {
+                    let attempts = match *transient_retry {
+                        Some((tracked_uid, n)) if tracked_uid == uid => n + 1,
+                        _ => 1,
+                    };
+                    if attempts >= Self::TRANSIENT_RETRY_MAX_ATTEMPTS {
+                        // Attempt budget exhausted: the failure is evidently
+                        // not transient after all. Drop the update exactly
+                        // like a permanent skip so it stops starving
+                        // everything behind it.
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "update_id": uid,
+                                "attempts": attempts,
+                            })),
+                            "update kept failing transiently; giving up and advancing past it to unblock the channel"
+                        );
+                        Box::pin(self.handle_unauthorized_message(update)).await;
+                        *offset = uid + 1;
+                        *transient_retry = None;
+                        return UpdateOutcome::Advanced;
+                    }
+                    *transient_retry = Some((uid, attempts));
+                }
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Transient failure parsing update; leaving offset unadvanced so the next poll retries it"
+                );
+                // Brief backoff, shorter than the generic poll-error delay
+                // above, since only this one update failed and the rest of
+                // the getUpdates response was healthy: just enough to avoid
+                // hammering a flaky download endpoint on every immediate
+                // re-poll.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                return UpdateOutcome::StopBatch;
+            }
+        };
+
+        if self.ack_reactions
+            && let Some((reaction_chat_id, reaction_message_id)) =
+                Self::extract_update_message_target(update)
+        {
+            self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
+        }
+
+        // Send "typing" indicator immediately when we receive a message
+        let typing_body = serde_json::json!({
+            "chat_id": &msg.reply_target,
+            "action": "typing"
+        });
+        let _ = self
+            .http_client()
+            .post(self.api_url("sendChatAction"))
+            .json(&typing_body)
+            .send()
+            .await; // Ignore errors for typing indicator
+
+        match tx.send(*msg).await {
+            Ok(()) => {
+                if let Some(uid) = uid {
+                    *offset = uid + 1;
+                    *transient_retry = None;
+                }
+                UpdateOutcome::Advanced
+            }
+            Err(_) => UpdateOutcome::ReceiverClosed,
+        }
+    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for TelegramChannel {
@@ -3722,15 +3946,18 @@ impl Channel for TelegramChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
         // Single-slot transient-retry tracker: (update_id, attempts so far).
-        // One slot is sufficient because a transient failure breaks out of
-        // the per-update loop below, so at most one update can be
-        // head-of-line blocking retries at any time. Once an update has
-        // burned through the attempt budget it is dropped like a permanent
-        // skip — otherwise a permanently failing download (expired file_id,
-        // revoked transcription key, full disk) would wedge the channel
-        // forever, starving every later update behind it.
+        // One slot is sufficient because a transient failure via
+        // `process_update` stops processing of the current update batch (be
+        // it the startup probe's batch below or the main loop's), so at most
+        // one update can be head-of-line blocking retries at any time. Once
+        // an update has burned through the attempt budget it is dropped
+        // like a permanent skip, otherwise a permanently failing download
+        // (expired file_id, revoked transcription key, full disk) would
+        // wedge the channel forever, starving every later update behind it.
+        // Shared across both the startup probe and the main loop so a
+        // transient failure on a queued startup update is tracked the same
+        // way as one seen mid-run.
         let mut transient_retry: Option<(i64, u32)> = None;
-        const TRANSIENT_RETRY_MAX_ATTEMPTS: u32 = 3;
 
         if self.mention_only {
             let _ = self.get_bot_username().await;
@@ -3783,16 +4010,30 @@ impl Channel for TelegramChannel {
                                 .and_then(serde_json::Value::as_bool)
                                 .unwrap_or(false);
                             if ok {
-                                // Slot claimed — advance offset past any queued updates.
+                                // Slot claimed. Route any queued updates through the
+                                // same delivered/permanent-skip/retry-transient
+                                // disposition path as the main loop below, instead of
+                                // blindly advancing the offset past them: a transient
+                                // failure or a dropped receiver here must leave the
+                                // offset unadvanced too, so the update survives until
+                                // a later poll (in this probe or the main loop) can
+                                // actually deliver it.
                                 if let Some(results) =
                                     data.get("result").and_then(serde_json::Value::as_array)
                                 {
                                     for update in results {
-                                        if let Some(uid) = update
-                                            .get("update_id")
-                                            .and_then(serde_json::Value::as_i64)
+                                        match self
+                                            .process_update(
+                                                update,
+                                                &tx,
+                                                &mut offset,
+                                                &mut transient_retry,
+                                            )
+                                            .await
                                         {
-                                            offset = uid + 1;
+                                            UpdateOutcome::Advanced => {}
+                                            UpdateOutcome::StopBatch => break,
+                                            UpdateOutcome::ReceiverClosed => return Ok(()),
                                         }
                                     }
                                 }
@@ -3927,204 +4168,13 @@ Ensure only one `zeroclaw` process is using this bot token."
 
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
                 for update in results {
-                    let uid = update.get("update_id").and_then(serde_json::Value::as_i64);
-
-                    // ── Handle callback_query (inline keyboard taps) ──
-                    if let Some(cb) = update.get("callback_query") {
-                        let cb_id = cb
-                            .get("id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default();
-                        let cb_data = cb
-                            .get("data")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default();
-
-                        if let Some(rest) = cb_data.strip_prefix("approval:")
-                            && let Some((approval_id, action)) = rest.rsplit_once(':')
-                        {
-                            let response = match action {
-                                "approve" => {
-                                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
-                                }
-                                "always" => Some(
-                                    zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
-                                ),
-                                "deny" => {
-                                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny)
-                                }
-                                other => {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Note
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                        .with_attrs(::serde_json::json!({"other": other})),
-                                        "Unknown approval callback action"
-                                    );
-                                    None
-                                }
-                            };
-
-                            if let Some(resp) = response
-                                && let Some(sender) =
-                                    self.pending_approvals.lock().await.remove(approval_id)
-                            {
-                                let _ = sender.send(resp);
-                            }
-
-                            // Answer the callback query to dismiss the spinner.
-                            let answer_text = match action {
-                                "approve" => "✅ Approved",
-                                "always" => "✅✅ Always approved",
-                                "deny" => "❌ Denied",
-                                _ => "⚠️ Unknown action",
-                            };
-                            let answer_body = serde_json::json!({
-                                "callback_query_id": cb_id,
-                                "text": answer_text,
-                            });
-                            if let Err(e) = self
-                                .http_client()
-                                .post(self.api_url("answerCallbackQuery"))
-                                .json(&answer_body)
-                                .send()
-                                .await
-                            {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                                    "answerCallbackQuery failed"
-                                );
-                            }
-                        }
-
-                        // callback_query is not a regular message; it carries no
-                        // fallible I/O, so it's always safe to acknowledge.
-                        if let Some(uid) = uid {
-                            offset = uid + 1;
-                        }
-                        continue;
-                    }
-
-                    // `parse_update_message` handles text messages and has no
-                    // fallible I/O, so its `None` always means "not applicable" —
-                    // fall through to the voice parser next. The voice and
-                    // attachment parsers can additionally fail transiently on
-                    // download/transcription I/O; a transient failure must abort
-                    // this update's processing entirely (not fall through to the
-                    // next parser) so the offset stays put and the next poll
-                    // retries it.
-                    let disposition = if let Some(m) = self.parse_update_message(update) {
-                        UpdateDisposition::Parsed(Box::new(m))
-                    } else {
-                        match self.try_parse_voice_message(update).await {
-                            UpdateDisposition::SkipPermanent => {
-                                self.try_parse_attachment_message(update).await
-                            }
-                            other => other,
-                        }
-                    };
-
-                    let msg = match disposition {
-                        UpdateDisposition::Parsed(m) => m,
-                        UpdateDisposition::SkipPermanent => {
-                            Box::pin(self.handle_unauthorized_message(update)).await;
-                            if let Some(uid) = uid {
-                                offset = uid + 1;
-                                transient_retry = None;
-                            }
-                            continue;
-                        }
-                        UpdateDisposition::RetryTransient => {
-                            if let Some(uid) = uid {
-                                let attempts = match transient_retry {
-                                    Some((tracked_uid, n)) if tracked_uid == uid => n + 1,
-                                    _ => 1,
-                                };
-                                if attempts >= TRANSIENT_RETRY_MAX_ATTEMPTS {
-                                    // Attempt budget exhausted: the failure is
-                                    // evidently not transient after all. Drop
-                                    // the update exactly like a permanent skip
-                                    // so it stops starving everything behind it.
-                                    ::zeroclaw_log::record!(
-                                        ERROR,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Fail
-                                        )
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                        .with_attrs(
-                                            ::serde_json::json!({
-                                                "update_id": uid,
-                                                "attempts": attempts,
-                                            })
-                                        ),
-                                        "update kept failing transiently; giving up and advancing past it to unblock the channel"
-                                    );
-                                    Box::pin(self.handle_unauthorized_message(update)).await;
-                                    offset = uid + 1;
-                                    transient_retry = None;
-                                    continue;
-                                }
-                                transient_retry = Some((uid, attempts));
-                            }
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                "Transient failure parsing update; leaving offset unadvanced so the next poll retries it"
-                            );
-                            // Brief backoff — shorter than the generic poll-error
-                            // delay above, since only this one update failed and
-                            // the rest of the getUpdates response was healthy —
-                            // just enough to avoid hammering a flaky download
-                            // endpoint on every immediate re-poll.
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            break;
-                        }
-                    };
-
-                    if self.ack_reactions
-                        && let Some((reaction_chat_id, reaction_message_id)) =
-                            Self::extract_update_message_target(update)
+                    match self
+                        .process_update(update, &tx, &mut offset, &mut transient_retry)
+                        .await
                     {
-                        self.try_add_ack_reaction_nonblocking(
-                            reaction_chat_id,
-                            reaction_message_id,
-                        );
-                    }
-
-                    // Send "typing" indicator immediately when we receive a message
-                    let typing_body = serde_json::json!({
-                        "chat_id": &msg.reply_target,
-                        "action": "typing"
-                    });
-                    let _ = self
-                        .http_client()
-                        .post(self.api_url("sendChatAction"))
-                        .json(&typing_body)
-                        .send()
-                        .await; // Ignore errors for typing indicator
-
-                    match tx.send(*msg).await {
-                        Ok(()) => {
-                            if let Some(uid) = uid {
-                                offset = uid + 1;
-                                transient_retry = None;
-                            }
-                        }
-                        Err(_) => return Ok(()),
+                        UpdateOutcome::Advanced => {}
+                        UpdateOutcome::StopBatch => break,
+                        UpdateOutcome::ReceiverClosed => return Ok(()),
                     }
                 }
             }
@@ -6954,6 +7004,28 @@ mod tests {
             .await;
     }
 
+    /// Mount the startup probe (`getUpdates` with `"timeout": 0`) so its
+    /// single response carries `update` in `result`, simulating a message
+    /// that queued up on Telegram's side while the listener was down (e.g.
+    /// across a restart) and is waiting at the current offset.
+    async fn mount_telegram_startup_probe_with_queued_update(
+        mock_server: &wiremock::MockServer,
+        update: serde_json::Value,
+    ) {
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_partial_json(serde_json::json!({"timeout": 0})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": [update]})),
+            )
+            .mount(mock_server)
+            .await;
+    }
+
     /// Mount a main-loop `getUpdates` responder (`"timeout": 30`) matched on
     /// the exact `offset` the request carries, replying `ok` with `result`.
     async fn mount_telegram_get_updates(
@@ -7378,6 +7450,113 @@ mod tests {
             telegram_wait_for_main_loop_offset(&mock_server, uid2 + 1, Duration::from_secs(5))
                 .await,
             "offset never advanced past the unauthorized voice update"
+        );
+
+        handle.abort();
+    }
+
+    /// A restart's startup probe (`getUpdates` with `"timeout": 0`) can come
+    /// back with updates that queued up on Telegram's side while the
+    /// listener was down. Those updates must go through the same
+    /// delivered/permanent-skip/retry-transient disposition path as the
+    /// main loop: if delivery of a queued update fails transiently, the
+    /// offset must NOT advance past it in the probe, and the update must
+    /// survive, unadvanced, until a later poll (here, the main loop's very
+    /// next request at the same offset) can actually deliver it.
+    #[tokio::test]
+    async fn listen_restart_probe_queued_update_survives_transient_failure_until_delivered() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let uid = 6_000;
+        let update = telegram_document_update(uid, 40, 111, "alice", "file999", "queued.pdf");
+
+        // The startup probe's one and only response carries the update that
+        // was queued while the listener was offline, simulating a restart.
+        mount_telegram_startup_probe_with_queued_update(&mock_server, update.clone()).await;
+
+        // The offset must stay at 0 across the probe's transient failure, so
+        // the main loop re-polls at the same offset and sees the same
+        // still-queued update again.
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([update])).await;
+
+        // First getFile attempt (from the probe) fails transiently; the
+        // retry (from the main loop's first poll) succeeds.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_path": "documents/queued.pdf"}
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/file/bot[^/]+/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"pdf bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        // Keep the loop fed once the offset advances past the update.
+        mount_telegram_get_updates(&mock_server, uid + 1, serde_json::json!([])).await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timed out waiting for the queued attachment message")
+            .expect("channel closed before delivering the queued attachment message");
+        assert!(
+            msg.content.contains("queued.pdf"),
+            "unexpected content: {}",
+            msg.content
+        );
+
+        // Exactly one main-loop poll (timeout: 30) must have happened at the
+        // still-unadvanced offset 0 before the offset moved past the update:
+        // the probe's own transient failure must not have advanced it.
+        let old_offset_polls = telegram_main_loop_getupdates_bodies(&mock_server)
+            .await
+            .iter()
+            .filter(|b| b.get("offset").and_then(serde_json::Value::as_i64) == Some(0))
+            .count();
+        assert_eq!(
+            old_offset_polls, 1,
+            "offset must have stayed at 0 (unadvanced by the probe) for exactly one main-loop retry"
+        );
+
+        assert!(
+            telegram_wait_for_main_loop_offset(&mock_server, uid + 1, Duration::from_secs(5)).await,
+            "offset never advanced past the queued update once its retry succeeded"
+        );
+
+        // The queued update must be delivered exactly once, never twice.
+        let extra = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            extra.is_err(),
+            "unexpected extra message delivered: {extra:?}"
         );
 
         handle.abort();
