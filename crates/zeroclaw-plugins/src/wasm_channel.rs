@@ -11,7 +11,7 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
 };
 use crate::component::{
     PluginState, PluginStoreSpec, WarmPluginState, call_channel, call_store, engine,
-    load_component, wt,
+    load_component, wt, wt_instantiate,
 };
 use crate::endpoint::PluginChannelEndpoint;
 use crate::instance::PluginGrantSet;
@@ -181,7 +181,7 @@ impl ChannelInstanceFactory {
         let linker = build_linker(http)?;
         crate::component::ensure_http_coherent(&store, http)?;
         let bindings = call_store!(store, async |store: &mut Store<PluginState>| {
-            wt(
+            wt_instantiate(
                 ChannelPlugin::instantiate_async(store, &self.component, &linker).await,
                 "failed to instantiate channel plugin",
             )
