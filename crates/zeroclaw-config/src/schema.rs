@@ -14805,7 +14805,7 @@ impl ChannelConfig for WatiConfig {
     }
 }
 
-/// Nextcloud Talk bot configuration (webhook receive + OCS send API).
+/// Nextcloud Talk bot configuration (webhook receive + signed bot send API).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.nextcloud_talk"]
@@ -14820,12 +14820,35 @@ pub struct NextcloudTalkConfig {
     /// Nextcloud base URL (e.g. `"https://cloud.example.com"`).
     #[tab(Connection)]
     pub base_url: String,
-    /// Bot app token used for OCS API bearer auth.
+    /// Deprecated, unused. Nextcloud Talk sends do not authenticate via
+    /// OCS bearer auth (see `webhook_secret`); this field is only accepted so
+    /// existing configs that set it don't fail to parse. Safe to remove
+    /// from your config.
+    #[serde(default)]
     #[secret]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub app_token: String,
-    /// Shared secret for webhook signature verification.
+    pub app_token: Option<String>,
+    /// DEPRECATED alias for `webhook_secret`, kept for migration.
+    ///
+    /// Nextcloud issues ONE secret per installed bot and uses it for both
+    /// directions, so this cannot hold a different outbound secret. When both
+    /// are set to different non-empty values the channel logs the conflict and
+    /// fails closed as unconfigured: inbound `401` and no outbound send.
+    /// Prefer `webhook_secret`; this alias will be removed.
+    ///
+    /// Upgrade from a `bot_token`-only configuration: copy the installed bot
+    /// secret to `webhook_secret`, verify replies still send, then delete
+    /// `bot_token`.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub bot_token: Option<String>,
+    /// The bot secret Nextcloud installed for this bot. Canonical field.
+    ///
+    /// Used for BOTH directions: verifying inbound webhook signatures and
+    /// signing outbound bot-API requests. When it is unset, inbound webhooks
+    /// are rejected and no outbound request is sent (fail closed).
     ///
     /// Can also be set via `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET`.
     #[serde(default)]
@@ -14849,20 +14872,69 @@ pub struct NextcloudTalkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
-    /// Controls whether and how streaming draft updates are delivered.
-    ///
-    /// - `"off"` (default): responses are sent as a single final message.
-    /// - `"partial"`: a placeholder is posted first and edited incrementally
-    ///   as tokens arrive, making long responses visible in real time.
+    /// Retained for configuration compatibility. Nextcloud Talk's bot API does
+    /// not provide message IDs or edit/delete operations, so draft updates are
+    /// disabled and responses are currently sent as one final message for every
+    /// value.
     #[tab(Behavior)]
     #[serde(default)]
     pub stream_mode: StreamMode,
-    /// Minimum interval in milliseconds between consecutive OCS edit calls per
-    /// room when `stream_mode = "partial"`. Default: 1000 ms.
+    /// Retained for configuration compatibility. Currently inert while draft
+    /// updates are disabled for this channel. Default: 1000 ms.
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
 }
+impl NextcloudTalkConfig {
+    /// Resolve the single bot secret Nextcloud installs for this bot.
+    ///
+    /// Nextcloud issues ONE secret per installed bot and uses it for both directions:
+    /// verifying inbound webhook signatures and signing outbound bot-API requests. So
+    /// both directions must resolve it identically, or one of them cannot match the
+    /// installed bot.
+    ///
+    /// `webhook_secret` is canonical; `bot_token` is a deprecated alias kept for
+    /// migration. Both are trimmed, and a blank value is treated as absent so an empty
+    /// or whitespace alias cannot mask a real secret. Two conflicting non-empty values
+    /// are rejected rather than silently split into two authorities.
+    ///
+    /// Returns `Ok(None)` when no secret is configured. Callers must fail closed on
+    /// `Ok(None)` and on `Err`: send no outbound request, and reject inbound webhooks
+    /// rather than skipping verification.
+    pub fn resolve_bot_secret(&self) -> Result<Option<String>, NextcloudTalkSecretConflict> {
+        let norm = |v: &Option<String>| -> Option<String> {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        };
+        let canonical = norm(&self.webhook_secret);
+        let alias = norm(&self.bot_token);
+        match (canonical, alias) {
+            (Some(a), Some(b)) if a != b => Err(NextcloudTalkSecretConflict),
+            (Some(a), _) => Ok(Some(a)),
+            (None, Some(b)) => Ok(Some(b)),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// `webhook_secret` and the deprecated `bot_token` alias hold different non-empty
+/// values. Nextcloud installs one secret per bot, so there is no correct choice
+/// between them and guessing would leave one direction unable to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NextcloudTalkSecretConflict;
+
+impl std::fmt::Display for NextcloudTalkSecretConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "nextcloud_talk: `webhook_secret` and the deprecated `bot_token` alias are set \
+to different values; Nextcloud installs one secret per bot. Set `webhook_secret` only.",
+        )
+    }
+}
+
+impl std::error::Error for NextcloudTalkSecretConflict {}
 
 impl ChannelConfig for NextcloudTalkConfig {
     fn name() -> &'static str {
@@ -22616,6 +22688,96 @@ impl HasPropKind for serde_json::Value {
 #[cfg(test)]
 mod tests {
 
+    // ── Nextcloud Talk: one normalized bot secret for both directions ──
+    //
+    // Nextcloud installs ONE secret per bot and uses it to verify inbound webhook
+    // signatures AND to sign outbound bot-API requests. Before this, outbound used a
+    // raw `bot_token.or_else(webhook_secret)` (no trim, no non-empty check) while
+    // inbound read only a trimmed non-empty `webhook_secret`, so the two directions
+    // could resolve different secrets -- or outbound could sign with whitespace.
+
+    fn nc_cfg(webhook_secret: Option<&str>, bot_token: Option<&str>) -> NextcloudTalkConfig {
+        NextcloudTalkConfig {
+            webhook_secret: webhook_secret.map(ToOwned::to_owned),
+            bot_token: bot_token.map(ToOwned::to_owned),
+            ..NextcloudTalkConfig::default()
+        }
+    }
+
+    /// Alias-only configuration must resolve, so a `bot_token`-only install keeps
+    /// working through the migration window -- and, critically, now resolves for the
+    /// INBOUND direction too, where it previously produced no secret at all.
+    #[::core::prelude::v1::test]
+    fn nextcloud_alias_only_configuration_resolves_the_secret() {
+        let cfg = nc_cfg(None, Some("shared-bot-secret"));
+        assert_eq!(
+            cfg.resolve_bot_secret().unwrap(),
+            Some("shared-bot-secret".to_string())
+        );
+    }
+
+    /// The canonical field wins when both carry the SAME value, and agreeing
+    /// duplicates are not treated as a conflict.
+    #[::core::prelude::v1::test]
+    fn nextcloud_agreeing_alias_and_canonical_resolve_to_one_secret() {
+        let cfg = nc_cfg(Some("same"), Some("same"));
+        assert_eq!(cfg.resolve_bot_secret().unwrap(), Some("same".to_string()));
+    }
+
+    /// Two conflicting non-empty values must be REJECTED rather than silently split
+    /// into two authorities: whichever direction loses cannot match the installed bot.
+    #[::core::prelude::v1::test]
+    fn nextcloud_conflicting_alias_is_rejected() {
+        let cfg = nc_cfg(Some("canonical"), Some("different"));
+        assert!(
+            cfg.resolve_bot_secret().is_err(),
+            "conflicting non-empty secrets must not silently pick one"
+        );
+    }
+
+    /// A blank or whitespace alias must not mask a real secret. Previously the raw
+    /// `bot_token.or_else(...)` would hand whitespace to the outbound signer.
+    #[::core::prelude::v1::test]
+    fn nextcloud_blank_alias_does_not_mask_the_real_secret() {
+        for blank in ["", "   ", "\t", "\n  "] {
+            let cfg = nc_cfg(Some("real-secret"), Some(blank));
+            assert_eq!(
+                cfg.resolve_bot_secret().unwrap(),
+                Some("real-secret".to_string()),
+                "blank alias {blank:?} must not mask the canonical secret"
+            );
+        }
+        // ...and a blank canonical falls back to a real alias rather than resolving blank.
+        let cfg = nc_cfg(Some("  "), Some("real-secret"));
+        assert_eq!(
+            cfg.resolve_bot_secret().unwrap(),
+            Some("real-secret".to_string())
+        );
+    }
+
+    /// Values are trimmed, so trailing whitespace in config cannot produce a secret
+    /// that differs between the two directions.
+    #[::core::prelude::v1::test]
+    fn nextcloud_secret_is_trimmed() {
+        let cfg = nc_cfg(Some("  padded  "), None);
+        assert_eq!(
+            cfg.resolve_bot_secret().unwrap(),
+            Some("padded".to_string())
+        );
+    }
+
+    /// With nothing configured the secret is unresolved. Callers must fail closed:
+    /// no outbound request is signed, and inbound verification is NOT skipped.
+    /// (The gateway rejects with 401 in that case; see the inbound handler.)
+    #[::core::prelude::v1::test]
+    fn nextcloud_unresolved_secret_yields_none_so_callers_fail_closed() {
+        assert_eq!(nc_cfg(None, None).resolve_bot_secret().unwrap(), None);
+        assert_eq!(
+            nc_cfg(Some(""), Some("   ")).resolve_bot_secret().unwrap(),
+            None
+        );
+    }
+
     #[::core::prelude::v1::test]
     fn todotracker_config_defaults() {
         let cfg = super::TodoTrackerConfig::default();
@@ -23010,7 +23172,6 @@ max_height = 8
         assert_eq!(cfg.events.len(), 4);
     }
     use super::*;
-    #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -23021,13 +23182,11 @@ max_height = 8
     use tokio::sync::MutexGuard;
     use tokio::test;
 
-    #[cfg(unix)]
     struct EnvValueGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
-    #[cfg(unix)]
     impl EnvValueGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
@@ -23044,7 +23203,6 @@ max_height = 8
         }
     }
 
-    #[cfg(unix)]
     impl Drop for EnvValueGuard {
         fn drop(&mut self) {
             // SAFETY: tests that mutate env vars serialize on env_override_lock().
@@ -28173,11 +28331,20 @@ wire_api = "ws"
     #[test]
     async fn classify_runtime_config_kind_uses_runtime_resolution_source() {
         let _env_guard = env_override_lock().await;
+        #[cfg(unix)]
         let fake_home =
             PathBuf::from("/non-temp-zeroclaw-test-home").join(uuid::Uuid::new_v4().to_string());
+        #[cfg(not(unix))]
+        let fake_home = UserDirs::new()
+            .expect("user directories should be available")
+            .home_dir()
+            .to_path_buf();
         let explicit_config_dir = fake_home.join("explicit-config");
 
+        #[cfg(unix)]
         let _home_guard = EnvValueGuard::set("HOME", &fake_home);
+        #[cfg(not(unix))]
+        let _home_guard = EnvValueGuard::remove("HOME");
         let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
         let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
 
@@ -29556,7 +29723,8 @@ group_policy = "disabled"
         let nc = NextcloudTalkConfig {
             enabled: true,
             base_url: "https://cloud.example.com".into(),
-            app_token: "app-token".into(),
+            app_token: None,
+            bot_token: None,
             webhook_secret: Some("webhook-secret".into()),
             proxy_url: None,
             bot_name: None,
@@ -29568,15 +29736,26 @@ group_policy = "disabled"
         let json = serde_json::to_string(&nc).unwrap();
         let parsed: NextcloudTalkConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.base_url, "https://cloud.example.com");
-        assert_eq!(parsed.app_token, "app-token");
+        assert!(parsed.app_token.is_none());
         assert_eq!(parsed.webhook_secret.as_deref(), Some("webhook-secret"));
     }
 
     #[test]
     async fn nextcloud_talk_config_defaults_optional_fields() {
-        let json = r#"{"base_url":"https://cloud.example.com","app_token":"app-token"}"#;
+        let json = r#"{"base_url":"https://cloud.example.com"}"#;
         let parsed: NextcloudTalkConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.webhook_secret.is_none());
+        assert!(parsed.app_token.is_none());
+    }
+
+    #[test]
+    async fn nextcloud_talk_config_accepts_legacy_app_token_without_using_it() {
+        // Pre-existing configs may still set the now-deprecated app_token;
+        // it must parse (not fail-closed the whole config) and just be
+        // carried as a no-op field.
+        let json = r#"{"base_url":"https://cloud.example.com","app_token":"legacy-value"}"#;
+        let parsed: NextcloudTalkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.app_token.as_deref(), Some("legacy-value"));
     }
 
     // ── Config file permission hardening (Unix only) ───────────────
