@@ -9679,6 +9679,37 @@ fn validate_required_bot_token(field_path: &str, enabled: bool, token: &str) -> 
     Ok(())
 }
 
+/// Shared "required once enabled" rule for channel-credential fields whose
+/// name doesn't end in `bot_token` (Signal's `http_url`/`account`, Voice
+/// Call's `account_id`/`auth_token`/`from_number`), so the sibling
+/// `.enabled` path can't be derived by suffix-stripping like
+/// `validate_required_bot_token` does. An enabled channel built with an
+/// empty required credential never connects, so its per-channel supervisor
+/// restarts it forever; rejecting at config-load time turns that crashloop
+/// into a fail-fast startup error instead.
+pub(crate) fn validate_required_field(
+    field_path: &str,
+    enabled_path: &str,
+    enabled: bool,
+    value: &str,
+) -> Result<()> {
+    if value.trim() == crate::traits::UNSET_DISPLAY {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} must not contain the unset display placeholder",
+        );
+    }
+    if enabled && crate::traits::is_unset_display_value(value) {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field_path.to_string(),
+            "{field_path} is required when {enabled_path} = true",
+        );
+    }
+    Ok(())
+}
+
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -14498,6 +14529,40 @@ pub struct SignalConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl SignalConfig {
+    /// Whether both required credentials (`http_url`, `account`) are
+    /// present. Mirrors `WhatsAppConfig::is_cloud_config`'s role: the
+    /// channel orchestrator uses this bool to decide whether to build the
+    /// channel at all, skipping (with a warning) an enabled-but-uncredentialed
+    /// alias instead of building a listener that can never connect and
+    /// crashloops its per-channel supervisor.
+    pub fn has_required_credentials(&self) -> bool {
+        !crate::traits::is_unset_display_value(&self.http_url)
+            && !crate::traits::is_unset_display_value(&self.account)
+    }
+
+    /// Validate this alias's required credentials once enabled. Mirrors
+    /// `TelegramConfig::validate_bot_token` / `DiscordConfig::validate_bot_token`:
+    /// an enabled Signal channel built with an empty `http_url` or `account`
+    /// never connects and crashloops its per-channel supervisor, so reject
+    /// it at config-load time instead.
+    pub fn validate_required(&self, alias: &str) -> Result<()> {
+        let enabled_path = format!("channels.signal.{alias}.enabled");
+        validate_required_field(
+            &format!("channels.signal.{alias}.http_url"),
+            &enabled_path,
+            self.enabled,
+            &self.http_url,
+        )?;
+        validate_required_field(
+            &format!("channels.signal.{alias}.account"),
+            &enabled_path,
+            self.enabled,
+            &self.account,
+        )
+    }
+}
+
 impl ChannelConfig for SignalConfig {
     fn name() -> &'static str {
         "Signal"
@@ -19282,6 +19347,37 @@ impl Config {
 
         for (alias, dc) in &self.channels.discord {
             dc.validate_bot_token(alias)?;
+        }
+
+        // Signal and Voice Call: like Telegram/Discord's bot_token, these
+        // channels have unambiguous required plain-String credentials. An
+        // enabled channel built with an empty credential never connects and
+        // its per-channel supervisor restarts it forever (crashloop), so
+        // reject at config-load time instead.
+        for (alias, sig) in &self.channels.signal {
+            sig.validate_required(alias)?;
+        }
+
+        for (alias, vc) in &self.channels.voice_call {
+            let enabled_path = format!("channels.voice_call.{alias}.enabled");
+            validate_required_field(
+                &format!("channels.voice_call.{alias}.account_id"),
+                &enabled_path,
+                vc.enabled,
+                &vc.account_id,
+            )?;
+            validate_required_field(
+                &format!("channels.voice_call.{alias}.auth_token"),
+                &enabled_path,
+                vc.enabled,
+                &vc.auth_token,
+            )?;
+            validate_required_field(
+                &format!("channels.voice_call.{alias}.from_number"),
+                &enabled_path,
+                vc.enabled,
+                &vc.from_number,
+            )?;
         }
 
         // Git forge channel: a PAT-backed provider must name its API origin
@@ -24121,6 +24217,203 @@ api_base_url = "http://127.0.0.1:8081"
         config
             .validate()
             .expect_err("the unset display sentinel must never become persisted config");
+    }
+
+    // Regression: an enabled Signal or Voice Call channel with empty
+    // required credentials was built anyway, then its listener failed to
+    // connect and the per-channel supervisor restarted it forever
+    // (crashloop). Reject at config-load time instead, mirroring how
+    // Telegram/Discord require `bot_token`.
+    #[test]
+    async fn validate_rejects_enabled_signal_without_http_url() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: true,
+                http_url: "   ".into(),
+                account: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Signal channel must require an http_url");
+        assert!(err.to_string().contains("channels.signal.signal.http_url"));
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_signal_without_account() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: true,
+                http_url: "http://127.0.0.1:8686".into(),
+                account: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Signal channel must require an account");
+        assert!(err.to_string().contains("channels.signal.signal.account"));
+    }
+
+    #[test]
+    async fn validate_allows_disabled_signal_without_creds() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: false,
+                http_url: "   ".into(),
+                account: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect("disabled Signal channel may be staged without credentials");
+    }
+
+    #[test]
+    async fn validate_rejects_disabled_signal_with_unset_sentinel() {
+        let mut config = Config::default();
+        config.channels.signal.insert(
+            "signal".to_string(),
+            SignalConfig {
+                enabled: false,
+                http_url: crate::traits::UNSET_DISPLAY.to_string(),
+                account: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("the unset display sentinel must never become persisted config, even for a disabled channel");
+        assert!(err.to_string().contains("channels.signal.signal.http_url"));
+    }
+
+    #[test]
+    async fn signal_has_required_credentials_true_when_both_set() {
+        let sig = SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "+15551234567".into(),
+            ..Default::default()
+        };
+        assert!(sig.has_required_credentials());
+    }
+
+    #[test]
+    async fn signal_has_required_credentials_false_when_either_blank() {
+        let missing_http_url = SignalConfig {
+            http_url: "   ".into(),
+            account: "+15551234567".into(),
+            ..Default::default()
+        };
+        assert!(!missing_http_url.has_required_credentials());
+
+        let missing_account = SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "   ".into(),
+            ..Default::default()
+        };
+        assert!(!missing_account.has_required_credentials());
+
+        assert!(!SignalConfig::default().has_required_credentials());
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_voice_call_without_account_id() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "   ".into(),
+                auth_token: "tok".into(),
+                from_number: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Voice Call channel must require an account_id");
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.voice.account_id")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_voice_call_without_auth_token() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "AC123".into(),
+                auth_token: "   ".into(),
+                from_number: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Voice Call channel must require an auth_token");
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.voice.auth_token")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_enabled_voice_call_without_from_number() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: true,
+                account_id: "AC123".into(),
+                auth_token: "tok".into(),
+                from_number: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("enabled Voice Call channel must require a from_number");
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.voice.from_number")
+        );
+    }
+
+    #[test]
+    async fn validate_allows_disabled_voice_call_without_creds() {
+        let mut config = Config::default();
+        config.channels.voice_call.insert(
+            "voice".to_string(),
+            crate::scattered_types::VoiceCallConfig {
+                enabled: false,
+                account_id: "   ".into(),
+                auth_token: "   ".into(),
+                from_number: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        config
+            .validate()
+            .expect("disabled Voice Call channel may be staged without credentials");
     }
 
     // Regression (fail closed, both PAT-backed forge providers): a Gitea or
