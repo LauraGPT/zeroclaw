@@ -828,7 +828,8 @@ jobs:
 
           assets_dir="$PWD/release-assets"
           tmp_dir="$(mktemp -d "$RUNNER_TEMP/zeroclaw-verification.XXXXXX")"
-          trap 'rm -rf "$tmp_dir"' EXIT
+          staged_archive="$RUNNER_TEMP/zeroclaw-${TAG}-verification.tar.gz"
+          trap 'rm -rf "$tmp_dir" "$staged_archive"' EXIT
 
           gh attestation trusted-root > "$tmp_dir/trusted_root.jsonl"
           {
@@ -881,12 +882,21 @@ jobs:
 
           test "$artifact_count" -gt 0
           test "$bundle_count" -eq "$artifact_count"
-          archive="$assets_dir/zeroclaw-${TAG}-verification.tar.gz"
-          tar -C "$tmp_dir" -czf "$archive" .
+
+          # Build and validate the archive under $RUNNER_TEMP, then move it into
+          # release-assets only after `tar -tzf` confirms it is readable. A
+          # corrupt archive therefore never reaches the consolidated asset
+          # directory that the checksum and release-upload steps later glob, and
+          # the EXIT trap clears the staged copy on every failure path.
+          final_archive="$assets_dir/zeroclaw-${TAG}-verification.tar.gz"
+          rm -f "$staged_archive"
+          tar -C "$tmp_dir" -czf "$staged_archive" .
+          tar -tzf "$staged_archive"
+          mv "$staged_archive" "$final_archive"
 
           echo "--- Verification archive ---"
-          tar -tzf "$archive"
-          ls -lh "$archive"
+          tar -tzf "$final_archive"
+          ls -lh "$final_archive"
 
       # SHA256SUMS is final only after the verification archive exists. Never
       # mutate it after the metadata attestations below.

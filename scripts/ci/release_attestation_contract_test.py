@@ -99,6 +99,22 @@ class ReleaseAttestationContractTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIn(value, step)
 
+    def test_verification_archive_is_staged_and_validated_before_publication(self) -> None:
+        step = step_block(self.publish, "verification_archive")
+        # The archive is built and validated under $RUNNER_TEMP, never written
+        # straight into the consolidated release-assets directory.
+        self.assertIn('staged_archive="$RUNNER_TEMP/', step)
+        self.assertNotIn('-czf "$assets_dir/', step)
+        self.assertNotIn('-czf "$archive"', step)
+        create = step.index('-czf "$staged_archive"')
+        validate = step.index('tar -tzf "$staged_archive"')
+        publish = step.index('mv "$staged_archive" "$final_archive"')
+        self.assertLess(create, validate)
+        self.assertLess(validate, publish)
+        # The EXIT trap clears the staged copy so a failed validation cannot
+        # leave a corrupt archive in the final asset path.
+        self.assertIn('"$tmp_dir" "$staged_archive"', step)
+
     def test_final_checksums_follow_archive_and_are_never_rewritten(self) -> None:
         archive = self.publish.index("id: verification_archive")
         checksums = self.publish.index("Generate final checksums")
