@@ -239,8 +239,9 @@ impl Tool for SendMessageToPeerTool {
 }
 
 /// Run `inner` under the recipient's cost-tracking task-locals so its usage
-/// is recorded and its budget enforced, mirroring the scope the gateway
-/// chat path installs around `process_message` in
+/// is recorded with recipient attribution and its provider calls participate
+/// in the process-wide budget, mirroring the scope the gateway chat path
+/// installs around `process_message` in
 /// `zeroclaw-gateway/src/lib.rs`. Split out from `execute` so the
 /// scope-install itself can be exercised directly in tests, independent of
 /// the detached-spawn plumbing around it.
@@ -726,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_turn_cost_scope_records_spend_against_recipient_alias() {
+    async fn peer_turn_cost_scope_records_recipient_usage_and_enforces_shared_budget() {
         use crate::agent::cost::record_tool_loop_cost_usage;
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
         use crate::cost::CostTracker;
@@ -821,10 +822,10 @@ mod tests {
         assert_eq!(snapshot.input_tokens, 1_000);
         assert_eq!(snapshot.output_tokens, 200);
 
-        // Budget enforcement: a recipient whose spend already exceeds a
-        // configured daily ceiling must be blocked on the next call while
-        // still scoped to its own context — proving per-agent budget
-        // enforcement rides the same scope this fix installs.
+        // Budget enforcement is process-wide, unlike the per-agent ledger
+        // attribution above. Record spend as an unrelated sender, then prove
+        // a recipient call scoped through this helper observes the shared
+        // daily ceiling instead of bypassing it.
         let capped_workspace = tempfile::TempDir::new().expect("second temp dir");
         let capped_tracker = Arc::new(
             CostTracker::new(
@@ -845,23 +846,39 @@ mod tests {
                 ("test-model.output".to_string(), 15.0),
             ]),
         )]));
-        let capped_ctx =
-            ToolLoopCostTrackingContext::new(Arc::clone(&capped_tracker), capped_pricing)
-                .with_agent_alias("recipient");
+        let capped_ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&capped_tracker),
+            Arc::clone(&capped_pricing),
+        )
+        .with_agent_alias("recipient");
         let capped_turn_usage = Arc::new(Mutex::new(TurnUsage::default()));
+
+        let sender_ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&capped_tracker),
+            Arc::clone(&capped_pricing),
+        )
+        .with_agent_alias("sender");
+        let sender_usage = deliver_peer_turn_with_cost_scope(
+            Some(sender_ctx),
+            Some(Arc::new(Mutex::new(TurnUsage::default()))),
+            async { record_tool_loop_cost_usage("mock-provider", "test-model", &usage) },
+        )
+        .await;
+        assert!(
+            sender_usage.is_some(),
+            "setup spend must be recorded against the unrelated sender"
+        );
 
         let budget_result =
             deliver_peer_turn_with_cost_scope(Some(capped_ctx), Some(capped_turn_usage), async {
-                record_tool_loop_cost_usage("mock-provider", "test-model", &usage);
                 enforce_tool_loop_budget()
             })
             .await;
 
         assert!(
             budget_result.is_err(),
-            "a recipient turn over its configured daily budget must be rejected \
-             by enforce_tool_loop_budget once it is scoped to that recipient's \
-             cost context"
+            "a recipient turn must observe the process-wide daily budget even \
+             when unrelated sender spend exhausted it"
         );
     }
 }
