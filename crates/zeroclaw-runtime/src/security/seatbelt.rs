@@ -4,6 +4,8 @@ use crate::security::traits::Sandbox;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub(super) const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+
 #[derive(Debug, Clone)]
 pub struct SeatbeltSandbox {
     /// Directory where per-session policy files are stored.
@@ -56,15 +58,7 @@ impl SeatbeltSandbox {
 
     /// Check if `sandbox-exec` is available on this system.
     fn is_installed() -> bool {
-        // sandbox-exec is a built-in macOS binary at /usr/bin/sandbox-exec
-        Path::new("/usr/bin/sandbox-exec").exists()
-            || Command::new("sandbox-exec")
-                .arg("-n")
-                .arg("no-network")
-                .arg("true")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
+        Path::new(SANDBOX_EXEC_PATH).is_file()
     }
 
     /// Return the path to the generated policy file.
@@ -94,7 +88,10 @@ impl Sandbox for SeatbeltSandbox {
             .collect();
         let current_dir = cmd.get_current_dir().map(Path::to_path_buf);
 
-        let mut sandbox_cmd = Command::new("sandbox-exec");
+        // Use the same fixed system binary checked by availability detection.
+        // Resolving a bare name through PATH would happen before Seatbelt is
+        // active and could select an attacker-controlled workspace executable.
+        let mut sandbox_cmd = Command::new(SANDBOX_EXEC_PATH);
         sandbox_cmd.arg("-f");
         sandbox_cmd.arg(&self.policy_path);
         sandbox_cmd.arg(&program);
@@ -330,7 +327,7 @@ mod tests {
         cmd.arg("hello");
         sandbox.wrap_command(&mut cmd).unwrap();
 
-        assert_eq!(cmd.get_program().to_string_lossy(), "sandbox-exec");
+        assert_eq!(cmd.get_program(), SANDBOX_EXEC_PATH);
         let args: Vec<String> = cmd
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
@@ -394,6 +391,32 @@ mod tests {
         sandbox.wrap_command(&mut cmd).unwrap();
 
         assert_eq!(cmd.get_current_dir(), Some(workspace.as_path()));
+    }
+
+    #[test]
+    fn seatbelt_wrap_command_ignores_workspace_launcher_on_relative_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("test.sb");
+        std::fs::write(&policy_path, "(version 1)").unwrap();
+        let fake_launcher = dir.path().join("sandbox-exec");
+        std::fs::write(&fake_launcher, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&fake_launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sandbox = SeatbeltSandbox {
+            policy_dir: dir.path().to_path_buf(),
+            policy_path,
+        };
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("safe");
+        cmd.current_dir(dir.path());
+        cmd.env("PATH", ".:/usr/bin:/bin");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        assert!(fake_launcher.is_file());
+        assert_eq!(cmd.get_program(), SANDBOX_EXEC_PATH);
+        assert_eq!(cmd.get_current_dir(), Some(dir.path()));
     }
 
     #[test]
@@ -469,7 +492,7 @@ mod tests {
             policy_path: policy_path.clone(),
         };
 
-        if Path::new("/usr/bin/sandbox-exec").exists() {
+        if Path::new(SANDBOX_EXEC_PATH).is_file() {
             assert!(
                 !sandbox.is_available(),
                 "should be false without policy file"
@@ -477,7 +500,7 @@ mod tests {
         }
 
         std::fs::write(&policy_path, "(version 1)").unwrap();
-        if Path::new("/usr/bin/sandbox-exec").exists() {
+        if Path::new(SANDBOX_EXEC_PATH).is_file() {
             assert!(sandbox.is_available(), "should be true with policy file");
         }
     }
