@@ -78,7 +78,6 @@ This release is a large consolidation cycle spanning **379 commits** from **56 c
 | Runtime | Arc-share tool schemas to stop per-iteration clone churn; hot-reload log-persistence config; thread `agent_alias` into `agent_turn`'s ToolLoop (#8817, #8816, #8921) |
 | Providers | Guard SSE parsers against EOF-as-success truncation; omit `tool_choice`/empty tool-call content for empty tool lists; clean Anthropic tool schemas before native serialization (#8663, #8667, #8524, #7961) |
 | Providers | Distinguish missing vs expired OpenAI Codex credentials; prefer `chatgpt_account_id` claim in Codex JWT extraction; cool down rate-limited fallback entries (#8029, #8002, #8317) |
-| Providers | Activate the previously dead-code Conservative schema sanitizer for Ollama/llama.cpp compatible-provider requests, a behavior change that now strips `$ref`/`$defs`/`definitions`/`additionalProperties` from local-model tool schemas as originally intended (#9208) |
 | Security | Close SSRF gaps in Matrix marker URLs, text_browser, and skill_http userinfo; harden WeChat attachment path against traversal (#8657, #8635, #8658, #8628) |
 | Security | Constant-time `nodes.auth_token` comparison; reject empty bearer token; prevent signing-key leak via `VarError`; scan link/image destinations for credential patterns (#8824, #8727, #8591, #8906) |
 | Config | Protect runtime state files and real `config.toml` from agent self-modification; auto-materialize new map aliases in config patch (#8660, #8606, #8842) |

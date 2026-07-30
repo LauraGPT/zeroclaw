@@ -4,7 +4,7 @@
 
 use crate::auth::AuthService;
 use crate::multimodal;
-use crate::openai::{NativeToolFunctionSpec, NativeToolSpec, parse_native_tool_spec};
+use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -1306,7 +1306,7 @@ struct Function {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeChatRequest {
+struct NativeChatRequest<T = Vec<NativeToolSpec>> {
     model: String,
     messages: Vec<NativeMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1320,7 +1320,7 @@ struct NativeChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<NativeToolSpec>>,
+    tools: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2009,12 +2009,6 @@ impl OpenAiCompatibleModelProvider {
         })
     }
 
-    /// Note: before the typed-struct rework this second stage was silently
-    /// dead — it looked up `"parameters"` on the *top-level* tool entry,
-    /// where the field never exists (it lives under `"function"`), so the
-    /// Conservative pass never rewrote anything. Operating on the typed
-    /// struct made the opt-in `local_model_tool_sanitize` feature actually
-    /// take effect.
     fn convert_tool_specs_for_model(
         &self,
         tools: Option<&[zeroclaw_api::tool::ToolSpec]>,
@@ -2024,13 +2018,20 @@ impl OpenAiCompatibleModelProvider {
         if !self.local_model_tool_sanitize || !Self::should_sanitize_local_tool_schema(model) {
             return Some(converted);
         }
+        // Preserve the pre-existing compatible-provider wire behavior in
+        // this allocation-only change. The legacy sanitizer inspected a
+        // top-level `parameters` extension even though ordinary OpenAI tool
+        // specs place it under `function`; activating a nested rewrite is a
+        // separate protocol change that needs its own compatibility contract.
         for tool in &mut converted {
-            // Stage-1 output is memoized and pointer-stable across requests,
-            // so this second (Conservative) stage memoizes per schema too.
-            tool.function.parameters = self.schema_cache.clean_shared(
-                &tool.function.parameters,
+            let Some(raw_parameters) = tool.extra.get("parameters").cloned() else {
+                continue;
+            };
+            let cleaned = zeroclaw_api::schema::SchemaCleanr::clean(
+                raw_parameters,
                 zeroclaw_api::schema::CleaningStrategy::Conservative,
             );
+            tool.extra.insert("parameters".to_string(), cleaned);
         }
         Some(converted)
     }
@@ -2063,6 +2064,30 @@ impl OpenAiCompatibleModelProvider {
             tool_stream: self.tool_stream_for_tools(has_tool_entries),
             tools,
             tool_choice,
+            max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
+        }
+    }
+
+    fn build_raw_native_tool_chat_request<'a>(
+        &self,
+        effective_messages: &[ChatMessage],
+        tools: Option<&'a [serde_json::Value]>,
+        model: &str,
+        temperature: Option<f64>,
+        allow_user_image_parts: bool,
+    ) -> NativeChatRequest<&'a [serde_json::Value]> {
+        let has_tool_entries = tools.is_some_and(|tools| !tools.is_empty());
+        NativeChatRequest {
+            model: model.to_string(),
+            messages: self.convert_messages_for_native(effective_messages, allow_user_image_parts),
+            temperature,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: self.tool_stream_for_tools(has_tool_entries),
+            tools,
+            tool_choice: has_tool_entries.then(|| "auto".to_string()),
             max_tokens: self.max_tokens,
             extra_body: self.extra_body.clone(),
         }
@@ -2892,22 +2917,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         } else {
             self.strip_native_tool_messages(&effective_messages)
         };
-        let tools = if tools.is_empty() {
-            None
-        } else {
-            // Same contract as the openai provider: entries must be
-            // OpenAI-shape `{"type": "function", "function": {...}}` specs.
-            Some(
-                tools
-                    .iter()
-                    .cloned()
-                    .map(parse_native_tool_spec)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        };
-        let request = self.build_native_tool_chat_request(
+        let request = self.build_raw_native_tool_chat_request(
             &effective_messages,
-            tools,
+            (!tools.is_empty()).then_some(tools),
             model,
             temperature,
             !merge,
@@ -3692,63 +3704,6 @@ mod tests {
     }
 
     #[test]
-    fn convert_tool_specs_for_model_applies_conservative_stage_for_local_models() {
-        let p = OpenAiCompatibleModelProvider::builder("test")
-            .display_name("lmstudio")
-            .base_url("http://localhost:1234/v1")
-            .credential(None)
-            .auth_style(AuthStyle::Bearer)
-            .local_model_tool_sanitize()
-            .build();
-        // additionalProperties survives the OpenAI strategy but is stripped
-        // by the Conservative stage-2 pass for sanitize-listed models.
-        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
-            "shell",
-            "Run a shell command",
-            serde_json::json!({
-                "type": "object",
-                "properties": { "cmd": { "type": "string" } },
-                "additionalProperties": false
-            }),
-        )];
-
-        let sanitized = p
-            .convert_tool_specs_for_model(Some(&tools), "gemma-4-9b-it")
-            .unwrap();
-        assert!(
-            sanitized[0]
-                .function
-                .parameters
-                .get("additionalProperties")
-                .is_none(),
-            "gemma-family models must get the Conservative second cleaning pass"
-        );
-
-        let untouched = p
-            .convert_tool_specs_for_model(Some(&tools), "mistral-large-latest")
-            .unwrap();
-        assert!(
-            untouched[0]
-                .function
-                .parameters
-                .get("additionalProperties")
-                .is_some(),
-            "non-sanitize-listed models must keep the OpenAI-strategy output"
-        );
-
-        let sanitized_again = p
-            .convert_tool_specs_for_model(Some(&tools), "gemma-4-9b-it")
-            .unwrap();
-        assert!(
-            std::sync::Arc::ptr_eq(
-                &sanitized[0].function.parameters,
-                &sanitized_again[0].function.parameters
-            ),
-            "the Conservative stage must memoize per schema as well"
-        );
-    }
-
-    #[test]
     fn streaming_native_tool_request_serializes_tools_and_guards_tool_choice() {
         let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
         let messages = vec![ChatMessage::user("hello")];
@@ -3828,74 +3783,6 @@ mod tests {
                 &via_clone[0].function.parameters
             ),
             "provider clones must serve dirty schemas from the same memo"
-        );
-    }
-
-    #[tokio::test]
-    async fn chat_with_tools_rejects_malformed_tool_spec() {
-        let p = make_model_provider("vllm", "http://localhost:8000/v1", Some("key"));
-        let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![serde_json::json!({ "type": "retrieval" })];
-
-        let result = p
-            .chat_with_tools(&messages, &tools, "test-model", None)
-            .await;
-        let err = result.expect_err("non-function tool specs must be rejected");
-        assert!(
-            err.to_string()
-                .contains("Invalid OpenAI tool specification"),
-            "rejection must come from spec validation, not from the \
-             unreachable test endpoint; got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn chat_with_tools_rejects_well_formed_spec_with_non_function_type() {
-        // Distinct from the malformed-spec case above: this spec passes serde
-        // deserialization (a complete `function` object is present) and must
-        // be rejected by the explicit `kind != "function"` check.
-        let p = make_model_provider("vllm", "http://localhost:8000/v1", Some("key"));
-        let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![serde_json::json!({
-            "type": "retrieval",
-            "function": {
-                "name": "lookup",
-                "description": "Look something up",
-                "parameters": { "type": "object" }
-            }
-        })];
-
-        let result = p
-            .chat_with_tools(&messages, &tools, "test-model", None)
-            .await;
-        let err = result.expect_err("non-'function' tool types must be rejected");
-        assert!(
-            err.to_string().contains("unsupported tool type"),
-            "rejection must come from the tool-type check; got: {err}"
-        );
-    }
-
-    #[test]
-    fn parsed_tool_spec_round_trip_preserves_unknown_fields() {
-        // chat_with_tools validates caller specs by parsing into the typed
-        // struct and re-serializing; fields outside the typed shape (e.g.
-        // OpenAI `strict`) must survive the round trip unaltered.
-        let original = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Fetch the weather",
-                "parameters": { "type": "object" },
-                "strict": true
-            },
-            "x_vendor_hint": "keep-me"
-        });
-
-        let parsed = parse_native_tool_spec(original.clone()).expect("valid function spec");
-        assert_eq!(
-            serde_json::to_value(&parsed).unwrap(),
-            original,
-            "validation round trip must not silently alter accepted specs"
         );
     }
 
@@ -4127,7 +4014,7 @@ mod tests {
         // into a final `usage` SSE event, otherwise OpenAI-compatible providers
         // never report token counts on the `/ws/chat` path (the gateway's
         // primary path uses native tools). See Audacity88'sreview.
-        let req = NativeChatRequest {
+        let req: NativeChatRequest = NativeChatRequest {
             model: "gpt-4o".to_string(),
             messages: vec![NativeMessage {
                 role: "user".to_string(),
@@ -4176,7 +4063,7 @@ mod tests {
         // Non-streaming path (e.g. classic `chat()` call) does not need
         // `stream_options.include_usage` because the final response carries
         // `usage` directly. The field must be skipped in serialization.
-        let req = NativeChatRequest {
+        let req: NativeChatRequest = NativeChatRequest {
             model: "gpt-4o".to_string(),
             messages: vec![],
             temperature: Some(0.7),
@@ -4198,7 +4085,7 @@ mod tests {
 
     #[test]
     fn extra_body_flattens_into_request_top_level() {
-        let req = NativeChatRequest {
+        let req: NativeChatRequest = NativeChatRequest {
             model: "qwen".to_string(),
             messages: vec![],
             temperature: None,
@@ -7096,15 +6983,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_tools_accepts_valid_specs_and_sends_them_in_the_body() {
+    async fn chat_with_tools_forwards_raw_specs_without_validation_or_sanitizing() {
         use axum::{Json, Router, routing::post};
         use std::sync::Mutex;
         use tokio::net::TcpListener;
 
-        // Pins the full composition delta (b)/(d) introduced: caller JSON ->
-        // parse_native_tool_spec -> typed Vec -> serialized request body.
-        // Without this test, wrongful rejection of valid specs or dropping
-        // the parsed tools from the body passes every other test.
         let captured: std::sync::Arc<Mutex<Option<serde_json::Value>>> =
             std::sync::Arc::new(Mutex::new(None));
         let captured_clone = captured.clone();
@@ -7134,29 +7017,42 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let provider = make_model_provider("vllm", &format!("http://{addr}"), Some("key"));
+        let provider = OpenAiCompatibleModelProvider::builder("lmstudio")
+            .display_name("lmstudio")
+            .base_url(&format!("http://{addr}"))
+            .credential(Some("key"))
+            .auth_style(AuthStyle::Bearer)
+            .local_model_tool_sanitize()
+            .build();
         let messages = vec![ChatMessage::user("hello")];
-        // Valid spec with an unknown sibling field: it must be accepted AND
-        // reach the wire unaltered (declared delta (d)).
-        let tools = vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Fetch the weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "city": { "type": "string" } }
+        let tools = vec![
+            // OpenAI permits both description and parameters to be omitted.
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": "get_weather" }
+            }),
+            // Raw callers historically controlled vendor extensions and
+            // schema shape. Even with local sanitization configured, this
+            // entry must not be parsed or cleaned in this allocation-only PR.
+            serde_json::json!({
+                "type": "vendor_extension",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "$defs": { "Id": { "type": "string" } },
+                        "additionalProperties": false
+                    }
                 },
-                "strict": true
-            }
-        })];
+                "x_vendor_hint": "keep-me"
+            }),
+        ];
 
         let result = provider
-            .chat_with_tools(&messages, &tools, "test-model", None)
+            .chat_with_tools(&messages, &tools, "gemma-4-9b-it", None)
             .await;
         assert!(
             result.is_ok(),
-            "valid specs must be accepted: {:?}",
+            "raw compatible-provider specs must be forwarded: {:?}",
             result.err()
         );
 
@@ -7168,7 +7064,8 @@ mod tests {
         assert_eq!(
             body["tools"],
             serde_json::json!(tools),
-            "parsed tools must reach the request body unaltered"
+            "raw tools must reach the request body byte-shape-equivalent, \
+             including optional-field omissions and sanitizer-sensitive keys"
         );
         assert_eq!(
             body["tool_choice"],

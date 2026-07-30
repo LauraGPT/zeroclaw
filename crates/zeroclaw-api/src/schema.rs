@@ -583,10 +583,12 @@ impl SchemaCleanr {
     }
 }
 
-/// Upper bound on retained [`SchemaCleanCache`] entries. Sized for the
-/// realistic ceiling of registered tools × strategies; overflow first drops
-/// entries whose source schema is gone, then falls back to a full clear.
-const SCHEMA_CLEAN_CACHE_CAP: usize = 512;
+/// Per-provider bounds for completed cleaned-schema memos. The byte bound is
+/// deliberately small because MCP schemas are externally supplied and have no
+/// intrinsic size limit; the entry bound prevents many tiny trees from
+/// accumulating metadata indefinitely.
+const SCHEMA_CLEAN_CACHE_MAX_ENTRIES: usize = 64;
+const SCHEMA_CLEAN_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 struct SchemaCleanCacheEntry {
     /// Identity of the source schema this result was cleaned from. `Weak`
@@ -604,6 +606,10 @@ struct SchemaCleanCacheEntry {
     /// unrelated keys use unrelated cells, so they still clean
     /// concurrently.
     cleaned: Arc<std::sync::OnceLock<Arc<Value>>>,
+    /// Conservative heap-size estimate for an initialized `cleaned` tree.
+    /// Shared with the initializer so it can publish the size without
+    /// reacquiring the map lock.
+    retained_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Bounded memo of [`SchemaCleanr::clean_shared`] results, keyed by source
@@ -618,6 +624,15 @@ struct SchemaCleanCacheEntry {
 /// keyed by the identity of the canonical `Arc` the tool registry owns, and
 /// the memoized result is byte-stable across requests (which also keeps
 /// provider-side prompt caching stable).
+///
+/// Retired sources are pruned whenever a dirty schema uses the cache, so a
+/// replaced MCP schema does not wait for capacity pressure before its cleaned
+/// tree can be released. Completed entries are additionally bounded per
+/// provider by both count and estimated heap bytes. Retention pressure may
+/// evict completed memos, but never an in-flight single-flight cell; a live
+/// schema can therefore be recomputed after pressure eviction, while
+/// concurrent callers participating in one cold miss still share exactly one
+/// computation.
 ///
 /// Only *rewritten* results are cached. A no-op clean is returned straight
 /// from the pre-scan and never inserted: such an entry's `cleaned` field
@@ -662,8 +677,8 @@ impl SchemaCleanCache {
 
     /// Memoized [`SchemaCleanr::clean_shared`]: returns the shared source
     /// `Arc` when cleaning is a no-op, and otherwise the cleaned tree —
-    /// deep-computed at most once per (live schema, strategy) pair, even
-    /// when multiple threads race a cold miss on the same key together.
+    /// deep-computed at most once per retained (live schema, strategy) pair,
+    /// even when multiple threads race a cold miss on the same key together.
     ///
     /// Single-flight: the first miss for a `(schema, strategy)` key installs
     /// a shared [`OnceLock`](std::sync::OnceLock) cell in the map before the
@@ -672,9 +687,10 @@ impl SchemaCleanCache {
     /// installed, reuses it, and blocks in `get_or_init` instead of starting
     /// its own deep clone — so only the winner's closure ever runs, and
     /// every caller, winner and waiters alike, ends up with the one
-    /// resulting `Arc`. Misses on *different* keys install independent
-    /// cells and clean fully concurrently; the map lock is never held while
-    /// a clean itself runs.
+    /// resulting `Arc`. Misses on *different* keys install independent cells
+    /// and clean fully concurrently; the map lock is never held while a clean
+    /// itself runs. Capacity enforcement can evict only initialized cells, so
+    /// it cannot split an in-flight computation into competing cells.
     pub fn clean_shared(&self, schema: &Arc<Value>, strategy: CleaningStrategy) -> Arc<Value> {
         if !SchemaCleanr::needs_cleaning(schema, strategy) {
             // No-op: nothing worth caching or single-flighting (see the
@@ -684,32 +700,34 @@ impl SchemaCleanCache {
         }
 
         let key = (Arc::as_ptr(schema) as usize, strategy);
-        let cell = {
+        let (cell, retained_bytes) = {
             let mut entries = self
                 .entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // An actual in-flight caller still owns the source `Arc`, so a
+            // dead source is also proof that its entry is safe to remove.
+            entries.retain(|_, entry| entry.source.strong_count() > 0);
             if let Some(entry) = entries.get(&key)
                 && let Some(live_source) = entry.source.upgrade()
                 && Arc::ptr_eq(&live_source, schema)
             {
-                Arc::clone(&entry.cleaned)
+                (
+                    Arc::clone(&entry.cleaned),
+                    Arc::clone(&entry.retained_bytes),
+                )
             } else {
-                if entries.len() >= SCHEMA_CLEAN_CACHE_CAP && !entries.contains_key(&key) {
-                    entries.retain(|_, entry| entry.source.strong_count() > 0);
-                    if entries.len() >= SCHEMA_CLEAN_CACHE_CAP {
-                        entries.clear();
-                    }
-                }
                 let cell = Arc::new(std::sync::OnceLock::new());
+                let retained_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 entries.insert(
                     key,
                     SchemaCleanCacheEntry {
                         source: Arc::downgrade(schema),
                         cleaned: Arc::clone(&cell),
+                        retained_bytes: Arc::clone(&retained_bytes),
                     },
                 );
-                cell
+                (cell, retained_bytes)
             }
         };
 
@@ -720,12 +738,60 @@ impl SchemaCleanCache {
         // that actually initializes `cell` runs the closure; concurrent
         // callers sharing `cell` block here and all observe that same
         // result `Arc`.
-        Arc::clone(cell.get_or_init(|| {
+        let cleaned = Arc::clone(cell.get_or_init(|| {
             #[cfg(test)]
             self.cold_compute_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            SchemaCleanr::clean_shared(schema, strategy)
-        }))
+            let cleaned = SchemaCleanr::clean_shared(schema, strategy);
+            retained_bytes.store(
+                estimated_json_heap_bytes(&cleaned),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            cleaned
+        }));
+        self.enforce_retention_bounds(key, &cell);
+        cleaned
+    }
+
+    fn enforce_retention_bounds(
+        &self,
+        current_key: (usize, CleaningStrategy),
+        current_cell: &Arc<std::sync::OnceLock<Arc<Value>>>,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|_, entry| entry.source.strong_count() > 0);
+
+        let completed_count = entries
+            .values()
+            .filter(|entry| entry.cleaned.get().is_some())
+            .count();
+        let completed_bytes = entries.values().fold(0usize, |total, entry| {
+            total.saturating_add(
+                entry
+                    .retained_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
+        if completed_count <= SCHEMA_CLEAN_CACHE_MAX_ENTRIES
+            && completed_bytes <= SCHEMA_CLEAN_CACHE_MAX_BYTES
+        {
+            return;
+        }
+
+        let keep_current = entries.get(&current_key).is_some_and(|entry| {
+            Arc::ptr_eq(&entry.cleaned, current_cell)
+                && entry
+                    .retained_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    <= SCHEMA_CLEAN_CACHE_MAX_BYTES
+        });
+        entries.retain(|_, entry| {
+            entry.cleaned.get().is_none()
+                || (keep_current && Arc::ptr_eq(&entry.cleaned, current_cell))
+        });
     }
 
     #[cfg(test)]
@@ -743,6 +809,38 @@ impl SchemaCleanCache {
         self.cold_compute_count
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+}
+
+/// Estimate the heap retained by a JSON tree without serializing or allocating
+/// a second representation. Container overhead is intentionally rounded up;
+/// this is a retention guard, not an allocator accounting API.
+fn estimated_json_heap_bytes(value: &Value) -> usize {
+    fn heap_bytes(value: &Value) -> usize {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+            Value::String(text) => text.capacity(),
+            Value::Array(items) => items.iter().fold(
+                items
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+                |total, child| total.saturating_add(heap_bytes(child)),
+            ),
+            Value::Object(entries) => {
+                const MAP_NODE_OVERHEAD: usize = 3 * std::mem::size_of::<usize>();
+                entries.iter().fold(0usize, |total, (key, child)| {
+                    total.saturating_add(
+                        std::mem::size_of::<String>()
+                            + std::mem::size_of::<Value>()
+                            + MAP_NODE_OVERHEAD
+                            + key.capacity()
+                            + heap_bytes(child),
+                    )
+                })
+            }
+        }
+    }
+
+    std::mem::size_of::<Value>().saturating_add(heap_bytes(value))
 }
 
 #[cfg(test)]
@@ -923,60 +1021,103 @@ mod tests {
     }
 
     #[test]
-    fn schema_clean_cache_stays_bounded_when_all_sources_live() {
+    fn schema_clean_cache_stays_entry_bounded_when_all_sources_live() {
         let cache = SchemaCleanCache::new();
-        // Keep every source alive so the dead-entry prune removes nothing
-        // and the overflow path has to fall back to a full clear.
-        let sources: Vec<Arc<Value>> = (0..=SCHEMA_CLEAN_CACHE_CAP)
+        let sources: Vec<Arc<Value>> = (0..=SCHEMA_CLEAN_CACHE_MAX_ENTRIES)
             .map(|i| Arc::new(json!({ "type": "string", "const": format!("v{i}") })))
             .collect();
         for source in &sources {
             cache.clean_shared(source, CleaningStrategy::OpenAI);
         }
         assert!(
-            cache.len() <= SCHEMA_CLEAN_CACHE_CAP,
+            cache.len() <= SCHEMA_CLEAN_CACHE_MAX_ENTRIES,
             "cache must never retain more than its cap ({}), got {}",
-            SCHEMA_CLEAN_CACHE_CAP,
+            SCHEMA_CLEAN_CACHE_MAX_ENTRIES,
             cache.len()
         );
     }
 
     #[test]
-    fn schema_clean_cache_overflow_prunes_dead_entries_and_keeps_live_memos() {
+    fn schema_clean_cache_prunes_retired_source_without_capacity_pressure() {
         let cache = SchemaCleanCache::new();
-
-        // A long-lived dirty schema (the MCP case this cache exists for).
-        let survivor = Arc::new(json!({ "type": "string", "const": "survivor" }));
-        let survivor_memo = cache.clean_shared(&survivor, CleaningStrategy::OpenAI);
-
-        // Fill the map exactly to its cap with dirty entries, keeping the
-        // sources alive so no mid-fill overflow fires, then drop them all
-        // (e.g. per-iteration rebuilt specs going out of scope).
-        let ephemerals: Vec<Arc<Value>> = (0..SCHEMA_CLEAN_CACHE_CAP - 1)
-            .map(|i| Arc::new(json!({ "type": "string", "const": format!("e{i}") })))
-            .collect();
-        for ephemeral in &ephemerals {
-            cache.clean_shared(ephemeral, CleaningStrategy::OpenAI);
-        }
-        assert_eq!(cache.len(), SCHEMA_CLEAN_CACHE_CAP);
-        drop(ephemerals);
-
-        // The next new-key insert overflows: the graceful tier must drop the
-        // dead entries instead of clearing, and the live memo must survive.
-        let trigger = Arc::new(json!({ "type": "string", "const": "trigger" }));
-        cache.clean_shared(&trigger, CleaningStrategy::OpenAI);
+        let retired = Arc::new(json!({ "type": "string", "const": "retired" }));
+        let retired_cleaned = cache.clean_shared(&retired, CleaningStrategy::OpenAI);
+        let retired_cleaned_weak = Arc::downgrade(&retired_cleaned);
+        drop(retired_cleaned);
+        drop(retired);
         assert!(
-            cache.len() <= 2,
-            "overflow with dead entries must prune them (survivor + trigger \
-             remain), not fall through to a full clear; got {}",
-            cache.len()
+            retired_cleaned_weak.upgrade().is_some(),
+            "the cache should own the cleaned allocation before retirement"
         );
+
+        let active = Arc::new(json!({ "type": "string", "const": "active" }));
+        cache.clean_shared(&active, CleaningStrategy::OpenAI);
+
         assert!(
-            Arc::ptr_eq(
-                &survivor_memo,
-                &cache.clean_shared(&survivor, CleaningStrategy::OpenAI)
-            ),
-            "a live schema's memo must survive the dead-entry prune"
+            retired_cleaned_weak.upgrade().is_none(),
+            "ordinary dirty-schema activity must release a retired source's \
+             cleaned allocation without filling the cache first"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn schema_clean_cache_does_not_retain_one_oversized_external_schema() {
+        let cache = SchemaCleanCache::new();
+        let oversized = Arc::new(json!({
+            "type": "string",
+            "const": "x".repeat(SCHEMA_CLEAN_CACHE_MAX_BYTES)
+        }));
+
+        let cleaned = cache.clean_shared(&oversized, CleaningStrategy::OpenAI);
+        assert_eq!(&cleaned["enum"][0], oversized.get("const").unwrap());
+        assert_eq!(
+            cache.len(),
+            0,
+            "one externally supplied schema larger than the byte budget must \
+             not remain retained by the provider cache"
+        );
+    }
+
+    #[test]
+    fn schema_clean_cache_pressure_never_evicts_in_flight_cell() {
+        let cache = SchemaCleanCache::new();
+        let in_flight_source = Arc::new(json!({ "type": "string", "const": "in-flight" }));
+        let in_flight_key = (
+            Arc::as_ptr(&in_flight_source) as usize,
+            CleaningStrategy::OpenAI,
+        );
+        let in_flight_cell = Arc::new(std::sync::OnceLock::new());
+        cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                in_flight_key,
+                SchemaCleanCacheEntry {
+                    source: Arc::downgrade(&in_flight_source),
+                    cleaned: Arc::clone(&in_flight_cell),
+                    retained_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                },
+            );
+
+        let live_sources: Vec<Arc<Value>> = (0..=SCHEMA_CLEAN_CACHE_MAX_ENTRIES)
+            .map(|i| Arc::new(json!({ "type": "string", "const": format!("v{i}") })))
+            .collect();
+        for source in &live_sources {
+            cache.clean_shared(source, CleaningStrategy::OpenAI);
+        }
+
+        let entries = cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            entries.get(&in_flight_key).is_some_and(|entry| {
+                entry.cleaned.get().is_none() && Arc::ptr_eq(&entry.cleaned, &in_flight_cell)
+            }),
+            "capacity enforcement must retain the installed single-flight \
+             cell until its first computation finishes"
         );
     }
 
