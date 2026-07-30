@@ -443,14 +443,23 @@ mod tests {
     }
 
     #[test]
-    fn quickstart_terminal_width_error_formats_from_english_fluent() {
-        let message = get_english_cli_string_with_args(
+    fn quickstart_terminal_size_errors_format_from_english_fluent() {
+        let width_message = get_english_cli_string_with_args(
             "cli-quickstart-terminal-too-narrow",
             &[("min_width", "3"), ("width", "2")],
         );
         assert_eq!(
-            message,
+            width_message,
             "Quickstart needs a terminal at least 3 columns wide; the current terminal is 2 columns. Widen the terminal and try again."
+        );
+
+        let height_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-short",
+            &[("height", "8"), ("min_height", "9")],
+        );
+        assert_eq!(
+            height_message,
+            "Quickstart needs a terminal at least 9 rows tall; the current terminal is 8 rows. Make the terminal taller and try again."
         );
     }
 

@@ -153,8 +153,21 @@ fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
 const QUICKSTART_SELECTOR_MIN_WIDTH: usize = 3;
 
 #[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_VERTICAL_OVERHEAD: usize = 2;
+
+#[cfg(feature = "agent-runtime")]
 fn quickstart_selector_row_budget(terminal_width: usize) -> Option<usize> {
     terminal_width.checked_sub(QUICKSTART_SELECTOR_MIN_WIDTH)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_min_height(item_count: usize) -> usize {
+    item_count.saturating_add(QUICKSTART_SELECTOR_VERTICAL_OVERHEAD)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_fits_height(terminal_height: usize, item_count: usize) -> bool {
+    terminal_height >= quickstart_selector_min_height(item_count)
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -205,12 +218,6 @@ fn quickstart_action_for_pick(
 ) -> QuickstartChecklistAction {
     pick.and_then(|index| choices.get(index).map(|(action, _)| *action))
         .unwrap_or(QuickstartChecklistAction::Quit)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn quickstart_labels_are_unique(labels: &[String]) -> bool {
-    let mut seen = std::collections::HashSet::with_capacity(labels.len());
-    labels.iter().all(|label| seen.insert(label.as_str()))
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -1618,7 +1625,9 @@ async fn run_quickstart_cli(
         ));
 
         let term = console::Term::stderr();
-        let terminal_width = usize::from(term.size().1);
+        let (terminal_height, terminal_width) = term.size();
+        let terminal_height = usize::from(terminal_height);
+        let terminal_width = usize::from(terminal_width);
         let Some(row_budget) = quickstart_selector_row_budget(terminal_width) else {
             let terminal_width = terminal_width.to_string();
             let min_width = QUICKSTART_SELECTOR_MIN_WIDTH.to_string();
@@ -1634,6 +1643,18 @@ async fn run_quickstart_cli(
             .iter()
             .map(|(_, label)| fit_quickstart_selector_row(label, row_budget))
             .collect();
+        let min_height = quickstart_selector_min_height(labels.len());
+        if !quickstart_selector_fits_height(terminal_height, labels.len()) {
+            let terminal_height = terminal_height.to_string();
+            let min_height = min_height.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-short",
+                    &[("height", &terminal_height), ("min_height", &min_height)],
+                )
+            );
+        }
 
         let prompt = fit_quickstart_selector_row(
             &t(
@@ -1642,21 +1663,16 @@ async fn run_quickstart_cli(
             ),
             row_budget,
         );
-        let pick = if quickstart_labels_are_unique(&labels) {
-            FuzzySelect::new()
-                .with_prompt(prompt)
-                .items(&labels)
-                .default(0)
-                .max_length(labels.len())
-                .interact_on_opt(&term)?
-        } else {
-            Select::new()
-                .with_prompt(prompt)
-                .items(&labels)
-                .default(0)
-                .max_length(labels.len())
-                .interact_on_opt(&term)?
-        };
+        // Keep this checklist non-searchable and non-paged. FuzzySelect appends
+        // an unbounded search term to the prompt, while a paged Select appends a
+        // dynamic page suffix. The width and height guards above therefore
+        // bound every line rendered by this selector.
+        let pick = Select::new()
+            .with_prompt(prompt)
+            .items(&labels)
+            .default(0)
+            .max_length(labels.len())
+            .interact_on_opt(&term)?;
         let action = quickstart_action_for_pick(&choices, pick);
 
         match action {
@@ -8274,6 +8290,23 @@ mod tests {
 
     #[cfg(feature = "agent-runtime")]
     #[test]
+    fn quickstart_selector_height_prevents_paging_suffixes() {
+        let item_count = 7;
+        let min_height = quickstart_selector_min_height(item_count);
+
+        assert_eq!(min_height, 9);
+        assert!((0..min_height).all(|height| !quickstart_selector_fits_height(height, item_count)));
+        assert!(quickstart_selector_fits_height(min_height, item_count));
+        assert!(quickstart_selector_fits_height(min_height + 1, item_count));
+        assert_eq!(
+            quickstart_selector_min_height(usize::MAX),
+            usize::MAX,
+            "the terminal guard must not wrap on an unexpected item count"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
     fn quickstart_selector_prompt_stays_within_final_terminal_budget() {
         let prompts = [
             "Open a selector (Enter), or pick Create. Esc to quit.",
@@ -8325,11 +8358,6 @@ mod tests {
             .map(|(_, label)| fit_quickstart_selector_row(label, 0))
             .collect();
         assert!(fitted.windows(2).all(|pair| pair[0] == pair[1]));
-        assert!(!quickstart_labels_are_unique(&fitted));
-        assert!(quickstart_labels_are_unique(&[
-            "provider".to_string(),
-            "risk".to_string(),
-        ]));
 
         for (index, expected) in actions.into_iter().enumerate() {
             assert_eq!(quickstart_action_for_pick(&choices, Some(index)), expected);
