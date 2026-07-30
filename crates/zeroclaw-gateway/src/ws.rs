@@ -255,20 +255,13 @@ where
         };
         match resolved {
             Some(Ok(outcome)) => {
-                // A resumed action still needs an executor on this headless
-                // surface (checkpoint tails already drove inside the broker).
-                if let zeroclaw_runtime::sop::approval::BrokerOutcome::Resolved(
-                    zeroclaw_runtime::sop::approval::ResolveOutcome::Resumed(action),
-                ) = &outcome
-                {
-                    let config = state.config.read().clone();
-                    zeroclaw_runtime::sop::spawn_headless_run_driver(
-                        config,
-                        std::sync::Arc::clone(engine),
-                        state.sop_audit.clone(),
-                        action.as_ref().clone(),
-                    );
-                }
+                let config = state.config.read();
+                zeroclaw_runtime::sop::drive_resumed_broker_action(
+                    &config,
+                    std::sync::Arc::clone(engine),
+                    state.sop_audit.clone(),
+                    &outcome,
+                );
                 serde_json::json!({
                     "type": "sop_approval_result",
                     "run_id": run_id,
@@ -454,6 +447,8 @@ async fn handle_socket(
             &agent_alias,
             Some(&session_cwd),
             true,
+            false,
+            // The gateway WebSocket turn does not transport ACP file attachments.
             false,
             state.sop_engine.clone(),
             state.sop_audit.clone(),
@@ -1180,7 +1175,9 @@ async fn process_chat_message(
                         TurnEvent::ToolCall { id, name, args } => {
                             serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
                         }
-                        TurnEvent::ToolResult { id, name, output } => {
+                        TurnEvent::ToolResult {
+                            id, name, output, ..
+                        } => {
                             serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
                         }
                         TurnEvent::ApprovalRequest {
