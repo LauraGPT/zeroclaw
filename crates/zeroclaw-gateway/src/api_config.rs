@@ -1064,7 +1064,7 @@ pub async fn handle_delete_map_key(
             // (heartbeat, peer-groups, delegates, workspace.access, …) via
             // `delete_with_cascade` and cascade owned non-config state (memory /
             // cron / acp / session).
-            return delete_agent_cascade(&state, working, &q.key, &_cfg_guard).await;
+            return delete_agent_cascade(&state, working, &q.key, _cfg_guard).await;
         }
         Some(kind) => {
             return delete_config_cascade(&state, working, &kind, &q.path, &q.key, &_cfg_guard)
@@ -1104,7 +1104,7 @@ async fn delete_agent_cascade(
     state: &AppState,
     mut working: zeroclaw_config::schema::Config,
     alias: &str,
-    guard: &ConfigWriteGuard,
+    guard: ConfigWriteGuard,
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind, CascadePolicy};
 
@@ -1179,9 +1179,14 @@ async fn delete_agent_cascade(
     for path in cascade.dirty_paths() {
         working.mark_dirty(&path);
     }
-    if let Err(e) = persist_and_swap(state, working, guard).await {
+    if let Err(e) = persist_and_swap(state, working, &guard).await {
         return error_response(e);
     }
+    // Config is committed (saved + swapped). Release before the post-commit
+    // side effects below: workspace archive and the memory/cron/ACP/session
+    // cascade can be slow or wedge, and holding the lock across them would
+    // stall every other gateway config write process-wide.
+    drop(guard);
     // Config is durably committed: the agent is GONE from the persisted config.
     // Read it back from the (now-swapped) AppState for the side-effects below.
     let committed = state.config.read().clone();
@@ -1571,7 +1576,7 @@ pub async fn handle_rename_map_key(
 
     match zeroclaw_config::alias_refs::alias_kind_for_map_path(&body.path) {
         Some(zeroclaw_config::alias_refs::AliasKind::Agent) => {
-            rename_agent_cascade(&state, working, &body, &_cfg_guard).await
+            rename_agent_cascade(&state, working, &body, _cfg_guard).await
         }
         Some(kind) => rename_config_cascade(&state, working, &kind, &body, &_cfg_guard).await,
         None => {
@@ -1725,7 +1730,7 @@ async fn rename_agent_cascade(
     state: &AppState,
     mut working: zeroclaw_config::schema::Config,
     body: &RenameMapKeyBody,
-    guard: &ConfigWriteGuard,
+    guard: ConfigWriteGuard,
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind};
     let (from, to) = (&body.from, &body.to);
@@ -1744,7 +1749,7 @@ async fn rename_agent_cascade(
                     working.mark_dirty(path);
                 }
                 let dirty_count = report.dirty_paths.len();
-                if let Err(e) = persist_and_swap(state, working, guard).await {
+                if let Err(e) = persist_and_swap(state, working, &guard).await {
                     return error_response(e);
                 }
                 dirty_count
@@ -1752,6 +1757,12 @@ async fn rename_agent_cascade(
             Err(e) => return rename_error_response(&body.path, from, e),
         }
     };
+    // Config is committed (saved + swapped, or already committed by a prior
+    // crashed run). Release before the post-commit side effects below:
+    // workspace move and the memory/cron/ACP/session-backend cascade can be
+    // slow or wedge, and holding the lock across them would stall every
+    // other gateway config write process-wide.
+    drop(guard);
 
     let cfg = state.config.read().clone();
     // The NEW workspace path off the committed config (the rewritten `to`).
@@ -3202,7 +3213,7 @@ mod tests {
             to: "to".to_string(),
         };
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = rename_agent_cascade(&state, config.clone(), &body, &guard).await;
+        let resp = rename_agent_cascade(&state, config.clone(), &body, guard).await;
 
         // Persist failed -> error response, not a clean rename.
         assert!(
@@ -3263,7 +3274,7 @@ mod tests {
             to: "to".to_string(),
         };
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = rename_agent_cascade(&state, config.clone(), &body, &guard).await;
+        let resp = rename_agent_cascade(&state, config.clone(), &body, guard).await;
         assert!(resp.status().is_success(), "a clean rename returns success");
 
         // Config swapped to `to`.
@@ -3342,7 +3353,7 @@ mod tests {
         // Re-issue the SAME rename. Beforethis returned 404 (from absent in
         // the committed config); now it resumes and re-runs the lagging effects.
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = rename_agent_cascade(&state, config.clone(), &body, &guard).await;
+        let resp = rename_agent_cascade(&state, config.clone(), &body, guard).await;
         assert!(
             resp.status().is_success(),
             "re-issuing a rename after a post-persist lag must converge, not 404"
@@ -3410,7 +3421,7 @@ mod tests {
             to: "to".to_string(),
         };
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = rename_agent_cascade(&state, config.clone(), &body, &guard).await;
+        let resp = rename_agent_cascade(&state, config.clone(), &body, guard).await;
 
         // No residue → NOT a resume → the normal branch runs `rename_with_cascade`
         // with `gone` absent → NotFound → an error response, not a silent success.
@@ -4015,7 +4026,7 @@ mod tests {
 
         let state = crate::api::test_state(config.clone());
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = delete_agent_cascade(&state, config.clone(), "victim", &guard).await;
+        let resp = delete_agent_cascade(&state, config.clone(), "victim", guard).await;
 
         // Persist failed -> error response, not a clean delete.
         assert!(
@@ -4071,7 +4082,7 @@ mod tests {
 
         let state = crate::api::test_state(config.clone());
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = delete_agent_cascade(&state, config.clone(), "victim", &guard).await;
+        let resp = delete_agent_cascade(&state, config.clone(), "victim", guard).await;
         assert!(resp.status().is_success(), "a clean delete returns success");
 
         // Config swapped: `victim` is GONE.
@@ -4143,7 +4154,7 @@ mod tests {
 
         let state = crate::api::test_state(config.clone());
         let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
-        let resp = delete_agent_cascade(&state, config.clone(), "victim", &guard).await;
+        let resp = delete_agent_cascade(&state, config.clone(), "victim", guard).await;
 
         // The HTTP call is still 200 OK — partial failure is not an error
         // response, it is a successful response with `warnings` populated.
