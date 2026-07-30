@@ -178,7 +178,15 @@ pub(crate) async fn drive_shared_deterministic_run(
         action = next;
         tokio::task::yield_now().await;
     }
-    anyhow::bail!("SOP headless deterministic driver step budget exhausted")
+    let run_id = match action {
+        SopRunAction::DeterministicStep { run_id, .. } => run_id,
+        terminal => return Ok(terminal),
+    };
+    let mut guard = match engine.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.fail_headless_step_budget(&run_id)
 }
 
 /// Spawn a background task that drives a resumed SOP action to its next
@@ -436,12 +444,37 @@ async fn drive_headless_run(
             }
         }
     }
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-        "SOP headless driver: step budget exhausted; leaving run in place"
-    );
+    let run_id = match &action {
+        SopRunAction::ExecuteStep { run_id, .. }
+        | SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+        _ => return,
+    };
+    let terminal = {
+        let mut guard = match engine.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.fail_headless_step_budget(&run_id)
+    };
+    match terminal {
+        Ok(_) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"run_id": run_id})),
+            "SOP headless driver: step budget exhausted; run failed"
+        ),
+        Err(e) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "error": e.to_string(),
+                })),
+            "SOP headless driver: failed to persist step-budget terminal state"
+        ),
+    }
 }
 
 pub(crate) fn advance_sop_step(
@@ -499,9 +532,10 @@ pub(crate) async fn audit_sop_step(
 mod tests {
     use super::*;
     use crate::sop::metrics::SopMetricsCollector;
+    use crate::sop::store::{InMemoryRunStore, SopRunStore};
     use crate::sop::types::{
-        Sop, SopEvent, SopExecutionMode, SopPriority, SopStep, SopStepResult, SopStepStatus,
-        SopTrigger, SopTriggerSource,
+        Sop, SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopStep, SopStepKind,
+        SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
     };
     use serde_json::json;
     use zeroclaw_config::schema::SopConfig;
@@ -544,6 +578,66 @@ mod tests {
             SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
             other => panic!("expected ExecuteStep, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn shared_deterministic_budget_exhaustion_fails_run_and_releases_claim() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let sop_name = "deterministic-loop";
+        let sop = Sop {
+            name: sop_name.to_string(),
+            description: "bounded deterministic loop".to_string(),
+            version: "0.1.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Loop".to_string(),
+                kind: SopStepKind::Capability,
+                capability: Some("noop".to_string()),
+                routing: crate::sop::StepRouting {
+                    next: Some(1),
+                    ..Default::default()
+                },
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        let store_for_engine: Arc<dyn SopRunStore> = store.clone();
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store_for_engine);
+        engine.set_sops_for_test(vec![sop]);
+        let first_action = engine.start_run(sop_name, manual_event()).unwrap();
+        let run_id = match &first_action {
+            SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected deterministic step, got {other:?}"),
+        };
+        let engine = Arc::new(Mutex::new(engine));
+
+        let terminal = drive_shared_deterministic_run(&engine, first_action)
+            .await
+            .expect("budget exhaustion should persist a terminal failure");
+
+        assert!(matches!(
+            terminal,
+            SopRunAction::Failed { ref reason, .. }
+                if reason == "SOP headless driver step budget exhausted"
+        ));
+        let guard = engine.lock().unwrap();
+        assert_eq!(guard.get_run(&run_id).unwrap().status, SopRunStatus::Failed);
+        assert!(!guard.active_runs().contains_key(&run_id));
+        drop(guard);
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap(),
+            (0, 0),
+            "terminal budget failure must free the run's concurrency claim"
+        );
     }
 
     #[test]

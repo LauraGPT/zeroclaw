@@ -93,6 +93,8 @@ pub struct SopEngine {
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
 const DISPATCH_DEDUP_CAP: usize = 512;
+/// Terminal writes retried while the driver is already at a safe cancellation boundary.
+const CANCELLATION_FINALIZE_ATTEMPTS: usize = 3;
 
 /// Composite dedup key: `sop_name` and the transport delivery key joined by a NUL, which
 /// cannot appear in a SOP name, so distinct pairs never collide.
@@ -2817,7 +2819,23 @@ impl SopEngine {
                     "run {run_id} is cancel_requested but has no durable request event"
                 ))
             })?;
-        self.cancel_run_with_reason_and_actor(run_id, request.reason, request.actor)?;
+        let mut last_error = None;
+        for _ in 0..CANCELLATION_FINALIZE_ATTEMPTS {
+            match self.cancel_run_with_reason_and_actor(
+                run_id,
+                request.reason.clone(),
+                request.actor.clone(),
+            ) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        if let Some(e) = last_error {
+            return Err(e);
+        }
         Ok(Some(
             self.get_run(run_id)
                 .map(|run| SopRunAction::Completed {
@@ -3987,6 +4005,17 @@ impl SopEngine {
             }
             terminal => Ok(terminal),
         }
+    }
+
+    /// Fail a run whose headless driver consumed its bounded step budget.
+    /// The engine owns the durable terminal transition so the active run and
+    /// its concurrency claim are released together.
+    pub(crate) fn fail_headless_step_budget(&mut self, run_id: &str) -> Result<SopRunAction> {
+        self.finish_run(
+            run_id,
+            SopRunStatus::Failed,
+            Some("SOP headless driver step budget exhausted".to_string()),
+        )
     }
 
     /// Advance a deterministic run with the output of the current step.
@@ -7551,6 +7580,49 @@ mod tests {
             store.claim_counts("s1").unwrap(),
             (1, 1),
             "a failed terminal persist must keep the admission claim"
+        );
+    }
+
+    #[test]
+    fn cancellation_boundary_retries_transient_terminal_failure() {
+        let store = std::sync::Arc::new(FailFirstFinishStore::new());
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine
+            .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+            .unwrap();
+
+        let terminal = engine
+            .finish_requested_cancellation(&run_id)
+            .expect("the safe boundary should retry a transient terminal failure")
+            .expect("the requested cancellation should become terminal");
+
+        assert!(matches!(terminal, SopRunAction::Completed { .. }));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (0, 0),
+            "the successful boundary retry must release the retained claim"
+        );
+        assert_eq!(
+            engine
+                .run_events(&run_id)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "run_cancelled")
+                .count(),
+            1,
+            "the retry must produce exactly one durable cancellation event"
         );
     }
 
@@ -13344,6 +13416,14 @@ type = "manual"
             terminal: &PersistedRun,
             event: &SopEventRecord,
         ) -> Result<u64, StoreError> {
+            if self
+                .fail_next_finish
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::Backend(
+                    "injected first terminal persistence failure".into(),
+                ));
+            }
             self.inner.finish_run_with_event(run_id, terminal, event)
         }
 

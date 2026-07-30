@@ -132,7 +132,7 @@ export default function RunDetail() {
           >
             {t('run_detail.open_sop')}
           </Link>
-          {gated || stoppable ? (
+          {gated || stoppable || stopping ? (
             <div className="ml-auto flex items-center gap-2">
               {gated ? (
                 <>
