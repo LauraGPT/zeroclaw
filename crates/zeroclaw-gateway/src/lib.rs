@@ -454,8 +454,6 @@ pub struct AppState {
     pub mem: Arc<dyn Memory>,
     pub memory_strategy: Arc<dyn MemoryStrategy>,
     pub auto_save: bool,
-    /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
-    pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
@@ -990,16 +988,6 @@ pub async fn run_gateway(
         tx
     });
     let event_buffer = Arc::new(sse::EventBuffer::new(500));
-    // Extract webhook secret for authentication
-    let webhook_secret_hash: Option<Arc<str>> =
-        config.channels.webhook.values().next().and_then(|webhook| {
-            webhook.secret.as_ref().and_then(|raw_secret| {
-                let trimmed_secret = raw_secret.trim();
-                (!trimmed_secret.is_empty())
-                    .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_secret)))
-            })
-        });
-
     // WhatsApp channel instances (one per cloud-configured alias), keyed by
     // alias so `/whatsapp/{alias}` webhooks reach the matching instance
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -1532,7 +1520,6 @@ pub async fn run_gateway(
         mem,
         memory_strategy,
         auto_save: config.memory.auto_save,
-        webhook_secret_hash,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
@@ -2585,6 +2572,21 @@ pub struct WebhookQuery {
 
 type WebhookJsonResponse = (StatusCode, Json<serde_json::Value>);
 
+/// Resolve the gateway webhook credential from its canonical live config.
+/// Channel webhook aliases own separate HMAC listeners and never participate
+/// in authorization for the gateway's `/webhook` or `/sop/*` routes.
+fn configured_gateway_webhook_secret_hash(state: &AppState) -> Option<String> {
+    state
+        .config
+        .read()
+        .gateway
+        .webhook_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(hash_webhook_secret)
+}
+
 fn authorize_webhook_request(
     state: &AppState,
     peer_addr: SocketAddr,
@@ -2640,7 +2642,7 @@ fn authorize_webhook_request(
         }
     }
 
-    if let Some(ref secret_hash) = state.webhook_secret_hash {
+    if let Some(secret_hash) = configured_gateway_webhook_secret_hash(state) {
         let header_hash = headers
             .get("X-Webhook-Secret")
             .and_then(|v| v.to_str().ok())
@@ -2648,7 +2650,7 @@ fn authorize_webhook_request(
             .filter(|value| !value.is_empty())
             .map(hash_webhook_secret);
         match header_hash {
-            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            Some(val) if constant_time_eq(&val, &secret_hash) => {}
             _ => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -2693,7 +2695,7 @@ fn check_webhook_idempotency(
         Json(serde_json::json!({
             "status": "duplicate",
             "idempotent": true,
-            "message": "Request already processed for this idempotency key"
+            "message": "A prior request already reserved this idempotency key; no new dispatch was started"
         })),
     ))
 }
@@ -2704,7 +2706,7 @@ fn check_webhook_idempotency(
 /// fails, so by the time callers reach this point "configured" implies
 /// "already verified for this request".
 fn has_configured_webhook_credential(state: &AppState) -> bool {
-    state.pairing.require_pairing() || state.webhook_secret_hash.is_some()
+    state.pairing.require_pairing() || configured_gateway_webhook_secret_hash(state).is_some()
 }
 
 /// Fail closed before a SOP run starts. Starting a SOP run authorizes real
@@ -2727,7 +2729,7 @@ fn require_sop_dispatch_credentials(state: &AppState) -> Result<(), WebhookJsonR
         "error": "SOP webhook dispatch requires a configured credential: set \
                   `gateway.require_pairing = true` and authenticate with \
                   `Authorization: Bearer <paired-token>` (pair first via POST /pair), or set \
-                  `[channels.webhook.<alias>].secret` and send X-Webhook-Secret."
+                  `gateway.webhook_secret` and send X-Webhook-Secret."
     });
     Err((StatusCode::UNAUTHORIZED, Json(err)))
 }
@@ -4486,7 +4488,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -4643,9 +4644,9 @@ path = "{trigger_path}"
     /// secret to send back as `X-Webhook-Secret`. Item 2's fail-closed SOP
     /// dispatch policy requires a configured-and-verified credential before
     /// a SOP run can start.
-    fn with_webhook_secret(mut state: AppState) -> (AppState, String) {
+    fn with_webhook_secret(state: AppState) -> (AppState, String) {
         let secret = generate_test_secret();
-        state.webhook_secret_hash = Some(Arc::from(hash_webhook_secret(&secret)));
+        state.config.write().gateway.webhook_secret = Some(secret.clone());
         (state, secret)
     }
 
@@ -5233,7 +5234,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -5321,7 +5321,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -5916,7 +5915,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6058,16 +6056,69 @@ path = "{trigger_path}"
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
 
+    async fn post_sop_route_without_credentials(
+        state: AppState,
+        path: &'static str,
+        body: &'static [u8],
+    ) -> (StatusCode, serde_json::Value) {
+        let app = sop_webhook_routes().with_state(state);
+        let mut request = axum::http::Request::post(path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&payload).unwrap())
+    }
+
+    #[tokio::test]
+    async fn sop_route_without_credentials_hides_body_and_engine_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (matching, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let unavailable_tmp = tempfile::tempdir().unwrap();
+        let unavailable = admin_paircode_state(&unavailable_tmp, false, false);
+
+        let cases = [
+            post_sop_route_without_credentials(
+                matching.clone(),
+                "/sop/deploy",
+                br#"{"revision":"abc123"}"#,
+            )
+            .await,
+            post_sop_route_without_credentials(
+                matching.clone(),
+                "/sop/missing",
+                br#"{"revision":"abc123"}"#,
+            )
+            .await,
+            post_sop_route_without_credentials(matching, "/sop/deploy", b"not-json").await,
+            post_sop_route_without_credentials(unavailable, "/sop/deploy", br#"{}"#).await,
+        ];
+
+        let expected_error = cases[0].1["error"].clone();
+        for (status, payload) in cases {
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                payload["error"], expected_error,
+                "credential failure must not reveal JSON validity, trigger matches, or engine availability"
+            );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn sop_webhook_rejects_unmatched_and_invalid_requests_without_chat_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
 
         let unmatched = api_sop_webhook::handle_sop_webhook(
             State(state.clone()),
             test_connect_info(),
             axum::extract::Path("missing".to_string()),
-            HeaderMap::new(),
+            webhook_secret_header(&secret),
             axum::body::Bytes::from_static(br#"{}"#),
         )
         .await;
@@ -6077,7 +6128,7 @@ path = "{trigger_path}"
             State(state),
             test_connect_info(),
             axum::extract::Path("deploy".to_string()),
-            HeaderMap::new(),
+            webhook_secret_header(&secret),
             axum::body::Bytes::from_static(b"not-json"),
         )
         .await;
@@ -6089,20 +6140,21 @@ path = "{trigger_path}"
     async fn sop_webhook_requires_shared_engine_and_webhook_auth() {
         let disabled_tmp = tempfile::tempdir().unwrap();
         let disabled = admin_paircode_state(&disabled_tmp, false, false);
+        let (disabled, secret) = with_webhook_secret(disabled);
         let unavailable = api_sop_webhook::handle_sop_webhook(
             State(disabled),
             test_connect_info(),
             axum::extract::Path("deploy".to_string()),
-            HeaderMap::new(),
+            webhook_secret_header(&secret),
             axum::body::Bytes::from_static(br#"{}"#),
         )
         .await;
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let protected_tmp = tempfile::tempdir().unwrap();
-        let (mut protected, provider) = webhook_sop_state(&protected_tmp, "/sop/deploy");
+        let (protected, provider) = webhook_sop_state(&protected_tmp, "/sop/deploy");
         let secret = generate_test_secret();
-        protected.webhook_secret_hash = Some(Arc::from(hash_webhook_secret(&secret)));
+        protected.config.write().gateway.webhook_secret = Some(secret);
         let unauthorized = api_sop_webhook::handle_sop_webhook(
             State(protected),
             test_connect_info(),
@@ -6251,6 +6303,13 @@ path = "{trigger_path}"
         let repeat_parsed: serde_json::Value = serde_json::from_slice(&repeat_payload).unwrap();
         assert_eq!(repeat_parsed["status"], "duplicate");
         assert_eq!(repeat_parsed["idempotent"], true);
+        assert!(
+            repeat_parsed["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no new dispatch was started"),
+            "duplicate response must describe reservation, not claim successful processing"
+        );
 
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
@@ -6381,7 +6440,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6502,7 +6560,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6603,7 +6660,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: true,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6704,15 +6760,100 @@ path = "{trigger_path}"
         assert_eq!(one.len(), 64);
     }
 
+    #[test]
+    fn gateway_webhook_secret_uses_one_live_config_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+        {
+            let mut config = state.config.write();
+            config.channels.webhook.insert(
+                "enabled-a".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    secret: Some("channel-secret-a".into()),
+                    ..Default::default()
+                },
+            );
+            config.channels.webhook.insert(
+                "enabled-b".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    secret: Some("channel-secret-b".into()),
+                    ..Default::default()
+                },
+            );
+            config.channels.webhook.insert(
+                "disabled".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: false,
+                    secret: Some("disabled-channel-secret".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            configured_gateway_webhook_secret_hash(&state),
+            None,
+            "channel listener aliases must never become gateway credentials"
+        );
+        assert!(
+            require_sop_dispatch_credentials(&state).is_err(),
+            "multiple channel aliases without a gateway credential must fail closed"
+        );
+
+        let startup_secret = "synthetic-startup-gateway-secret".to_string();
+        state.config.write().gateway.webhook_secret = Some(startup_secret.clone());
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header("channel-secret-a"),
+            )
+            .is_err(),
+            "an enabled channel alias secret must not authorize the gateway"
+        );
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&startup_secret),
+            )
+            .is_ok()
+        );
+
+        let rotated_secret = "synthetic-rotated-gateway-secret".to_string();
+        state.config.write().gateway.webhook_secret = Some(rotated_secret.clone());
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&startup_secret),
+            )
+            .is_err(),
+            "authorization must not retain a startup snapshot after config replacement"
+        );
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&rotated_secret),
+            )
+            .is_ok(),
+            "the live canonical gateway credential must take effect"
+        );
+    }
+
     #[tokio::test]
     async fn webhook_secret_hash_rejects_missing_header() {
         let provider_impl = Arc::new(MockModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(secret.clone());
 
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6723,7 +6864,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6796,9 +6936,11 @@ path = "{trigger_path}"
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let valid_secret = generate_test_secret();
         let wrong_secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(valid_secret.clone());
 
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6809,7 +6951,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6887,9 +7028,11 @@ path = "{trigger_path}"
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(secret.clone());
 
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -6900,7 +7043,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6998,7 +7140,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7094,7 +7235,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7238,7 +7378,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -8062,7 +8201,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -8149,7 +8287,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -8310,7 +8447,6 @@ path = "{trigger_path}"
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),

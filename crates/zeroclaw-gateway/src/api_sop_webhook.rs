@@ -149,6 +149,12 @@ pub async fn handle_sop_webhook(
     if let Err(response) = authorize_webhook_request(&state, peer_addr, &headers) {
         return response.into_response();
     }
+    // `/sop/*` is side-effecting and has no open chat fallback. After the
+    // shared rate/auth checks above, fail closed before parsing the body or
+    // consulting daemon-owned SOP state so anonymous callers cannot probe it.
+    if let Err(response) = require_sop_dispatch_credentials(&state) {
+        return response.into_response();
+    }
 
     let payload = if body.is_empty() {
         None
@@ -182,10 +188,6 @@ pub async fn handle_sop_webhook(
                 .into_response();
         }
         Err(response) => return response.into_response(),
-    }
-
-    if let Err(response) = require_sop_dispatch_credentials(&state) {
-        return response.into_response();
     }
 
     // Namespace idempotency by the specific SOP path, not just the shared

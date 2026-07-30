@@ -51,27 +51,44 @@ array. Input rejected by the SOP untrusted-input guard returns `422`.
 Both entry points use the gateway webhook security controls:
 
 - pairing bearer authentication when gateway pairing is required;
-- the optional `X-Webhook-Secret` configured for webhooks; and
+- the optional `X-Webhook-Secret` configured by
+  `gateway.webhook_secret`; and
 - webhook rate limiting.
 
 Starting a SOP run authorizes real side effects, so dispatch fails closed:
-whenever a request matches a loaded SOP trigger, at least one of the two
-controls above must be configured and satisfied: `gateway.require_pairing =
-true` with a valid `Authorization: Bearer <paired-token>`, or
-`[channels.webhook.<alias>].secret` with a valid `X-Webhook-Secret`. With
-neither configured (for example `gateway.require_pairing = false` and no
-webhook secret set), a matching request is rejected with `401` naming both
-ways to configure a credential, instead of starting the run. This applies to
-`/sop/*` unconditionally, and to `/webhook` only when a SOP trigger actually
-matches; an unmatched `/webhook` request still falls back to the existing
-chat authentication policy.
+at least one control must be configured. Every configured control must pass:
+when pairing is required, send a valid `Authorization: Bearer <paired-token>`;
+when `gateway.webhook_secret` is set, send its exact value in
+`X-Webhook-Secret`; when both are configured, send both.
+
+```toml
+[gateway]
+webhook_secret = "replace-with-a-random-secret"
+```
+
+`[channels.webhook.<alias>].secret` is not a gateway credential. It belongs to
+the separate webhook channel listener and verifies
+`X-Webhook-Signature: sha256=<HMAC>`. Multiple channel aliases, including
+disabled or stale aliases, never affect gateway/SOP authorization.
+
+With neither gateway control configured (for example
+`gateway.require_pairing = false` and no `gateway.webhook_secret`), `/sop/*`
+returns the same `401` before parsing JSON or consulting the SOP engine. An
+anonymous caller therefore cannot distinguish malformed JSON, engine
+availability, or whether a path matches. For `/webhook`, the fail-closed
+credential requirement applies only when a SOP trigger matches; an unmatched
+request retains the existing chat fallback policy.
 
 Optional `X-Idempotency-Key` replay protection is namespaced per SOP path, not
 just per endpoint family: the same key sent to two different SOP paths (e.g.
 `/sop/deploy` then `/sop/rollback`) is treated as two distinct requests, and
 `/sop/*` keys never collide with `/webhook` keys. HTTP delivery is
-at-most-once: a `deferred` result is observable but is not automatically
-retried by the gateway.
+at-most-once by attempt: the key is reserved before dispatch, so a race such
+as SOP unload between matching and dispatch may consume the key without
+starting a run. A duplicate response therefore says that a prior request
+reserved the key and that no new dispatch started; it does not claim the prior
+attempt completed successfully. A `deferred` result is observable but is not
+automatically retried by the gateway.
 
 ## See also
 
