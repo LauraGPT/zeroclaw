@@ -623,8 +623,7 @@ enum UpdateOutcome {
     /// The update was delivered or permanently skipped; the offset has been
     /// advanced past it and the caller should keep processing the batch.
     Advanced,
-    /// A transient failure occurred (or the retry budget for this update was
-    /// exhausted and it was dropped). The caller should stop processing the
+    /// A transient failure occurred. The caller should stop processing the
     /// rest of this batch so the next poll retries starting at the
     /// still-unadvanced offset.
     StopBatch,
@@ -3288,10 +3287,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .await
     }
 
-    /// Attempt budget for a single update stuck on `RetryTransient` before it
-    /// is dropped like a permanent skip. Shared by both the startup probe
-    /// and the main long-poll loop via [`Self::process_update`].
-    const TRANSIENT_RETRY_MAX_ATTEMPTS: u32 = 3;
+    /// Fixed, bounded delay between retries of a transiently failing update.
+    /// The attempt count is diagnostic only: only an explicitly permanent
+    /// disposition may advance the Telegram offset.
+    const TRANSIENT_RETRY_DELAY_SECS: u64 = 2;
 
     /// Route a single update from a `getUpdates` batch through the shared
     /// delivered/permanent-skip/retry-transient disposition path.
@@ -3413,48 +3412,31 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 return UpdateOutcome::Advanced;
             }
             UpdateDisposition::RetryTransient => {
-                if let Some(uid) = uid {
+                let attempts = if let Some(uid) = uid {
                     let attempts = match *transient_retry {
-                        Some((tracked_uid, n)) if tracked_uid == uid => n + 1,
+                        Some((tracked_uid, n)) if tracked_uid == uid => n.saturating_add(1),
                         _ => 1,
                     };
-                    if attempts >= Self::TRANSIENT_RETRY_MAX_ATTEMPTS {
-                        // Attempt budget exhausted: the failure is evidently
-                        // not transient after all. Drop the update exactly
-                        // like a permanent skip so it stops starving
-                        // everything behind it.
-                        ::zeroclaw_log::record!(
-                            ERROR,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "update_id": uid,
-                                "attempts": attempts,
-                            })),
-                            "update kept failing transiently; giving up and advancing past it to unblock the channel"
-                        );
-                        Box::pin(self.handle_unauthorized_message(update)).await;
-                        *offset = uid + 1;
-                        *transient_retry = None;
-                        return UpdateOutcome::Advanced;
-                    }
                     *transient_retry = Some((uid, attempts));
-                }
+                    attempts
+                } else {
+                    1
+                };
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "update_id": uid,
+                            "attempts": attempts,
+                            "retry_delay_secs": Self::TRANSIENT_RETRY_DELAY_SECS,
+                        })),
                     "Transient failure parsing update; leaving offset unadvanced so the next poll retries it"
                 );
-                // Brief backoff, shorter than the generic poll-error delay
-                // above, since only this one update failed and the rest of
-                // the getUpdates response was healthy: just enough to avoid
-                // hammering a flaky download endpoint on every immediate
-                // re-poll.
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    Self::TRANSIENT_RETRY_DELAY_SECS,
+                ))
+                .await;
                 return UpdateOutcome::StopBatch;
             }
         };
@@ -3950,10 +3932,9 @@ impl Channel for TelegramChannel {
         // `process_update` stops processing of the current update batch (be
         // it the startup probe's batch below or the main loop's), so at most
         // one update can be head-of-line blocking retries at any time. Once
-        // an update has burned through the attempt budget it is dropped
-        // like a permanent skip, otherwise a permanently failing download
-        // (expired file_id, revoked transcription key, full disk) would
-        // wedge the channel forever, starving every later update behind it.
+        // the attempt count grows only for operator diagnostics. It never
+        // changes the delivery disposition: an unclassified I/O failure
+        // cannot become safe to acknowledge merely because it repeated.
         // Shared across both the startup probe and the main loop so a
         // transient failure on a queued startup update is tracked the same
         // way as one seen mid-run.
@@ -7303,30 +7284,55 @@ mod tests {
         handle.abort();
     }
 
-    /// A persistently failing download must not wedge the channel forever:
-    /// after the transient-retry attempt budget is exhausted, the update is
-    /// dropped like a permanent skip and the offset advances past it, while
-    /// the earlier polls prove the retries really happened at the old offset.
+    /// A transient failure that outlasts the former three-attempt budget must
+    /// remain unacknowledged. Later updates in the same ordered batch cannot
+    /// pass it; once the failing update recovers, all messages are delivered
+    /// in order and the offset advances past the whole batch.
     #[tokio::test]
-    async fn listen_gives_up_after_capped_transient_retries_and_advances() {
+    async fn listen_ordered_batch_recovers_after_extended_transient_failure() {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         mount_telegram_startup_probe(&mock_server).await;
 
-        let uid = 2_000;
-        let update = telegram_document_update(uid, 6, 666, "alice", "file456", "report.pdf");
+        let uid1 = 2_000;
+        let uid2 = 2_001;
+        let uid3 = 2_002;
+        let first = telegram_text_update(uid1, 6, 666, "alice", "first");
+        let failing = telegram_document_update(uid2, 7, 666, "alice", "file456", "report.pdf");
+        let later = telegram_text_update(uid3, 8, 666, "alice", "third");
 
-        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([update])).await;
-        // Keep the loop fed once the update is given up on.
-        mount_telegram_get_updates(&mock_server, uid + 1, serde_json::json!([])).await;
+        mount_telegram_get_updates(
+            &mock_server,
+            0,
+            serde_json::json!([first, failing.clone(), later.clone()]),
+        )
+        .await;
+        mount_telegram_get_updates(&mock_server, uid1 + 1, serde_json::json!([failing, later]))
+            .await;
+        mount_telegram_get_updates(&mock_server, uid3 + 1, serde_json::json!([])).await;
 
-        // getFile fails on every attempt — a permanent failure misclassified
-        // as transient, which only the attempt cap can unblock.
+        // Four failures outlast the former three-attempt budget. The fifth
+        // attempt succeeds, proving elapsed retries do not reclassify the
+        // update as a permanent skip.
         Mock::given(method("GET"))
             .and(path_regex(r"/bot[^/]+/getFile$"))
             .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(4)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_path": "documents/report.pdf"}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/file/bot[^/]+/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"pdf bytes".to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -7346,29 +7352,40 @@ mod tests {
         let listen_ch = ch.clone();
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
-        // Two retries sleep 2s each before the third attempt gives up, so
-        // allow a generous window for the advanced offset to appear.
-        assert!(
-            telegram_wait_for_main_loop_offset(&mock_server, uid + 1, Duration::from_secs(15))
-                .await,
-            "offset never advanced past the persistently failing update — channel is wedged"
-        );
-
-        let old_offset_polls = telegram_main_loop_getupdates_bodies(&mock_server)
+        let first_message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
-            .iter()
-            .filter(|b| b.get("offset").and_then(serde_json::Value::as_i64) == Some(0))
-            .count();
-        assert_eq!(
-            old_offset_polls, 3,
-            "expected exactly the attempt budget of polls at the old offset (retries really happened, then stopped)"
-        );
+            .expect("timed out waiting for the first message")
+            .expect("channel closed before delivering the first message");
+        assert_eq!(first_message.content, "first");
 
-        // The failed update must never be delivered.
-        let extra = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        let recovered = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("timed out waiting for the recovered attachment")
+            .expect("channel closed before delivering the recovered attachment");
         assert!(
-            extra.is_err(),
-            "unexpected message delivered from the failed update: {extra:?}"
+            recovered.content.contains("report.pdf"),
+            "the failed update must recover before the later update, got: {}",
+            recovered.content
+        );
+        let third_message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for the later message")
+            .expect("channel closed before delivering the later message");
+        assert_eq!(third_message.content, "third");
+
+        let main_loop_bodies = telegram_main_loop_getupdates_bodies(&mock_server).await;
+        let retry_polls = main_loop_bodies
+            .iter()
+            .filter(|body| body.get("offset").and_then(serde_json::Value::as_i64) == Some(uid1 + 1))
+            .count();
+        assert!(
+            retry_polls >= 4,
+            "expected retries beyond the former three-attempt budget at the blocked offset, got {retry_polls}"
+        );
+        assert!(
+            telegram_wait_for_main_loop_offset(&mock_server, uid3 + 1, Duration::from_secs(5))
+                .await,
+            "offset never advanced past the ordered batch after recovery"
         );
 
         handle.abort();
