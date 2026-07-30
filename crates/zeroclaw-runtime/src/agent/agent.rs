@@ -1953,97 +1953,34 @@ impl Agent {
             )
         );
 
-        let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> = match self
-            .provider_switch_config
-            .as_ref()
-        {
-            Some(switch_config)
-                if switch_config.live_config.is_some() || switch_config.config.is_some() =>
-            {
-                let full_config = switch_config
-                    .live_config
-                    .as_ref()
-                    .map(|config| config.read().clone())
-                    .or_else(|| switch_config.config.as_deref().cloned())
-                    .expect("guarded by match condition");
-                let agent_entry = full_config
-                    .resolved_model_provider_for_agent(&self.agent_alias)
-                    .map(|(_ty, _alias, entry)| entry);
-                let default_api_key = agent_entry.and_then(|e| e.api_key.as_deref());
-                let default_base_url = agent_entry.and_then(|e| e.uri.as_deref());
-
-                // Prefer a route-specific api_key when the switched
-                // provider/model matches a configured model_route entry.
-                let selected_route = full_config.model_routes.iter().find(|r| {
-                    r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                        && (r.model.eq_ignore_ascii_case(&new_model)
-                            || r.hint.eq_ignore_ascii_case(&new_model))
-                });
-                let route_api_key = selected_route.and_then(|route| route.api_key.as_deref());
-                let selected_route_hint = selected_route.map(|route| route.hint.as_str());
-                let api_key = route_api_key.or(default_api_key);
-
-                let runtime_options = new_model_provider
-                    .split_once('.')
-                    .map(|(family, alias)| {
-                        zeroclaw_providers::provider_runtime_options_for_alias(
-                            &full_config,
-                            family,
-                            alias,
-                        )
-                    })
-                    .unwrap_or_default();
-
-                match switch_config.live_config.as_ref() {
-                        Some(live_config) => match selected_route_hint {
-                            Some(route_hint) => zeroclaw_providers::create_routed_model_provider_with_live_config_for_route_options(
+        let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> =
+            match self.provider_switch_config.as_ref() {
+                Some(switch_config)
+                    if switch_config.live_config.is_some() || switch_config.config.is_some() =>
+                {
+                    match switch_config.live_config.as_ref() {
+                        Some(live_config) => {
+                            zeroclaw_providers::create_model_switch_provider_with_live_config(
                                 Arc::clone(live_config),
                                 &new_model_provider,
-                                api_key,
-                                default_base_url,
-                                route_hint,
                                 &new_model,
-                                &runtime_options,
-                            ),
-                            None => zeroclaw_providers::create_routed_model_provider_with_live_config_options(
-                                Arc::clone(live_config),
-                                &new_model_provider,
-                                api_key,
-                                default_base_url,
-                                &new_model,
-                                &runtime_options,
-                            ),
-                        },
-                        None => match selected_route_hint {
-                            Some(route_hint) => zeroclaw_providers::create_routed_model_provider_for_route_with_options(
-                                &full_config,
-                                &new_model_provider,
-                                api_key,
-                                default_base_url,
-                                &full_config.reliability,
-                                &full_config.model_routes,
-                                route_hint,
-                                &new_model,
-                                &runtime_options,
-                            ),
-                            None => zeroclaw_providers::create_routed_model_provider_with_options(
-                                &full_config,
-                                &new_model_provider,
-                                api_key,
-                                default_base_url,
-                                &full_config.reliability,
-                                &full_config.model_routes,
-                                &new_model,
-                                &runtime_options,
-                            ),
-                        },
+                            )
+                        }
+                        None => zeroclaw_providers::create_model_switch_provider(
+                            switch_config
+                                .config
+                                .as_deref()
+                                .expect("guarded by match condition"),
+                            &new_model_provider,
+                            &new_model,
+                        ),
                     }
-            }
-            _ => Err(anyhow::Error::msg(
-                "model_switch requested but agent has no provider_switch_config; \
+                }
+                _ => Err(anyhow::Error::msg(
+                    "model_switch requested but agent has no provider_switch_config; \
                  cannot rebuild provider safely",
-            )),
-        };
+                )),
+            };
 
         match switch_outcome {
             Ok(new_prov) => {
@@ -9338,6 +9275,154 @@ mod tests {
             &[("Bearer sk-deep".to_string(), "deep-model".to_string())]
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn try_apply_model_switch_uses_only_the_live_target_profile_snapshot() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use zeroclaw_config::{
+            providers::ModelProviderRef,
+            schema::{AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig},
+        };
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> (StatusCode, Json<Value>) {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            capture.lock().push(auth);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        async fn start_server(capture: Capture) -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let addr = listener.local_addr().expect("test server addr");
+            let app = Router::new()
+                .route("/v1/chat/completions", post(capture_chat_request))
+                .with_state(capture);
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve test server");
+            });
+            (format!("http://{addr}/v1"), server)
+        }
+
+        let source_capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let target_capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let (source_uri, source_server) = start_server(Arc::clone(&source_capture)).await;
+        let (target_uri, target_server) = start_server(Arc::clone(&target_capture)).await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        for (alias, key, uri) in [
+            ("source", "sk-source", source_uri),
+            ("target", "sk-target", target_uri),
+        ] {
+            config.providers.models.openai.insert(
+                alias.to_string(),
+                OpenAIModelProviderConfig {
+                    base: ModelProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
+                        api_key: Some(key.to_string()),
+                        uri: Some(uri),
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        config.agents.insert(
+            "current".to_string(),
+            AliasedAgentConfig {
+                model_provider: ModelProviderRef::new("openai.source"),
+                ..Default::default()
+            },
+        );
+        let live_config = Arc::new(parking_lot::RwLock::new(config));
+        let switch_cfg = ProviderSwitchConfig {
+            config: None,
+            live_config: Some(Arc::clone(&live_config)),
+        };
+        let mut agent = build_test_agent("openai.source", "source-model", Some(switch_cfg));
+        agent.agent_alias = "current".to_string();
+
+        let result = agent.try_apply_model_switch(
+            "source-model",
+            "openai.target".to_string(),
+            "target-model".to_string(),
+        );
+        assert_eq!(result.as_deref(), Some("target-model"));
+        assert_eq!(
+            agent
+                .model_provider
+                .simple_chat("hello", "target-model", None)
+                .await
+                .unwrap(),
+            "ok"
+        );
+
+        live_config
+            .write()
+            .providers
+            .models
+            .openai
+            .get_mut("target")
+            .expect("target profile")
+            .base
+            .api_key = Some("sk-target-replaced".to_string());
+        assert_eq!(
+            agent
+                .model_provider
+                .simple_chat("hello again", "target-model", None)
+                .await
+                .unwrap(),
+            "ok"
+        );
+
+        live_config
+            .write()
+            .providers
+            .models
+            .openai
+            .get_mut("target")
+            .expect("target profile")
+            .base
+            .api_key = None;
+        agent
+            .model_provider
+            .simple_chat("must not send", "target-model", None)
+            .await
+            .expect_err("removing the target credential must revoke it");
+
+        assert!(
+            source_capture.lock().is_empty(),
+            "the source credential and endpoint must not be reused for the target"
+        );
+        assert_eq!(
+            &*target_capture.lock(),
+            &[
+                "Bearer sk-target".to_string(),
+                "Bearer sk-target-replaced".to_string(),
+            ]
+        );
+        source_server.abort();
+        target_server.abort();
     }
 
     /// Streamed mock whose first call emits a tool call (queuing a model

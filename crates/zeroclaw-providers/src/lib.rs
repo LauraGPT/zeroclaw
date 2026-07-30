@@ -1395,11 +1395,13 @@ impl RouteCredentialIdentity {
         &self,
         config: &'a zeroclaw_config::schema::Config,
     ) -> Option<&'a zeroclaw_config::schema::ModelRouteConfig> {
-        config.model_routes.iter().find(|route| {
+        let mut matches = config.model_routes.iter().filter(|route| {
             route.hint == self.hint
                 && route.model_provider == self.model_provider
                 && route.model == self.model
-        })
+        });
+        let route = matches.next()?;
+        matches.next().is_none().then_some(route)
     }
 }
 
@@ -2030,6 +2032,102 @@ pub fn create_routed_model_provider_with_live_config_for_route_options(
         options,
         Some(live_config),
         Some(selected_route_hint),
+    )
+}
+
+fn selected_model_switch_route<'a>(
+    config: &'a zeroclaw_config::schema::Config,
+    primary_name: &str,
+    requested_model: &str,
+) -> anyhow::Result<Option<&'a zeroclaw_config::schema::ModelRouteConfig>> {
+    let requested_hint = requested_model
+        .strip_prefix("hint:")
+        .unwrap_or(requested_model);
+    let mut matches = config.model_routes.iter().filter(|route| {
+        route.model_provider.eq_ignore_ascii_case(primary_name)
+            && (route.model.eq_ignore_ascii_case(requested_model)
+                || route.hint.eq_ignore_ascii_case(requested_hint))
+    });
+    let selected = matches.next();
+    if matches.next().is_some() {
+        anyhow::bail!(
+            "model switch target `{primary_name}` / `{requested_model}` matches multiple model routes"
+        );
+    }
+    Ok(selected)
+}
+
+fn create_model_switch_provider_from_snapshot(
+    config: &zeroclaw_config::schema::Config,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    primary_name: &str,
+    requested_model: &str,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    let selected_route = selected_model_switch_route(config, primary_name, requested_model)?;
+    let (profile_key, profile_uri, options) = match primary_name.split_once('.') {
+        Some((family, alias)) => {
+            let entry = config.providers.models.find(family, alias).ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "model switch target `{primary_name}` no longer resolves"
+                ))
+            })?;
+            let options = provider_runtime_options_for_alias(config, family, alias);
+            let key = selected_route
+                .and_then(|route| route.api_key.as_deref())
+                .or(entry.api_key.as_deref());
+            if !factory::fallback_auth_ready_for_alias(config, family, alias, key, &options) {
+                anyhow::bail!(
+                    "model switch target `{primary_name}` has no profile-resolved credential"
+                );
+            }
+            (key, entry.uri.as_deref(), options)
+        }
+        None => (
+            selected_route.and_then(|route| route.api_key.as_deref()),
+            None,
+            ModelProviderRuntimeOptions::default(),
+        ),
+    };
+
+    create_routed_model_provider_with_options_and_live(
+        config,
+        primary_name,
+        profile_key,
+        profile_uri,
+        &config.reliability,
+        &config.model_routes,
+        requested_model,
+        &options,
+        live_config,
+        selected_route.map(|route| route.hint.as_str()),
+    )
+}
+
+/// Rebuild a model-switch target entirely from one immutable config snapshot.
+///
+/// The requested provider/model identity is the input; credentials, endpoint,
+/// auth mode, runtime options, and route identity are all resolved here so a
+/// caller cannot mix state from the previously active profile.
+pub fn create_model_switch_provider(
+    config: &zeroclaw_config::schema::Config,
+    primary_name: &str,
+    requested_model: &str,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    create_model_switch_provider_from_snapshot(config, None, primary_name, requested_model)
+}
+
+/// Rebuild a model-switch target from one read of the canonical live config.
+pub fn create_model_switch_provider_with_live_config(
+    live_config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    primary_name: &str,
+    requested_model: &str,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
+    let config = live_config.read().clone();
+    create_model_switch_provider_from_snapshot(
+        &config,
+        Some(live_config),
+        primary_name,
+        requested_model,
     )
 }
 
@@ -3545,6 +3643,47 @@ mod tests {
             ]
         );
         server.abort();
+    }
+
+    #[test]
+    fn route_credential_identity_fails_closed_on_duplicate_route_matches() {
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, ModelRouteConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "route".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-profile".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "fast".to_string(),
+                model_provider: "openai.route".to_string(),
+                model: "fast-model".to_string(),
+                api_key: Some("sk-first".to_string()),
+            },
+            ModelRouteConfig {
+                hint: "fast".to_string(),
+                model_provider: "openai.route".to_string(),
+                model: "fast-model".to_string(),
+                api_key: Some("sk-second".to_string()),
+            },
+        ];
+        let source =
+            PrimaryCredentialSource::Route(RouteCredentialIdentity::from(&config.model_routes[0]));
+
+        let attempts = credential_attempts_for_alias(config, "openai", "route", &source, false);
+
+        assert!(
+            attempts.is_empty(),
+            "an ambiguous route identity must not select either credential"
+        );
     }
 
     #[tokio::test]
