@@ -119,8 +119,10 @@ precision; the report prints `pass rate p̄ +/-t·SEM (95% CI)`, using the Stude
 multiplier on n-1 degrees of freedom (the normal z=1.96 understates the interval
 for the few-unit suites repeated runs typically produce). An optional
 per-case `cluster` label averages correlated case families together before the
-error bar; omitting it asserts independence. A case with `0/k` passes at `k >= 5`
-is flagged low-signal, and at `k >= 20` as a suspect (broken) task.
+error bar; omitting it asserts independence. With fewer than two independent
+units, the report shows the observed pass rate and marks the 95% CI unavailable.
+A case with `0/k` passes at `k >= 5` is flagged low-signal, and at `k >= 20` as a
+suspect (broken) task.
 
 ## Exit-code contract
 

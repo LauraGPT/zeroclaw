@@ -166,7 +166,8 @@ impl SuiteReport {
     /// Suite pass-rate error bar for repeated (live) runs: `pass rate p̄ ±1.96·SEM
     /// (95% CI)`. Per-case success proportions are collapsed first (one value per
     /// case), then cluster-averaged, so correlated resamples do not fake precision.
-    /// `None` when no case repeated.
+    /// `None` when no case repeated. Fewer than two independent units report the
+    /// observed pass rate without an interval because SEM is not estimable.
     pub fn repeat_ci_line(&self) -> Option<String> {
         let items: Vec<(Option<String>, f64)> = self
             .cases
@@ -182,9 +183,15 @@ impl SuiteReport {
         }
         let values = crate::stats::cluster_means(&items);
         let mean = crate::stats::mean(&values);
+        if values.len() < 2 {
+            return Some(format!(
+                "pass rate {:.0}% (95% CI unavailable: insufficient independent units)",
+                mean * 100.0
+            ));
+        }
         // Student-t multiplier on (n-1) df: the normal z=1.96 understates the
         // interval for the few-unit suites repeated runs typically produce.
-        let df = values.len().saturating_sub(1);
+        let df = values.len() - 1;
         let ci = crate::stats::t95_multiplier(df) * crate::stats::sem(&values);
         Some(format!(
             "pass rate {:.0}% +/-{:.0}% (95% CI)",
@@ -327,6 +334,63 @@ mod tests {
             repeat: None,
             cluster: None,
         }
+    }
+
+    fn repeated_case(name: &str, passes: u32, k: u32, cluster: Option<&str>) -> CaseReport {
+        CaseReport {
+            name: name.to_string(),
+            source: "fixture.json".to_string(),
+            record: None,
+            grades: Vec::new(),
+            error: None,
+            repeat: Some(crate::stats::RepeatStats {
+                k,
+                passes,
+                token_mean: 0.0,
+                token_stddev: 0.0,
+                duration_mean: 0.0,
+                duration_stddev: 0.0,
+                check_flips: std::collections::BTreeMap::new(),
+            }),
+            cluster: cluster.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn repeated_single_case_reports_insufficient_units_without_nan() {
+        let suite = SuiteReport {
+            cases: vec![repeated_case("only", 1, 2, None)],
+        };
+
+        let line = suite.repeat_ci_line().expect("repeated case has a summary");
+        assert!(line.contains("pass rate 50%"), "got: {line}");
+        assert!(
+            line.contains("insufficient independent units"),
+            "got: {line}"
+        );
+        assert!(!line.contains("NaN"), "got: {line}");
+        assert!(!suite.render_table().contains("NaN"));
+        assert!(!suite.to_json().contains("NaN"));
+    }
+
+    #[test]
+    fn repeated_single_effective_cluster_reports_insufficient_units() {
+        let suite = SuiteReport {
+            cases: vec![
+                repeated_case("cluster-a", 2, 2, Some("family")),
+                repeated_case("cluster-b", 0, 2, Some("family")),
+            ],
+        };
+
+        let line = suite
+            .repeat_ci_line()
+            .expect("repeated cases have a summary");
+        assert!(line.contains("pass rate 50%"), "got: {line}");
+        assert!(
+            line.contains("insufficient independent units"),
+            "got: {line}"
+        );
+        assert!(!line.contains("NaN"), "got: {line}");
     }
 
     #[test]

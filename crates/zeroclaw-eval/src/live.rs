@@ -415,53 +415,48 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_runs_are_isolated() {
-        // Run 1 writes marker.txt into its temp workspace; run 2 asserts the file
-        // is absent. A fresh workspace per run means run 2 cannot see run 1's file.
-        let write_case: LlmTrace = serde_json::from_str(
-            r#"{ "model_name": "iso-write", "turns": [{ "user_input": "write" }],
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The first provider writes marker.txt and therefore fails file_absent.
+        // The second provider does nothing and can pass only if the production
+        // repeat orchestrator gives it a fresh workspace.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "repeat-isolation", "repeat": 2,
+                 "turns": [{ "user_input": "run" }],
                  "tools": ["file_write"],
-                 "expects": { "workspace": { "file_exists": ["marker.txt"] } } }"#,
+                 "expects": { "workspace": { "file_absent": ["marker.txt"] } } }"#,
         )
         .unwrap();
-        let write_deps = live_deps(
-            |_| {
-                Ok(driver_provider(
-                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&provider_calls);
+        let deps = live_deps(
+            move |_| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok(driver_provider(
+                        r#"{"model_name":"d","turns":[{"user_input":"","steps":[
                 {"response":{"type":"tool_calls","tool_calls":[{"id":"1","name":"file_write","arguments":{"path":"marker.txt","content":"hi"}}]}},
                 {"response":{"type":"text","content":"done"}}
             ]}]}"#,
-                ))
+                    ))
+                } else {
+                    Ok(driver_provider(
+                        r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"noop"}}]}]}"#,
+                    ))
+                }
             },
             vec!["file_write".to_string()],
             Duration::from_secs(5),
         );
-        let out1 = run_live_case(&write_case, &write_deps).await.unwrap();
-        assert!(
-            out1.grades.iter().all(|g| g.passed),
-            "run 1 must write marker.txt into its own workspace: {:?}",
-            out1.grades
-        );
 
-        // Run 2: a fresh case that does nothing and asserts marker.txt is absent.
-        let absent_case: LlmTrace = serde_json::from_str(
-            r#"{ "model_name": "iso-absent", "turns": [{ "user_input": "noop" }],
-                 "expects": { "workspace": { "file_absent": ["marker.txt"] } } }"#,
-        )
-        .unwrap();
-        let noop_deps = live_deps(
-            |_| {
-                Ok(driver_provider(
-                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"noop"}}]}]}"#,
-                ))
-            },
-            Vec::new(),
-            Duration::from_secs(5),
-        );
-        let out2 = run_live_case(&absent_case, &noop_deps).await.unwrap();
-        assert!(
-            out2.grades.iter().all(|g| g.passed),
-            "run 2's fresh workspace must not contain run 1's marker.txt: {:?}",
-            out2.grades
+        let (_, repeat) = crate::runner::run_case_repeated(&trace, &deps)
+            .await
+            .unwrap();
+        let repeat = repeat.expect("repeat=2 must produce statistics");
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            repeat.passes, 1,
+            "the no-op repetition passes only when it cannot see the first run's marker"
         );
     }
 }
