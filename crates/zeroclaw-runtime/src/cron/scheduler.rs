@@ -27,6 +27,12 @@ const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 // run, not to police normal agent runtime.
 const AGENT_JOB_TIMEOUT_SECS: u64 = 1800;
 const AGENT_JOB_TIMEOUT_PREFIX: &str = "agent job timed out after ";
+// `purge_isolated_session`'s best-effort backend call (subprocess, network,
+// or lock-contended local store) gets its own short deadline so a stalled
+// backend can never delay `execute_and_persist_job`'s persist/`release_job`
+// critical path. Cleanup is still attempted; exceeding this deadline
+// abandons it (logged) rather than blocking the unbounded lock-release path.
+const ISOLATED_SESSION_PURGE_TIMEOUT: Duration = Duration::from_secs(3);
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -737,11 +743,32 @@ fn resolve_agent_job_timeout(config: &Config, agent_alias: &str) -> Duration {
     )
 }
 
+// Test-only seam: lets a scheduler test substitute the isolated-session
+// purge's `Memory` handle with a deliberately-stalling double, so
+// `ISOLATED_SESSION_PURGE_TIMEOUT` can be exercised deterministically
+// without depending on a real backend's timing. Unset in production and in
+// every test that doesn't explicitly scope it; `try_with` then fails closed
+// to the real `create_memory_for_agent` construction below.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PURGE_MEMORY: Arc<dyn zeroclaw_api::memory_traits::Memory>;
+}
+
 /// Best-effort purge of an Isolated cron run's per-run memory session. The
 /// Isolated session path (`cron-{run_session_id}`) is unique per run, so a
 /// timed-out run whose dropped agent future may still have an in-flight
 /// blocking sqlite write races only its own abandoned rows; a no-op for
 /// Main-target runs (they share the stable `main` session).
+///
+/// This is called from `run_agent_job_with_timeout`'s timeout and
+/// run-error branches, both of which are still awaited by
+/// `execute_and_persist_job` before it persists the result and calls
+/// `release_job`. A stalled backend (network stall, subprocess hang, lock
+/// contention) must never delay that critical path indefinitely, so the
+/// whole purge attempt (memory construction plus the backend call) runs
+/// under `ISOLATED_SESSION_PURGE_TIMEOUT`. On timeout the cleanup is
+/// abandoned (logged at WARN) rather than awaited further; the successful,
+/// fast-cleanup path is unaffected.
 async fn purge_isolated_session(
     config: &Config,
     job: &CronJob,
@@ -755,16 +782,43 @@ async fn purge_isolated_session(
         "cli:{}",
         session_path.display()
     ));
-    if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
-        config,
-        agent_alias,
-        config
-            .model_provider_for_agent(agent_alias)
-            .and_then(|e| e.api_key.as_deref()),
-    )
-    .await
+
+    let purge = async {
+        #[cfg(test)]
+        if let Ok(mem) = TEST_PURGE_MEMORY.try_with(Arc::clone) {
+            let _ = mem.purge_session(&mem_session_key).await;
+            return;
+        }
+
+        if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
+            config,
+            agent_alias,
+            config
+                .model_provider_for_agent(agent_alias)
+                .and_then(|e| e.api_key.as_deref()),
+        )
+        .await
+        {
+            let _ = mem.purge_session(&mem_session_key).await;
+        }
+    };
+
+    if time::timeout(ISOLATED_SESSION_PURGE_TIMEOUT, purge)
+        .await
+        .is_err()
     {
-        let _ = mem.purge_session(&mem_session_key).await;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "job_id": job.id,
+                    "agent": agent_alias,
+                    "timeout_secs": ISOLATED_SESSION_PURGE_TIMEOUT.as_secs(),
+                })),
+            "Cron job: isolated-session purge exceeded its cleanup deadline; abandoning \
+             best-effort cleanup so lock release is not delayed"
+        );
     }
 }
 
@@ -2018,6 +2072,212 @@ mod tests {
         );
     }
 
+    /// Stands in for a memory backend whose `purge_session` never returns
+    /// (a wedged subprocess, a stalled network call, or lock contention).
+    /// `purge_isolated_session` only ever calls `purge_session` on this
+    /// double, so every other trait method is a trivial stub.
+    #[derive(Default)]
+    struct StallingPurgeMemory {
+        purge_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StallingPurgeMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "stalling-purge-memory"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ::zeroclaw_api::memory_traits::Memory for StallingPurgeMemory {
+        fn name(&self) -> &str {
+            "stalling-purge-memory"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&::zeroclaw_api::memory_traits::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        /// Never resolves: the stalled backend that
+        /// `ISOLATED_SESSION_PURGE_TIMEOUT` must bound.
+        async fn purge_session(&self, _session_id: &str) -> anyhow::Result<usize> {
+            self.purge_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!("purge_session must never resolve in this test double");
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_and_persist_job_releases_lock_when_isolated_purge_stalls() {
+        // Same setup as `execute_and_persist_job_releases_lock_after_agent_timeout`
+        // (hung provider -> real agent-run timeout -> `purge_isolated_session`),
+        // except the isolated-session purge backend itself now stalls forever.
+        // The local sqlite test backend used by the sibling test purges fast
+        // and so cannot exercise this failure mode; this double proves the
+        // lock-release path stays bounded even when cleanup does not.
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("isolated-purge-stall-release");
+        let stalling_memory: Arc<dyn ::zeroclaw_api::memory_traits::Memory> =
+            Arc::new(StallingPurgeMemory::default());
+
+        let started = std::time::Instant::now();
+        // Also bound the call from outside `execute_and_persist_job`: if
+        // the fix regressed back to an unbounded await on the stalled
+        // purge, this test must fail promptly rather than hang the suite.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            TEST_PURGE_MEMORY.scope(
+                stalling_memory,
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let (job_id, success, output) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "execute_and_persist_job did not return within the outer test bound \
+                 ({elapsed:?}); a stalled isolated-session purge must not block \
+                 persist/release_job"
+            )
+        });
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "execute_and_persist_job did not return promptly despite a stalled \
+             isolated-session purge: {elapsed:?}"
+        );
+
+        // The lock must be released even though the isolated-session purge
+        // backend never returns: cleanup is bounded by
+        // `ISOLATED_SESSION_PURGE_TIMEOUT` and abandoned rather than awaited
+        // indefinitely, so `execute_and_persist_job` still reaches
+        // `persist_job_result`/`release_job`.
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released even when isolated-session cleanup stalls"
+        );
+    }
+
     #[tokio::test]
     async fn execute_job_with_retry_does_not_retry_agent_timeout() {
         let tmp = TempDir::new().unwrap();
@@ -2085,6 +2345,36 @@ mod tests {
         config.runtime_profiles.insert(
             TEST_AGENT.to_string(),
             zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            resolve_agent_job_timeout(&config, TEST_AGENT),
+            Duration::from_secs(AGENT_JOB_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn resolve_agent_job_timeout_falls_back_to_default_with_zero_override() {
+        // `agentic_timeout_secs = 0` is not validated away at config load, so
+        // the resolver must treat it as unset rather than an immediate,
+        // non-retryable timeout (an agent-run timeout is deliberately not
+        // retried, unlike shell-job/delegate timeouts elsewhere in the
+        // config surface, so `Some(0)` must never reach `time::timeout` as a
+        // real zero-duration deadline).
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                agentic_timeout_secs: Some(0),
+                ..Default::default()
+            },
         );
         config.agents.insert(
             TEST_AGENT.to_string(),
