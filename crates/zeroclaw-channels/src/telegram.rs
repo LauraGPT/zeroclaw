@@ -1523,10 +1523,14 @@ impl TelegramChannel {
     /// manager `try_parse_voice_message` requires are both present; a
     /// `document`/`photo` payload (`parse_attachment_metadata`) only
     /// when the workspace dir `try_parse_attachment_message` downloads
-    /// into is set. The voice `max_duration_secs` cap is deliberately
-    /// NOT mirrored: it is content-dependent and over-limit voice notes
-    /// are silently dropped even for authorized senders, so silence is
-    /// already the shared behavior there.
+    /// into is set. This only covers the config-shaped bails (is
+    /// transcription/workspace even configured); the content-shaped
+    /// permanent bails — over-`max_duration_secs` voice/audio and
+    /// over-`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES` attachments — are checked
+    /// separately by `message_exceeds_parser_limits`, kept out of this
+    /// predicate specifically so a captioned `/bind <code>` still reaches
+    /// the pairing branch in `handle_unauthorized_message` even on media
+    /// those limits would otherwise reject.
     fn message_has_processable_content(&self, message: &serde_json::Value) -> bool {
         if message.get("text").is_some() {
             return true;
@@ -1539,6 +1543,35 @@ impl TelegramChannel {
         }
         self.workspace_dir.is_some()
             && (message.get("document").is_some() || message.get("photo").is_some())
+    }
+
+    /// True when `message` is a voice/audio or document/photo update that
+    /// one of the update parsers would permanently bail on for size or
+    /// duration alone, independent of authorization — mirroring
+    /// `try_parse_voice_message`'s over-`max_duration_secs` bail (using
+    /// the same `self.transcription` config the parser reads) and
+    /// `try_parse_attachment_message`'s over-`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES`
+    /// bail (the same constant the parser checks). An authorized sender's
+    /// identical update would be silently dropped for this reason, so an
+    /// unauthorized sender must not receive the approval notice for it
+    /// either. Deliberately excluded from `message_has_processable_content`
+    /// so the captioned `/bind <code>` pairing path in
+    /// `handle_unauthorized_message` — checked before this — is not
+    /// gated by it.
+    fn message_exceeds_parser_limits(&self, message: &serde_json::Value) -> bool {
+        if let Some((_, duration)) = Self::parse_voice_metadata(message)
+            && let Some(config) = self.transcription.as_ref()
+            && duration > config.max_duration_secs
+        {
+            return true;
+        }
+        if let Some(attachment) = Self::parse_attachment_metadata(message)
+            && let Some(size) = attachment.file_size
+            && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
+        {
+            return true;
+        }
+        false
     }
 
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
@@ -1692,6 +1725,16 @@ impl TelegramChannel {
                     ))
                     .await;
             }
+            return;
+        }
+
+        // No bind code — this is heading for the approval notice. Bail
+        // silently here if the parsers would have permanently rejected
+        // this exact update on size/duration alone: an authorized
+        // sender's identical voice/attachment would be dropped for the
+        // same reason, so the notice must not promise processing that
+        // can never happen.
+        if self.message_exceeds_parser_limits(message) {
             return;
         }
 
@@ -7027,13 +7070,25 @@ mod tests {
     /// only matches requests whose body contains every fragment, so a
     /// send with the wrong chat or the wrong message goes unmatched and
     /// fails the expectation instead of passing vacuously.
+    ///
+    /// That narrowing has a gap of its own: a *wrong* `sendMessage` (bad
+    /// chat, bad text) that misses every fragment mock still goes
+    /// unmatched by the mock above, gets wiremock's default 404, and is
+    /// silently swallowed by the production `let _ = self.send(...)` —
+    /// so the test would still pass even though an extra, unexpected
+    /// notice went out. When `body_fragments` is non-empty, also mount a
+    /// catch-all matching any `sendMessage` that does NOT contain every
+    /// expected fragment, with a zero-call expectation, so that stray
+    /// request fails the test instead of disappearing into a 404. (When
+    /// `body_fragments` is empty the primary mock above already matches —
+    /// and bounds — every `sendMessage`, so no catch-all is needed.)
     async fn mount_telegram_send_message_ok(
         mock_server: &wiremock::MockServer,
         expect_calls: u64,
         body_fragments: &[&str],
     ) {
         use wiremock::matchers::{body_string_contains, method, path_regex};
-        use wiremock::{Mock, ResponseTemplate};
+        use wiremock::{Mock, Request, ResponseTemplate};
 
         let mut mock = Mock::given(method("POST")).and(path_regex(r"/bot[^/]+/sendMessage$"));
         for fragment in body_fragments {
@@ -7045,6 +7100,24 @@ mod tests {
         .expect(expect_calls)
         .mount(mock_server)
         .await;
+
+        if !body_fragments.is_empty() {
+            let expected_fragments: Vec<String> =
+                body_fragments.iter().map(|f| f.to_string()).collect();
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/sendMessage$"))
+                .and(move |request: &Request| {
+                    let body = std::str::from_utf8(&request.body).unwrap_or_default();
+                    !expected_fragments.iter().all(|f| body.contains(f.as_str()))
+                })
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok": true, "result": {}})),
+                )
+                .expect(0)
+                .mount(mock_server)
+                .await;
+        }
     }
 
     /// Every main-loop `getUpdates` request body (`"timeout": 30`, excluding
@@ -7503,6 +7576,50 @@ mod tests {
             document_update,
             |ch| ch.with_workspace_dir(workspace_path),
             1,
+        )
+        .await;
+    }
+
+    /// An unauthorized-sender VOICE update whose duration exceeds the
+    /// transcription config's `max_duration_secs` must be dropped exactly
+    /// like an authorized sender's identical over-duration voice note:
+    /// `try_parse_voice_message` bails on it permanently before
+    /// `handle_unauthorized_message` is even reached, so
+    /// `message_exceeds_parser_limits` must keep it out of the approval
+    /// notice too — no download, no notice, offset still advances.
+    #[tokio::test]
+    async fn listen_skips_unauthorized_over_duration_voice_update_without_notice() {
+        let mut voice_update = telegram_voice_update(5_100, 31, 1_020, "mallory", "voice999");
+        voice_update["message"]["voice"]["duration"] = serde_json::json!(200);
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        assert_listen_skips_unauthorized_update(voice_update, |ch| ch.with_transcription(tc), 0)
+            .await;
+    }
+
+    /// An unauthorized-sender DOCUMENT update whose size exceeds
+    /// `TELEGRAM_MAX_FILE_DOWNLOAD_BYTES` must be dropped exactly like an
+    /// authorized sender's identical oversized attachment:
+    /// `try_parse_attachment_message` bails on it permanently before
+    /// `handle_unauthorized_message` is even reached, so
+    /// `message_exceeds_parser_limits` must keep it out of the approval
+    /// notice too — no download, no notice, offset still advances.
+    #[tokio::test]
+    async fn listen_skips_unauthorized_oversized_document_update_without_notice() {
+        let mut document_update =
+            telegram_document_update(6_100, 41, 1_030, "mallory", "file000", "huge.pdf");
+        document_update["message"]["document"]["file_size"] =
+            serde_json::json!(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1);
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().to_path_buf();
+        assert_listen_skips_unauthorized_update(
+            document_update,
+            |ch| ch.with_workspace_dir(workspace_path),
+            0,
         )
         .await;
     }
