@@ -21117,8 +21117,23 @@ fn restore_onepassword_references_for_save(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PostReplaceSync {
+    Real,
+    #[cfg(test)]
+    FailForTest,
+}
+
 /// Atomic write shared by `save()` and `save_dirty()`.
 async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+    write_config_atomically_with_sync(config_path, toml_str, PostReplaceSync::Real).await
+}
+
+async fn write_config_atomically_with_sync(
+    config_path: &Path,
+    toml_str: &str,
+    post_replace_sync: PostReplaceSync,
+) -> Result<()> {
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -21129,6 +21144,11 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
             parent_dir.display()
         )
     })?;
+
+    // Open and sync the directory before replacement so permission, handle,
+    // and platform failures are reported while disk and live config are still
+    // unchanged. A second sync after rename establishes rename durability.
+    sync_directory(parent_dir).await?;
 
     let file_name = config_path
         .file_name()
@@ -21195,9 +21215,34 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
         }
     }
 
-    sync_directory(parent_dir).await?;
-
-    if had_existing_config {
+    let post_replace_sync_result = match post_replace_sync {
+        PostReplaceSync::Real => sync_directory(parent_dir).await,
+        #[cfg(test)]
+        PostReplaceSync::FailForTest => Err(anyhow::Error::msg(
+            "injected post-replace directory sync failure",
+        )),
+    };
+    if let Err(err) = post_replace_sync_result {
+        // The rename is already visible and the replacement file itself was
+        // fsynced before it moved. Returning an error here would make callers
+        // keep the old live snapshot even though disk contains the new one.
+        // Report the durability uncertainty, keep the backup for recovery,
+        // and classify the save as committed so save-then-swap callers install
+        // the matching snapshot.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "config.directory_sync_after_replace_failed",
+                    "path": config_path.display().to_string(),
+                    "backup_path": had_existing_config
+                        .then(|| backup_path.display().to_string()),
+                    "error": err.to_string(),
+                })),
+            "Config replacement committed but directory durability sync failed; keeping backup"
+        );
+    } else if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
     }
 
@@ -25631,6 +25676,44 @@ default_temperature = 0.7
         fs::create_dir_all(&dir).await.unwrap();
 
         sync_directory(&dir).await.unwrap();
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn post_replace_sync_failure_keeps_disk_commit_and_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_post_replace_sync_failure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+
+        let result = write_config_atomically_with_sync(
+            &config_path,
+            "schema_version = 2\n",
+            PostReplaceSync::FailForTest,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a post-replace sync fault must report a committed save: {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "the successful rename is the canonical on-disk result"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup_path).await.unwrap(),
+            "schema_version = 1\n",
+            "durability uncertainty must retain the pre-replace backup"
+        );
 
         let _ = fs::remove_dir_all(&dir).await;
     }
