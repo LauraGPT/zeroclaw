@@ -18825,8 +18825,9 @@ impl Config {
             warnings.push(crate::validation_warnings::ValidationWarning::new(
                 "security_audit_enabled_has_no_effect",
                 "security.audit.enabled=true has no effect: command audit logging is not wired \
-                 into the runtime yet (see #9391/#9086). No commands are being written to \
-                 audit.log."
+                 into the runtime yet. No commands are being written to audit.log; use an \
+                 external supervisor or logging wrapper that observes the ZeroClaw process, \
+                 or enable OS-level process accounting."
                     .to_string(),
                 "security.audit.enabled",
             ));
@@ -30595,17 +30596,22 @@ group_policy = "disabled"
              audit writer exists"
         );
 
-        // Also confirm it holds through a full config load with no
+        // Also confirm it holds through TOML deserialization with no
         // [security.audit] section present (the common case).
-        let config = Config::default();
+        let config: Config = toml::from_str("").expect("empty TOML loads with defaults");
         assert!(!config.security.audit.enabled);
     }
 
     #[test]
     async fn collect_warnings_flags_explicit_audit_enabled() {
-        let mut config = Config::default();
+        let mut config: Config = toml::from_str(
+            r#"
+[security.audit]
+enabled = true
+"#,
+        )
+        .expect("explicit audit setting loads from TOML");
         suppress_semantic_memory_warning(&mut config);
-        config.security.audit.enabled = true;
 
         let warnings = warnings_with_code(&config, "security_audit_enabled_has_no_effect");
         assert_eq!(warnings.len(), 1);
