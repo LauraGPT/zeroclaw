@@ -2,6 +2,7 @@
 //! These functions were originally in `channels/mod.rs` but live here to
 //! break a circular dependency between the channels and agent modules.
 
+use crate::agent::prompt::{TIMESTAMP_ORIENTATION, append_timestamp_orientation};
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -10,7 +11,6 @@ use crate::skills::Skill;
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
-const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
 const TRUNCATION_MARKER: &str = "\n\n[System prompt truncated to fit context budget]\n";
 
 fn load_openclaw_bootstrap_files(
@@ -427,7 +427,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // Because truncation below keeps only the *top* portion of the prompt,
     // the orientation is re-emitted inside the retained budget after any
     // truncation rather than left in the truncatable tail.
-    prompt.push_str(TIMESTAMP_ORIENTATION);
+    append_timestamp_orientation(&mut prompt);
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────
     if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
@@ -445,7 +445,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
             }
             prompt.truncate(end);
             prompt.push_str(TRUNCATION_MARKER);
-            prompt.push_str(TIMESTAMP_ORIENTATION);
+            append_timestamp_orientation(&mut prompt);
         } else {
             // When the budget cannot hold both retained content and the
             // critical tail, prioritize as much of the orientation as fits.

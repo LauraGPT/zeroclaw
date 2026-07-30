@@ -1,6 +1,6 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
-use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::agent::prompt::{PromptContext, SystemPromptBuilder, append_timestamp_orientation};
 use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -936,12 +936,9 @@ impl Agent {
     }
 
     /// Prefixes a user message with the current date/time in the labeled
-    /// shape both the streamed and non-streamed turn paths store in
-    /// history, so small models see ordinary conversation metadata rather
-    /// than an unlabeled timestamp that reads as log output. The tool-loop
-    /// engine (loop_.rs) and the channels orchestrator still build a bare
-    /// `[timestamp] message` shape of their own; unifying those is
-    /// deliberately out of scope here.
+    /// shape both embedded Agent turn paths store in history, including the
+    /// streamed path used by RPC and ACP. Other runtime owners format their
+    /// own user-message envelopes independently.
     fn enrich_user_message(&self, user_message: &str) -> String {
         let now = self.current_turn_datetime();
         let (year, month, day) = (now.year(), now.month(), now.day());
@@ -1903,6 +1900,7 @@ impl Agent {
             autonomy_level: self.autonomy_level,
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
+        append_timestamp_orientation(&mut prompt);
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
@@ -4392,6 +4390,42 @@ mod tests {
                 builder = builder.multimodal_config(mm);
             }
             builder.build().expect("agent builder should succeed")
+        }
+
+        #[tokio::test]
+        async fn streamed_agent_request_pairs_timestamp_orientation_with_labeled_user_text() {
+            let (provider, captured) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, Vec::new());
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+
+            agent
+                .turn_streamed_with_steering_state("hi from zerocode", event_tx, None, None)
+                .await
+                .expect("streamed Agent turn should succeed");
+
+            let captured = captured.lock();
+            let first_request = captured.first().expect("provider request captured");
+            let system = first_request
+                .iter()
+                .find(|message| message.role == "system")
+                .expect("system prompt");
+            let user = first_request
+                .iter()
+                .find(|message| message.role == "user")
+                .expect("user message");
+
+            assert!(
+                system
+                    .content
+                    .contains("timestamp metadata added by the runtime"),
+                "Agent prompt must explain its runtime-owned user envelope"
+            );
+            assert!(
+                user.content.starts_with("[CURRENT DATE & TIME:")
+                    && user.content.ends_with("\n\nhi from zerocode"),
+                "provider must receive the labeled envelope and original text: {}",
+                user.content
+            );
         }
 
         #[test]
