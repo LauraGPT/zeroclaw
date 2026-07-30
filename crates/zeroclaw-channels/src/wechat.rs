@@ -148,6 +148,56 @@ struct InboundAttachmentSpec {
     file_name: String,
 }
 
+/// Outcome of attempting to build inbound attachment content for a
+/// message, distinguishing "nothing to do" from a failure, and a
+/// retryable failure from a permanent one.
+///
+/// The listener uses this to decide whether it may commit `next_cursor`
+/// for the batch: `Retryable` must hold the cursor so the message is
+/// re-fetched (and the attachment retried) after a restart; `Permanent`
+/// and `None` must not hold the cursor, since nothing further will
+/// change on retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachmentDisposition {
+    /// The message carries no fetchable attachment (or no workspace
+    /// directory is configured for downloads). Not a failure.
+    None,
+    /// Attachment content was built successfully.
+    Ready(String),
+    /// Building the attachment failed for a condition that may clear up
+    /// on its own (see `AttachmentBuildFailure::Retryable`).
+    Retryable,
+    /// Building the attachment failed for a condition retrying will not
+    /// fix (see `AttachmentBuildFailure::Permanent`).
+    Permanent,
+}
+
+/// Why downloading/decrypting an inbound attachment failed, classified
+/// so the caller can pick a retryable-vs-permanent `AttachmentDisposition`.
+///
+/// Provisional default mapping, pending reviewer confirmation. Network
+/// and transport-layer failures are `Retryable`: connection errors,
+/// request timeouts, CDN HTTP 5xx, CDN HTTP 429, and transient local
+/// I/O errors on the workspace write. Content and parse-layer failures
+/// are `Permanent`: CDN HTTP 4xx other than 429 (the object is gone),
+/// decrypt/decode failures, and unsupported/oversized content. When an
+/// error does not map cleanly to either bucket, the default is
+/// `Retryable` for network/transport-layer errors and `Permanent` for
+/// content/parse-layer errors.
+#[derive(Debug)]
+enum AttachmentBuildFailure {
+    Retryable(String),
+    Permanent(String),
+}
+
+impl std::fmt::Display for AttachmentBuildFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(msg) | Self::Permanent(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UploadedWeChatMedia {
     encrypted_query_param: String,
@@ -1513,32 +1563,55 @@ impl WeChatChannel {
     async fn download_inbound_attachment(
         &self,
         spec: &InboundAttachmentSpec,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, AttachmentBuildFailure> {
         let resp = self
             .client
             .get(self.cdn_download_url(&spec.encrypted_query_param))
             .timeout(API_TIMEOUT)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                // Connection error or request timeout: transport-layer,
+                // may succeed on retry.
+                AttachmentBuildFailure::Retryable(format!("attachment request failed: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("attachment download failed ({status}): {body}");
+            let message = format!("attachment download failed ({status}): {body}");
+            // CDN 5xx and 429 are treated as transient; every other 4xx
+            // (e.g. 404/410) means the object is gone and won't come back.
+            return Err(if status.is_server_error() || status.as_u16() == 429 {
+                AttachmentBuildFailure::Retryable(message)
+            } else {
+                AttachmentBuildFailure::Permanent(message)
+            });
         }
 
-        let bytes = resp.bytes().await?.to_vec();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| {
+                AttachmentBuildFailure::Retryable(format!("attachment body read failed: {e}"))
+            })?
+            .to_vec();
         if bytes.len() as u64 > WECHAT_MEDIA_MAX_BYTES {
-            anyhow::bail!(
+            // Oversized content: unsupported, won't shrink on retry.
+            return Err(AttachmentBuildFailure::Permanent(format!(
                 "inbound attachment exceeds {} MB limit",
                 WECHAT_MEDIA_MAX_BYTES / (1024 * 1024)
-            );
+            )));
         }
 
         match spec.aes_key.as_deref() {
             Some(aes_key) if !aes_key.is_empty() => {
-                let key = parse_aes_key(aes_key)?;
+                // Decrypt/decode failures are content-layer: corrupt or
+                // undecryptable content will not fix itself on retry.
+                let key = parse_aes_key(aes_key)
+                    .map_err(|e| AttachmentBuildFailure::Permanent(e.to_string()))?;
                 decrypt_aes_ecb(&bytes, &key)
+                    .map_err(|e| AttachmentBuildFailure::Permanent(e.to_string()))
             }
             _ => Ok(bytes),
         }
@@ -1548,20 +1621,30 @@ impl WeChatChannel {
         &self,
         items: &[serde_json::Value],
         message_id: &str,
-    ) -> Option<String> {
-        let workspace_dir = self.workspace_dir.as_ref()?;
-        let spec = Self::find_inbound_attachment(items, message_id)?;
+    ) -> AttachmentDisposition {
+        let Some(workspace_dir) = self.workspace_dir.as_ref() else {
+            return AttachmentDisposition::None;
+        };
+        let Some(spec) = Self::find_inbound_attachment(items, message_id) else {
+            return AttachmentDisposition::None;
+        };
         let bytes = match self.download_inbound_attachment(&spec).await {
             Ok(bytes) => bytes,
-            Err(err) => {
+            Err(failure) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                        .with_attrs(::serde_json::json!({
+                            "error": failure.to_string(),
+                            "retryable": matches!(failure, AttachmentBuildFailure::Retryable(_)),
+                        })),
                     "attachment download skipped"
                 );
-                return None;
+                return match failure {
+                    AttachmentBuildFailure::Retryable(_) => AttachmentDisposition::Retryable,
+                    AttachmentBuildFailure::Permanent(_) => AttachmentDisposition::Permanent,
+                };
             }
         };
 
@@ -1574,7 +1657,9 @@ impl WeChatChannel {
                     .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                 "Failed to create WeChat attachment dir"
             );
-            return None;
+            // io::Error on the workspace side: transient local I/O per the
+            // default mapping, so treat as retryable.
+            return AttachmentDisposition::Retryable;
         }
 
         let local_path = save_dir.join(&spec.file_name);
@@ -1588,10 +1673,12 @@ impl WeChatChannel {
                     local_path.display()
                 )
             );
-            return None;
+            // io::Error on the write itself: transient local I/O per the
+            // default mapping, so treat as retryable.
+            return AttachmentDisposition::Retryable;
         }
 
-        Some(format_attachment_content(
+        AttachmentDisposition::Ready(format_attachment_content(
             spec.kind,
             &spec.file_name,
             &local_path,
@@ -2342,6 +2429,15 @@ impl Channel for WeChatChannel {
                 .cloned()
                 .unwrap_or_default();
 
+            // Set when any message in this batch hit a retryable
+            // attachment-build failure (see `AttachmentDisposition::Retryable`).
+            // Checked at the commit site below: a retryable failure must
+            // withhold `next_cursor` so the whole batch is re-fetched, and
+            // the attachment retried, after a restart. A permanent failure
+            // does not set this: holding the cursor forever for an
+            // attachment that will never succeed would wedge the listener.
+            let mut batch_has_retryable_attachment_failure = false;
+
             for msg in &msgs {
                 let from_user_id = msg
                     .get("from_user_id")
@@ -2378,8 +2474,17 @@ impl Channel for WeChatChannel {
                     continue;
                 }
 
-                let attachment_content =
+                let attachment_disposition =
                     self.try_build_attachment_content(&items, &message_id).await;
+                if attachment_disposition == AttachmentDisposition::Retryable {
+                    batch_has_retryable_attachment_failure = true;
+                }
+                let attachment_content = match attachment_disposition {
+                    AttachmentDisposition::Ready(marker) => Some(marker),
+                    AttachmentDisposition::None
+                    | AttachmentDisposition::Retryable
+                    | AttachmentDisposition::Permanent => None,
+                };
                 let content = match (attachment_content, text.is_empty()) {
                     (Some(marker), true) => marker,
                     (Some(marker), false) => format!("{marker}\n\n{text}"),
@@ -2433,7 +2538,16 @@ impl Channel for WeChatChannel {
             // There is no inbound dedup, so redelivery after a restart is
             // possible (at-least-once); that trade is intentional and
             // preferable to silent message loss.
-            if let Some(new_cursor) = next_cursor {
+            //
+            // A batch that hit a retryable attachment failure is held back
+            // the same way: committing `next_cursor` here would permanently
+            // skip the attachment on restart, since the batch would never
+            // be re-fetched. A permanent attachment failure does not hold
+            // the cursor: the attachment is genuinely unfetchable, and
+            // holding forever would wedge the listener on it.
+            if let Some(new_cursor) = next_cursor
+                && !batch_has_retryable_attachment_failure
+            {
                 cursor = new_cursor;
                 *self.cursor.lock() = cursor.clone();
                 self.save_sync_data();
@@ -3320,6 +3434,19 @@ mod tests {
         })
     }
 
+    /// Like `wechat_channel_for_mock`, but also points the CDN base URL at
+    /// the mock server and configures a workspace directory so inbound
+    /// attachments can be downloaded and saved.
+    fn wechat_channel_for_mock_with_workspace(
+        state_dir: PathBuf,
+        workspace_dir: PathBuf,
+        mock_base_url: String,
+    ) -> WeChatChannel {
+        let mut ch = wechat_channel_for_mock(state_dir, mock_base_url.clone());
+        ch.cdn_base_url = mock_base_url;
+        ch.with_workspace_dir(workspace_dir)
+    }
+
     /// Regression test for lost inbound batches: if the very first
     /// `tx.send` in a batch fails (receiver gone), `listen()` must return without ever
     /// committing the cursor the response carried — otherwise a crash
@@ -3572,6 +3699,249 @@ mod tests {
             *probe.cursor.lock(),
             "original_cursor",
             "mid-batch save must not have leaked the uncommitted new cursor"
+        );
+    }
+
+    /// Regression for the reviewer-flagged attachment-loss bug: a batch
+    /// carrying a text-plus-attachment message where the attachment
+    /// download fails retryably (a transient CDN 503) must not let
+    /// `next_cursor` commit. Delivering the text and moving the cursor
+    /// on would permanently drop the attachment, since a redelivered
+    /// message never happens without inbound dedup.
+    ///
+    /// This drives an actual reload: after the first pass, a fresh
+    /// `WeChatChannel` is built from the persisted state dir exactly like
+    /// a supervised restart, and the CDN is made to succeed. The same
+    /// batch is re-fetched (because the cursor never advanced) and the
+    /// attachment is delivered.
+    #[tokio::test]
+    async fn listen_holds_cursor_on_retryable_attachment_failure_and_recovers_after_reload() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        let attachment_batch = || {
+            getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )
+        };
+
+        // getupdates: same batch on the first pass and on the reload pass
+        // below (the server still has it buffered, since the cursor
+        // never advances past it until the attachment succeeds).
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(attachment_batch()))
+            .mount(&mock_server)
+            .await;
+
+        // CDN: retryable failure (503) on the first download attempt,
+        // then succeeds on every attempt after.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for first-pass message")
+            .expect("channel closed before first-pass message");
+        assert_eq!(first.sender, "user_a");
+        assert_eq!(
+            first.content, "hello",
+            "a retryable attachment failure must not fabricate attachment content"
+        );
+
+        // We have what we need from this pass; stop the listener rather
+        // than let it keep polling with the (deliberately) exhausted CDN
+        // failure mock.
+        handle.abort();
+        let _ = handle.await;
+
+        // Probe through the production reload path — exactly what a
+        // supervised restart runs.
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "original_cursor",
+            "cursor must not advance past a batch with a retryable attachment failure"
+        );
+
+        // Simulate the restart: a fresh channel built from the persisted
+        // state dir re-polls with the same (uncommitted) cursor, so the
+        // server hands back the same batch. This time the CDN succeeds.
+        let ch2 = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        assert_eq!(*ch2.cursor.lock(), "original_cursor");
+        let ch2 = Arc::new(ch2);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(1);
+        let listen_ch2 = ch2.clone();
+        let handle2 = zeroclaw_spawn::spawn!(async move { listen_ch2.listen(tx2).await });
+
+        let second = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
+            .await
+            .expect("timed out waiting for reload-pass message")
+            .expect("channel closed before reload-pass message");
+        assert_eq!(second.sender, "user_a");
+        assert!(
+            second.content.contains("[IMAGE:"),
+            "attachment must be delivered once the CDN recovers, got: {}",
+            second.content
+        );
+
+        handle2.abort();
+        let _ = handle2.await;
+
+        let probe2 = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe2.cursor.lock(),
+            "cursor_after_batch",
+            "cursor must advance once the batch delivers with no retryable failure left"
+        );
+    }
+
+    /// Companion to the retryable-failure regression above: a permanent
+    /// attachment failure (CDN 404, object gone) must NOT hold the
+    /// cursor. Holding it forever for an attachment that will never
+    /// succeed would wedge the listener on that batch.
+    #[tokio::test]
+    async fn listen_advances_cursor_when_attachment_fails_permanently() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        // CDN: the object is gone (404) on every attempt.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed before message");
+        assert_eq!(first.sender, "user_a");
+        assert_eq!(
+            first.content, "hello",
+            "a permanent attachment failure delivers the text without the attachment"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "cursor_after_batch",
+            "a permanent attachment failure must not wedge the listener by holding the cursor"
         );
     }
 }
