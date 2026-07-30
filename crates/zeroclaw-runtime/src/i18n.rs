@@ -443,6 +443,35 @@ mod tests {
     }
 
     #[test]
+    fn disk_approval_override_cannot_rewrite_parser_commands() {
+        let sources = CliFtlSources {
+            locale: "es".to_string(),
+            disk: Some(
+                "channel-approval-reply-instruction-yesno = Traducido: { $always_command }, { $yes_command }, { $no_command }"
+                    .to_string(),
+            ),
+            builtin: builtin_cli_ftl_source("es"),
+        };
+        let token = "abc123";
+        let yes_command = format!("{token} yes");
+        let no_command = format!("{token} no");
+        let always_command = format!("{token} always");
+
+        let rendered = format_cli_string_with_args(
+            &sources,
+            "channel-approval-reply-instruction-yesno",
+            &[
+                ("yes_command", yes_command.as_str()),
+                ("no_command", no_command.as_str()),
+                ("always_command", always_command.as_str()),
+            ],
+        )
+        .expect("disk override should format");
+
+        assert_eq!(rendered, "Traducido: abc123 always, abc123 yes, abc123 no");
+    }
+
+    #[test]
     fn wechat_cli_strings_format_from_fluent() {
         let keys = [
             (
@@ -1182,12 +1211,10 @@ mod tests {
 
     #[test]
     fn channel_approval_keys_are_defined_in_every_locale() {
-        // Key-parity + keyword-preservation guard: every new
+        // Key-parity + command-preservation guard: every new
         // `channel-approval-*` key must be defined in all 5 committed
-        // locales, and the reply-keyword args (yes/no/always,
-        // approve/deny/always) — and the token/tool args — must survive
-        // translation verbatim, since `util::parse_approval_reply` (and
-        // Matrix's own parser) match on the literal ASCII words.
+        // locales, and the complete Rust-built reply commands — plus the
+        // tool arg — must survive translation verbatim.
         for (source, locale) in channel_approval_locale_sources() {
             for key in CHANNEL_APPROVAL_ARGLESS_KEYS {
                 let value = format_ftl_message(source, locale, key, &[])
@@ -1209,7 +1236,11 @@ mod tests {
                 source,
                 locale,
                 "channel-approval-reply-instruction-yesno",
-                &[("token", "abc123")],
+                &[
+                    ("yes_command", "abc123 yes"),
+                    ("no_command", "abc123 no"),
+                    ("always_command", "abc123 always"),
+                ],
             )
             .unwrap_or_else(|| {
                 panic!("{locale}: channel-approval-reply-instruction-yesno should be defined")
@@ -1225,7 +1256,11 @@ mod tests {
                 source,
                 locale,
                 "channel-approval-reply-instruction-approve-deny",
-                &[("token", "abc123")],
+                &[
+                    ("approve_command", "abc123 approve"),
+                    ("deny_command", "abc123 deny"),
+                    ("always_command", "abc123 always"),
+                ],
             )
             .unwrap_or_else(|| {
                 panic!(
@@ -1265,12 +1300,20 @@ mod tests {
             ),
             (
                 "channel-approval-reply-instruction-yesno",
-                &[("token", "abc123")],
+                &[
+                    ("yes_command", "abc123 yes"),
+                    ("no_command", "abc123 no"),
+                    ("always_command", "abc123 always"),
+                ],
                 "Reply: \"abc123 yes\", \"abc123 no\", or \"abc123 always\"",
             ),
             (
                 "channel-approval-reply-instruction-approve-deny",
-                &[("token", "abc123")],
+                &[
+                    ("approve_command", "abc123 approve"),
+                    ("deny_command", "abc123 deny"),
+                    ("always_command", "abc123 always"),
+                ],
                 "Reply `abc123 approve` / `abc123 deny` / `abc123 always`.",
             ),
             ("channel-telegram-approval-ack-approved", &[], "Approved"),
@@ -1333,11 +1376,19 @@ mod tests {
             ("channel-approval-title", &[("tool", "git")][..]),
             (
                 "channel-approval-reply-instruction-yesno",
-                &[("token", "abc123")][..],
+                &[
+                    ("yes_command", "abc123 yes"),
+                    ("no_command", "abc123 no"),
+                    ("always_command", "abc123 always"),
+                ][..],
             ),
             (
                 "channel-approval-reply-instruction-approve-deny",
-                &[("token", "abc123")][..],
+                &[
+                    ("approve_command", "abc123 approve"),
+                    ("deny_command", "abc123 deny"),
+                    ("always_command", "abc123 always"),
+                ][..],
             ),
         ] {
             let value = get_english_cli_string_with_args(key, args);

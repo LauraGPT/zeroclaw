@@ -344,6 +344,14 @@ pub(crate) fn new_approval_token() -> String {
         .collect()
 }
 
+pub(crate) const APPROVAL_REPLY_YES: &str = "yes";
+pub(crate) const APPROVAL_REPLY_YES_SHORT: &str = "y";
+pub(crate) const APPROVAL_REPLY_APPROVE: &str = "approve";
+pub(crate) const APPROVAL_REPLY_NO: &str = "no";
+pub(crate) const APPROVAL_REPLY_NO_SHORT: &str = "n";
+pub(crate) const APPROVAL_REPLY_DENY: &str = "deny";
+pub(crate) const APPROVAL_REPLY_ALWAYS: &str = "always";
+
 pub fn parse_approval_reply(
     text: &str,
 ) -> Option<(String, zeroclaw_api::channel::ChannelApprovalResponse)> {
@@ -356,9 +364,13 @@ pub fn parse_approval_reply(
     }
     let action_word = parts.next()?.split_whitespace().next()?;
     let response = match action_word {
-        "yes" | "y" | "approve" => ChannelApprovalResponse::Approve,
-        "no" | "n" | "deny" => ChannelApprovalResponse::Deny,
-        "always" => ChannelApprovalResponse::AlwaysApprove,
+        APPROVAL_REPLY_YES | APPROVAL_REPLY_YES_SHORT | APPROVAL_REPLY_APPROVE => {
+            ChannelApprovalResponse::Approve
+        }
+        APPROVAL_REPLY_NO | APPROVAL_REPLY_NO_SHORT | APPROVAL_REPLY_DENY => {
+            ChannelApprovalResponse::Deny
+        }
+        APPROVAL_REPLY_ALWAYS => ChannelApprovalResponse::AlwaysApprove,
         _ => return None,
     };
     Some((token, response))
@@ -386,9 +398,16 @@ pub(crate) fn build_yesno_approval_prompt(
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
+    let yes_command = format!("{token} {APPROVAL_REPLY_YES}");
+    let no_command = format!("{token} {APPROVAL_REPLY_NO}");
+    let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
     let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
         "channel-approval-reply-instruction-yesno",
-        &[("token", token)],
+        &[
+            ("yes_command", yes_command.as_str()),
+            ("no_command", no_command.as_str()),
+            ("always_command", always_command.as_str()),
+        ],
     );
     format!(
         "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
@@ -407,9 +426,16 @@ pub(crate) fn build_approve_deny_approval_prompt(
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
+    let approve_command = format!("{token} {APPROVAL_REPLY_APPROVE}");
+    let deny_command = format!("{token} {APPROVAL_REPLY_DENY}");
+    let always_command = format!("{token} {APPROVAL_REPLY_ALWAYS}");
     let reply = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
         "channel-approval-reply-instruction-approve-deny",
-        &[("token", token)],
+        &[
+            ("approve_command", approve_command.as_str()),
+            ("deny_command", deny_command.as_str()),
+            ("always_command", always_command.as_str()),
+        ],
     );
     format!(
         "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
@@ -741,16 +767,13 @@ mod tests {
     }
 
     #[test]
-    fn every_approval_key_referenced_by_adapters_resolves() {
-        // Catalogue guard: a typo'd Fluent key at any adapter call
-        // site would render the `{key}` missing-string sentinel at runtime
-        // and, for the adapters without a dedicated `request_approval` test
-        // (discord/slack/signal/whatsapp), be caught by nothing else.
+    fn literal_approval_keys_in_listed_adapter_sources_resolve() {
+        // Heuristic smoke guard for literal Fluent keys in the current
+        // adapter list. It complements, but does not replace, compile-time
+        // feature coverage or the explicit catalogue-key tests.
         // `include_str!` embeds each source at compile time regardless of its
-        // `#[cfg(feature = ...)]`, so this one always-compiled test covers
-        // every approval key used across all seven adapters — including the
-        // feature-gated ones that CI's default-feature test build never
-        // compiles.
+        // `#[cfg(feature = ...)]`, so this always-compiled test can catch
+        // literal-key typos in feature-gated sources.
         const SOURCES: &[&str] = &[
             include_str!("telegram.rs"),
             include_str!("discord/mod.rs"),
@@ -790,12 +813,18 @@ mod tests {
         for key in &keys {
             // Supply dummy values for every arg any approval key might take.
             // Fluent ignores args a message doesn't reference, so no-arg keys
-            // still resolve; an arg-requiring message (e.g. the `{ $token }`
-            // reply instructions or `{ $tool }` title) resolved with no args
+            // still resolve; arg-requiring messages resolved with no args
             // would otherwise fail to format and false-positive here.
             let resolved = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
                 key,
-                &[("token", "TKN"), ("tool", "TOOL")],
+                &[
+                    ("tool", "TOOL"),
+                    ("yes_command", "TKN yes"),
+                    ("no_command", "TKN no"),
+                    ("approve_command", "TKN approve"),
+                    ("deny_command", "TKN deny"),
+                    ("always_command", "TKN always"),
+                ],
             );
             assert_ne!(
                 resolved,

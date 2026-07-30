@@ -230,9 +230,13 @@ mod approval {
             return None;
         }
         let response = match verb.as_str() {
-            "approve" | "yes" | "y" => ChannelApprovalResponse::Approve,
-            "deny" | "no" | "n" => ChannelApprovalResponse::Deny,
-            "always" => ChannelApprovalResponse::AlwaysApprove,
+            crate::util::APPROVAL_REPLY_APPROVE
+            | crate::util::APPROVAL_REPLY_YES
+            | crate::util::APPROVAL_REPLY_YES_SHORT => ChannelApprovalResponse::Approve,
+            crate::util::APPROVAL_REPLY_DENY
+            | crate::util::APPROVAL_REPLY_NO
+            | crate::util::APPROVAL_REPLY_NO_SHORT => ChannelApprovalResponse::Deny,
+            crate::util::APPROVAL_REPLY_ALWAYS => ChannelApprovalResponse::AlwaysApprove,
             _ => return None,
         };
         Some((token.to_uppercase(), response))
