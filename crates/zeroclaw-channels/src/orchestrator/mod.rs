@@ -5109,7 +5109,9 @@ async fn process_channel_message_body(
         // reaction. The sender otherwise has no idea why nothing happened.
         // Informational no-replies stay silent (reaction only, above), and
         // the raw classifier reason is never surfaced verbatim.
-        let notice_outcome = if let Some(channel) = target_channel.as_ref()
+        let notice_outcome = if let Some(channel) = target_channel
+            .as_ref()
+            .filter(|channel| channel.supports_outbound_send())
             && let Some(notice_key) = kind.notice_key()
         {
             let notice_text = zeroclaw_runtime::i18n::get_required_cli_string(notice_key);
@@ -5130,13 +5132,14 @@ async fn process_channel_message_body(
         let history_response = match &notice_outcome {
             Some((notice_text, Ok(()))) => notice_text.clone(),
             Some((_, Err(e))) => {
+                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
                             "phase": "no_reply_notice",
-                            "error": e.to_string(),
+                            "error": safe_error,
                         })),
                     "failed to send no-reply notice"
                 );
@@ -13659,6 +13662,11 @@ api_key = "anthropic-key"
         send_calls: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct InputOnlyNoopChannel {
+        send_calls: AtomicUsize,
+    }
+
     struct DraftRecordingChannel {
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
@@ -13844,6 +13852,17 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for InputOnlyNoopChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for DraftRecordingChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -13871,6 +13890,29 @@ api_key = "anthropic-key"
             _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for InputOnlyNoopChannel {
+        fn name(&self) -> &str {
+            "test-channel"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_outbound_send(&self) -> bool {
+            false
         }
     }
 
@@ -20161,6 +20203,56 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             marker.content.starts_with("[No reply sent"),
             "a failed notice send must fall back to the no-reply marker form, got: {}",
+            marker.content
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_no_reply_input_only_channel_does_not_claim_delivery() {
+        let channel_impl = Arc::new(InputOnlyNoopChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(NoReplyRefusedModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "noreply-input-only-msg".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "input-only-source".to_string(),
+            content: "do something disallowed".to_string(),
+            channel: "test-channel".into(),
+            timestamp: 1,
+            ..Default::default()
+        };
+        let history_key = conversation_history_key(&msg);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            channel_impl.send_calls.load(Ordering::SeqCst),
+            0,
+            "the orchestrator must not call send on an input-only channel"
+        );
+        let expected_notice = channel_runtime_cli_string("channel-runtime-no-reply-refused");
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let marker = histories
+            .peek(history_key.as_str())
+            .and_then(|turns| turns.iter().rev().find(|turn| turn.role == "assistant"))
+            .expect("an input-only no-reply turn should retain an internal history marker");
+        assert_ne!(
+            marker.content, expected_notice,
+            "an input-only channel must not record an undelivered notice as delivered"
+        );
+        assert!(
+            marker.content.starts_with("[No reply sent"),
+            "an input-only channel must retain the internal no-reply marker, got: {}",
             marker.content
         );
     }
