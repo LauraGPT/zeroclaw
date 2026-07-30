@@ -861,7 +861,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, interactive-ctrlc-changes, build, check, check-plugin-backends, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
