@@ -6797,6 +6797,11 @@ mod tests {
         let val = to_result(r).unwrap();
         assert_eq!(val["protocol_version"], 1);
         assert_eq!(val["server_version"], "0.1.0");
+        assert_eq!(
+            val["commands"],
+            json!([]),
+            "new daemons must serialize an authoritative empty catalogue"
+        );
     }
 
     #[test]

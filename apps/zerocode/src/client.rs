@@ -472,14 +472,48 @@ impl fmt::Display for DaemonInitializeTimeout {
 impl std::error::Error for DaemonInitializeTimeout {}
 
 #[derive(Debug)]
-struct InitializeResponse {
+pub(crate) struct InitializeResponse {
     server_version: String,
     tui_id: Option<String>,
     tui_sig: Option<String>,
-    commands: Vec<crate::wire::CommandDescriptor>,
+    pub(crate) commands: Vec<crate::wire::CommandDescriptor>,
 }
 
-fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
+/// One-release fallback for daemons from the pre-catalogue 0.8.x line, which
+/// share the current package and protocol versions but omit `commands`.
+///
+/// These descriptors preserve the shared tokens ZeroCode accepted before the
+/// RPC catalogue existed. New daemons remain authoritative, including when
+/// they explicitly advertise an empty catalogue.
+fn legacy_tui_command_descriptors() -> Vec<crate::wire::CommandDescriptor> {
+    vec![
+        crate::wire::CommandDescriptor {
+            id: "help".into(),
+            name: "help".into(),
+            aliases: Vec::new(),
+        },
+        crate::wire::CommandDescriptor {
+            id: "new".into(),
+            name: "new".into(),
+            aliases: vec!["new-session".into()],
+        },
+        crate::wire::CommandDescriptor {
+            id: "model".into(),
+            name: "model".into(),
+            aliases: Vec::new(),
+        },
+    ]
+}
+
+fn parse_initialize_commands(resp: &Value) -> Result<Vec<crate::wire::CommandDescriptor>> {
+    match resp.get("commands") {
+        Some(commands) => serde_json::from_value(commands.clone())
+            .context("invalid command descriptors in initialize response"),
+        None => Ok(legacy_tui_command_descriptors()),
+    }
+}
+
+pub(crate) fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
     let server_version = resp
         .get("server_version")
         .and_then(Value::as_str)
@@ -496,12 +530,7 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
             .get("tui_sig")
             .and_then(Value::as_str)
             .map(String::from),
-        commands: serde_json::from_value(
-            resp.get("commands")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        )
-        .context("invalid command descriptors in initialize response")?,
+        commands: parse_initialize_commands(resp)?,
     })
 }
 
@@ -712,7 +741,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -861,7 +889,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -1750,7 +1777,7 @@ mod initialize_version_tests {
         assert_eq!(parsed.server_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
         assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
-        assert!(parsed.commands.is_empty());
+        assert_eq!(parsed.commands, legacy_tui_command_descriptors());
     }
 
     #[test]
@@ -1773,6 +1800,17 @@ mod initialize_version_tests {
                 aliases: vec!["new-session".into()],
             }]
         );
+    }
+
+    #[test]
+    fn initialize_response_preserves_present_empty_command_catalogue() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": []
+        }))
+        .unwrap();
+
+        assert!(parsed.commands.is_empty());
     }
 
     #[test]

@@ -94,7 +94,11 @@ rpc_type! {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub capabilities: Vec<String>,
         /// Shared command catalogue entries available on the TUI surface.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ///
+        /// Always serialized so a new daemon's authoritative empty catalogue
+        /// remains distinguishable from an older daemon that predates this
+        /// field.
+        #[serde(default)]
         pub commands: Vec<CommandDescriptor>,
     }
 }

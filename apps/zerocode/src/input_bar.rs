@@ -1447,6 +1447,11 @@ impl InputBarState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn submit_current_input_for_test(&mut self) -> InputBarAction {
+        self.handle_enter()
+    }
+
     fn handle_inject(&mut self) -> InputBarAction {
         let msg = self.take_input();
         if !msg.is_empty() {

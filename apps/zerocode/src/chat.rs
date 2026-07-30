@@ -6775,6 +6775,64 @@ mod tests {
         )
     }
 
+    fn command_action_from_initialize(
+        response: serde_json::Value,
+        command: &str,
+    ) -> InputBarAction {
+        let commands = crate::client::parse_initialize_response(&response)
+            .expect("matching-version initialize response parses");
+        let mut state = ChatState::with_shared_commands(
+            "sess-1".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            &commands.commands,
+        );
+        state.input_bar.insert_text(command);
+        state.input_bar.submit_current_input_for_test()
+    }
+
+    #[test]
+    fn old_daemon_without_command_catalogue_preserves_shared_actions() {
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION")
+        });
+
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/help"),
+            InputBarAction::OpenHelp
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/model"),
+            InputBarAction::OpenModelPicker
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/new"),
+            InputBarAction::RestartSession
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response, "/new-session"),
+            InputBarAction::RestartSession
+        ));
+    }
+
+    #[test]
+    fn present_empty_command_catalogue_remains_authoritative() {
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": []
+        });
+
+        for command in ["/help", "/model", "/new", "/new-session"] {
+            match command_action_from_initialize(response.clone(), command) {
+                InputBarAction::Submit { text, attachments } => {
+                    assert_eq!(text.as_deref(), Some(command));
+                    assert!(attachments.is_empty());
+                }
+                _ => panic!("present empty catalogue must submit {command} as ordinary input"),
+            }
+        }
+    }
+
     fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {
         use unicode_width::UnicodeWidthChar;
 
