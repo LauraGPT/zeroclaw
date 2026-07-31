@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 /// - `security_audit_enabled_has_no_effect`: `security.audit.enabled` is set
 ///   to `true`, but command audit logging has no production writer yet, so
 ///   the setting currently has no effect.
+/// - `context_compression_unsupported`: a `runtime_profiles.<alias>.context_compression`
+///   knob (`enabled = true`, or any other field set to a non-default value)
+///   has no runtime consumer — the context compressor was removed —
+///   so it currently has no effect. One warning per non-default field (see
+///   `collect_context_compression_ignored_warnings` in `schema.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
