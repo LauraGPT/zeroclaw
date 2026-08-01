@@ -1970,6 +1970,18 @@ mod tests {
         file
     }
 
+    /// Install the `ring` `CryptoProvider` for this process (idempotent).
+    ///
+    /// The workspace test build links both `ring` (this crate) and `aws-lc-rs`
+    /// (pulled in transitively by the `matrix-sdk` dev-dependency), so rustls
+    /// cannot infer a process-level provider from crate features and panics
+    /// inside `ServerConfig::builder()`. Production is unaffected: the remote
+    /// transports build their clients through reqwest's `__rustls-ring`
+    /// feature, which selects the provider explicitly.
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     async fn spawn_test_tls_server() -> TestTlsServer {
         spawn_test_tls_server_with_san("127.0.0.1").await
     }
@@ -2036,6 +2048,8 @@ mod tests {
         use rustls::pki_types::PrivatePkcs8KeyDer;
         use std::sync::Arc;
         use tokio_rustls::TlsAcceptor;
+
+        ensure_crypto_provider();
 
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::new(vec!["ZeroClaw MCP test CA".into()]).unwrap();
