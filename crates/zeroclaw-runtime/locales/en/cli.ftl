@@ -700,6 +700,8 @@ cli-otp-enrollment-uri = Enrollment URI: {$uri}
 cli-otp-received = {"  "}✓ OTP received
 cli-secret-captured = {"  "}● Value captured — press Enter to save
 cli-secret-received = {"  "}✓ Secret received
+cli-secret-needs-tty = Secret input requires a terminal on stdin and stderr.
+cli-secret-empty = Value cannot be empty.
 cli-pairing-enabled = 🔐 Gateway pairing is enabled.
 cli-pairing-use-code = {"  "}Use this one-time code to pair a new device:
 cli-pairing-post = {"    "}POST /pair with header X-Pairing-Code: {$code}
@@ -906,6 +908,11 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+# Trailing notice appended (and streamed as a final chunk) when the resilient
+# provider wrapper served the turn with a different model or provider than the
+# one requested, so silent model downgrades stay visible on direct-turn
+# surfaces (WS, RPC/ZeroCode, ACP).
+turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) was unavailable; this reply was served by { $actual_model } ({ $actual_provider }).
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
@@ -1063,6 +1070,7 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
+cli-doctor-cache-write-failed = Failed to persist model cache: {$error}
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
