@@ -809,7 +809,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // Recovery could not trim the history further: leave a terminal
                 // notice instead of returning the error with no visible reason,
                 // so the user does not see the agent go idle silently.
-                append_context_exhausted_notice(&e, history, new_messages_out.as_deref_mut());
+                if append_context_exhausted_notice(
+                    &e,
+                    turn_state.history,
+                    turn_state.canonical.as_deref_mut(),
+                ) {
+                    turn_state.mark_all_synced();
+                }
                 return Err(e);
             }
         };
