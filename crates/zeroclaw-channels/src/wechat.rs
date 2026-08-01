@@ -175,11 +175,11 @@ enum AttachmentDisposition {
 /// Why downloading/decrypting an inbound attachment failed, classified
 /// so the caller can pick a retryable-vs-permanent `AttachmentDisposition`.
 ///
-/// Provisional default mapping, pending reviewer confirmation. Network
-/// and transport-layer failures are `Retryable`: connection errors,
-/// request timeouts, CDN HTTP 5xx, CDN HTTP 429, and transient local
+/// Network and transport-layer failures are `Retryable`: connection
+/// errors, request timeouts, CDN HTTP 5xx, CDN HTTP 429, CDN HTTP 408,
+/// and transient local
 /// I/O errors on the workspace write. Content and parse-layer failures
-/// are `Permanent`: CDN HTTP 4xx other than 429 (the object is gone),
+/// are `Permanent`: CDN HTTP 4xx other than 408/429 (the object is gone),
 /// decrypt/decode failures, and unsupported/oversized content. When an
 /// error does not map cleanly to either bucket, the default is
 /// `Retryable` for network/transport-layer errors and `Permanent` for
@@ -1580,13 +1580,15 @@ impl WeChatChannel {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             let message = format!("attachment download failed ({status}): {body}");
-            // CDN 5xx and 429 are treated as transient; every other 4xx
-            // (e.g. 404/410) means the object is gone and won't come back.
-            return Err(if status.is_server_error() || status.as_u16() == 429 {
-                AttachmentBuildFailure::Retryable(message)
-            } else {
-                AttachmentBuildFailure::Permanent(message)
-            });
+            // CDN 5xx, 429, and 408 are treated as transient; every other
+            // 4xx (e.g. 404/410) means the object is gone and won't come back.
+            return Err(
+                if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+                    AttachmentBuildFailure::Retryable(message)
+                } else {
+                    AttachmentBuildFailure::Permanent(message)
+                },
+            );
         }
 
         let bytes = resp
@@ -3942,6 +3944,88 @@ mod tests {
             *probe.cursor.lock(),
             "cursor_after_batch",
             "a permanent attachment failure must not wedge the listener by holding the cursor"
+        );
+    }
+
+    /// A CDN `408 Request Timeout` is a transient delivery failure, not a
+    /// missing object, so it must hold the cursor like a 5xx/429 rather
+    /// than advancing past the attachment and losing it forever.
+    #[tokio::test]
+    async fn listen_holds_cursor_when_attachment_download_times_out() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        // CDN: transient timeout on every attempt.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(408))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed before message");
+        assert_eq!(first.sender, "user_a");
+
+        handle.abort();
+        let _ = handle.await;
+
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "original_cursor",
+            "a 408 is transient: the cursor must stay pending so the attachment is re-fetched"
         );
     }
 }
