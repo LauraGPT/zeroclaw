@@ -33,6 +33,14 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const BACKOFF_DELAY: Duration = Duration::from_secs(30);
 /// Retry delay for a single failure.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Initial delay before re-polling a batch held back by a retryable
+/// attachment failure. Doubles per consecutive held pass, capped at
+/// `ATTACHMENT_RETRY_MAX_DELAY`, and resets as soon as a batch commits.
+/// Without this, a held batch re-polls immediately in a tight loop for
+/// as long as the CDN keeps failing.
+const ATTACHMENT_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+/// Ceiling for the attachment-retry backoff.
+const ATTACHMENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// QR code long-poll timeout.
 const QR_POLL_TIMEOUT: Duration = Duration::from_secs(35);
 /// Maximum QR code refresh attempts.
@@ -2256,6 +2264,10 @@ impl Channel for WeChatChannel {
         let mut cursor = self.cursor.lock().clone();
         let mut long_poll_timeout_ms = LONG_POLL_TIMEOUT_MS;
         let mut consecutive_failures: u32 = 0;
+        // Consecutive polls whose batch was held back by a retryable
+        // attachment failure. Drives the backoff at the commit site and
+        // resets on any committed batch.
+        let mut consecutive_attachment_holds: u32 = 0;
 
         loop {
             let token = match self.get_token() {
@@ -2476,17 +2488,23 @@ impl Channel for WeChatChannel {
                     continue;
                 }
 
-                let attachment_disposition =
-                    self.try_build_attachment_content(&items, &message_id).await;
-                if attachment_disposition == AttachmentDisposition::Retryable {
-                    batch_has_retryable_attachment_failure = true;
-                }
-                let attachment_content = match attachment_disposition {
-                    AttachmentDisposition::Ready(marker) => Some(marker),
-                    AttachmentDisposition::None
-                    | AttachmentDisposition::Retryable
-                    | AttachmentDisposition::Permanent => None,
-                };
+                let attachment_content =
+                    match self.try_build_attachment_content(&items, &message_id).await {
+                        AttachmentDisposition::Ready(marker) => Some(marker),
+                        AttachmentDisposition::None | AttachmentDisposition::Permanent => None,
+                        AttachmentDisposition::Retryable => {
+                            // Defer the rest of the batch. The cursor is held
+                            // below, so this exact batch is re-fetched on the
+                            // next poll. Enqueueing this message's degraded
+                            // (attachment-less) content — or any later message
+                            // in the batch — would therefore redeliver it on
+                            // every pass for as long as the failure persists,
+                            // and each duplicate can start another agent turn
+                            // and repeat downstream tool effects.
+                            batch_has_retryable_attachment_failure = true;
+                            break;
+                        }
+                    };
                 let content = match (attachment_content, text.is_empty()) {
                     (Some(marker), true) => marker,
                     (Some(marker), false) => format!("{marker}\n\n{text}"),
@@ -2547,9 +2565,32 @@ impl Channel for WeChatChannel {
             // be re-fetched. A permanent attachment failure does not hold
             // the cursor: the attachment is genuinely unfetchable, and
             // holding forever would wedge the listener on it.
-            if let Some(new_cursor) = next_cursor
-                && !batch_has_retryable_attachment_failure
-            {
+            if batch_has_retryable_attachment_failure {
+                // The batch is deferred, not dropped: the enqueue loop
+                // broke at the failing message, so nothing from this batch
+                // past that point was delivered, and the cursor stays put.
+                // Back off before re-polling so a sustained CDN outage
+                // cannot spin this loop; the delay doubles per consecutive
+                // held pass up to a ceiling.
+                let delay = ATTACHMENT_RETRY_BASE_DELAY
+                    .saturating_mul(1u32 << consecutive_attachment_holds.min(5))
+                    .min(ATTACHMENT_RETRY_MAX_DELAY);
+                consecutive_attachment_holds = consecutive_attachment_holds.saturating_add(1);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "consecutive_attachment_holds": consecutive_attachment_holds,
+                            "delay_ms": delay.as_millis() as u64,
+                        })),
+                    "holding WeChat batch after retryable attachment failure; backing off before re-poll"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            consecutive_attachment_holds = 0;
+            if let Some(new_cursor) = next_cursor {
                 cursor = new_cursor;
                 *self.cursor.lock() = cursor.clone();
                 self.save_sync_data();
@@ -3718,7 +3759,7 @@ mod tests {
     /// attachment is delivered.
     #[tokio::test]
     async fn listen_holds_cursor_on_retryable_attachment_failure_and_recovers_after_reload() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let temp = tempdir().unwrap();
@@ -3749,12 +3790,28 @@ mod tests {
             )
         };
 
-        // getupdates: same batch on the first pass and on the reload pass
-        // below (the server still has it buffered, since the cursor
-        // never advances past it until the attachment succeeds).
+        // getupdates: the batch is served while the listener still polls
+        // with the pre-batch cursor. Once the batch commits and the
+        // listener polls with `cursor_after_batch`, the server has nothing
+        // left — mirroring a real server, which only replays a batch the
+        // client has not acknowledged.
         Mock::given(method("POST"))
             .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(attachment_batch()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
             .mount(&mock_server)
             .await;
 
@@ -3785,24 +3842,49 @@ mod tests {
         let listen_ch = ch.clone();
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
-        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("timed out waiting for first-pass message")
-            .expect("channel closed before first-pass message");
-        assert_eq!(first.sender, "user_a");
-        assert_eq!(
-            first.content, "hello",
-            "a retryable attachment failure must not fabricate attachment content"
+        // The first pass hits the 503 and holds the batch, so nothing is
+        // delivered yet — in particular the bare "hello" text must NOT be
+        // enqueued, or it would repeat on every re-poll.
+        let held = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            held.is_err(),
+            "a retryable attachment failure must defer the batch, not deliver degraded content"
         );
 
-        // We have what we need from this pass; stop the listener rather
-        // than let it keep polling with the (deliberately) exhausted CDN
-        // failure mock.
+        // Keep the SAME listener running across the failure and into
+        // recovery — this is the production path a restart-only test skips.
+        // The CDN mock succeeds after the first attempt, so the backed-off
+        // re-poll re-fetches the same batch and delivers it complete, exactly
+        // once.
+        let first = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("timed out waiting for the recovered delivery")
+            .expect("channel closed before the recovered delivery");
+        assert_eq!(first.sender, "user_a");
+        assert!(
+            first.content.contains("[IMAGE:"),
+            "the recovered pass must carry the attachment, got: {}",
+            first.content
+        );
+        assert!(
+            first.content.contains("hello"),
+            "the recovered pass must still carry the text, got: {}",
+            first.content
+        );
+
+        // And the batch must not be delivered a second time once its
+        // cursor commits.
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            duplicate.is_err(),
+            "a recovered batch must deliver exactly once, not redeliver on the next poll"
+        );
+
         handle.abort();
         let _ = handle.await;
 
-        // Probe through the production reload path — exactly what a
-        // supervised restart runs.
+        // The batch committed in-process once the CDN recovered, so a
+        // supervised restart must not re-poll it.
         let probe = WeChatChannel::new(
             "test",
             Arc::new(|| vec!["*".to_string()]),
@@ -3813,50 +3895,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             *probe.cursor.lock(),
-            "original_cursor",
-            "cursor must not advance past a batch with a retryable attachment failure"
-        );
-
-        // Simulate the restart: a fresh channel built from the persisted
-        // state dir re-polls with the same (uncommitted) cursor, so the
-        // server hands back the same batch. This time the CDN succeeds.
-        let ch2 = wechat_channel_for_mock_with_workspace(
-            state_dir.clone(),
-            workspace_dir.clone(),
-            mock_server.uri(),
-        );
-        assert_eq!(*ch2.cursor.lock(), "original_cursor");
-        let ch2 = Arc::new(ch2);
-        let (tx2, mut rx2) = tokio::sync::mpsc::channel(1);
-        let listen_ch2 = ch2.clone();
-        let handle2 = zeroclaw_spawn::spawn!(async move { listen_ch2.listen(tx2).await });
-
-        let second = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
-            .await
-            .expect("timed out waiting for reload-pass message")
-            .expect("channel closed before reload-pass message");
-        assert_eq!(second.sender, "user_a");
-        assert!(
-            second.content.contains("[IMAGE:"),
-            "attachment must be delivered once the CDN recovers, got: {}",
-            second.content
-        );
-
-        handle2.abort();
-        let _ = handle2.await;
-
-        let probe2 = WeChatChannel::new(
-            "test",
-            Arc::new(|| vec!["*".to_string()]),
-            None,
-            None,
-            Some(state_dir.clone()),
-        )
-        .unwrap();
-        assert_eq!(
-            *probe2.cursor.lock(),
             "cursor_after_batch",
-            "cursor must advance once the batch delivers with no retryable failure left"
+            "cursor must advance once the held batch finally delivers in full"
         );
     }
 
@@ -4005,11 +4045,15 @@ mod tests {
         let listen_ch = ch.clone();
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
-        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("timed out waiting for message")
-            .expect("channel closed before message");
-        assert_eq!(first.sender, "user_a");
+        // A held batch must not deliver anything: the message carries an
+        // attachment that never arrives, so enqueueing its bare text would
+        // redeliver that text on every re-poll for as long as the 408
+        // persists. Nothing should come through.
+        let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            delivered.is_err(),
+            "a retryable attachment failure must defer the batch, not deliver degraded content"
+        );
 
         handle.abort();
         let _ = handle.await;
