@@ -876,6 +876,40 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
+/// The localized terminal notice the runtime appends when a turn dies on
+/// context exhaustion that in-loop recovery could not trim away, or `None` when
+/// this turn carries no such notice.
+///
+/// The runtime owns the decision of whether a failure is unrecoverable context
+/// exhaustion (`append_context_exhausted_notice` also suppresses the notice for
+/// already-annotated stream interruptions). Re-deriving that from the error here
+/// would duplicate the fact and let the two paths drift, so this resolves it
+/// from the canonical source: the message the runtime actually appended.
+fn context_exhausted_notice(messages: &[zeroclaw_providers::ConversationMessage]) -> Option<&str> {
+    let notice = zeroclaw_runtime::i18n::get_required_cli_string("turn-context-exhausted");
+    messages.iter().rev().find_map(|message| match message {
+        zeroclaw_providers::ConversationMessage::Chat(message)
+            if message.role == "assistant" && message.content == notice =>
+        {
+            Some(message.content.as_str())
+        }
+        _ => None,
+    })
+}
+
+/// Live delivery for the context-exhaustion terminal notice.
+///
+/// The `Err` arm persists `new_messages`, but the dashboard hydrates history on
+/// mount only, so a persisted-but-unannounced notice stays invisible until the
+/// next reload. This mirrors the `history_trimmed` frame so the mounted
+/// transcript shows the localized reason on the turn that produced it.
+fn context_exhausted_ws_frame(notice: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "context_exhausted",
+        "notice": notice,
+    })
+}
+
 fn history_trimmed_ws_frame(
     dropped_messages: usize,
     kept_turns: usize,
@@ -1444,6 +1478,14 @@ async fn process_chat_message(
                 persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
             }
 
+            // Deliver the context-exhaustion notice to the live conversation.
+            // Sent before the error frame so the transcript reads in causal
+            // order: the reason the turn stopped, then the failure itself.
+            if let Some(notice) = context_exhausted_notice(&e.new_messages) {
+                let frame = context_exhausted_ws_frame(notice);
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            }
+
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
                 let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
@@ -1573,6 +1615,58 @@ mod tests {
                 "kept_turns": 3,
                 "reason": "message limit",
             })
+        );
+    }
+
+    #[test]
+    fn context_exhausted_notice_is_detected_from_the_runtime_message() {
+        // The gateway must not re-derive "was this context exhaustion?" from the
+        // error. It resolves the fact from the message the runtime actually
+        // appended, so the two paths cannot drift.
+        let notice = zeroclaw_runtime::i18n::get_required_cli_string("turn-context-exhausted");
+        let messages = vec![
+            zeroclaw_providers::ConversationMessage::Chat(zeroclaw_providers::ChatMessage::user(
+                "summarize this",
+            )),
+            zeroclaw_providers::ConversationMessage::Chat(
+                zeroclaw_providers::ChatMessage::assistant(&notice),
+            ),
+        ];
+
+        assert_eq!(context_exhausted_notice(&messages), Some(notice.as_str()));
+    }
+
+    #[test]
+    fn context_exhausted_notice_ignores_unrelated_assistant_output() {
+        // A turn that failed for any other reason must not produce the frame,
+        // otherwise every error would render a misleading context-window claim.
+        let messages = vec![zeroclaw_providers::ConversationMessage::Chat(
+            zeroclaw_providers::ChatMessage::assistant("here is the summary you asked for"),
+        )];
+
+        assert_eq!(context_exhausted_notice(&messages), None);
+        assert_eq!(context_exhausted_notice(&[]), None);
+    }
+
+    #[test]
+    fn context_exhausted_frame_carries_the_localized_notice() {
+        // Pins the wire shape the dashboard's `context_exhausted` case reads.
+        // A renamed field would silently degrade to the pre-fix behavior: the
+        // notice persisted but never shown on the live turn (#8758).
+        let notice = zeroclaw_runtime::i18n::get_required_cli_string("turn-context-exhausted");
+        let frame = context_exhausted_ws_frame(&notice);
+
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "type": "context_exhausted",
+                "notice": notice,
+            })
+        );
+        // The user-facing text is localized, not a bare English literal.
+        assert!(
+            !notice.starts_with('{'),
+            "missing Fluent key would ship the `{{turn-context-exhausted}}` fallback to the browser"
         );
     }
 

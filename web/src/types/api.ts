@@ -263,6 +263,7 @@ export interface WsMessage {
     | "cron_result"
     | "approval_request"
     | "history_trimmed"
+    | "context_exhausted"
     | "aborted";
   content?: string;
   full_response?: string;
@@ -286,6 +287,8 @@ export interface WsMessage {
   dropped_messages?: number;
   kept_turns?: number;
   reason?: string;
+  /** Localized terminal notice for a turn that died on context exhaustion. See #8758. */
+  notice?: string;
   // Context window info (present on "done" frames). See #7311.
   max_context_tokens?: number;
   input_tokens?: number;
