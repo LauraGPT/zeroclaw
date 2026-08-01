@@ -42,7 +42,7 @@ cat > "$config_file" <<'CONFIG'
 host = "127.0.0.1"
 port = 42617
 allow_public_bind = false
-require_pairing = false
+require_pairing = true
 CONFIG
 
 cat > "$override_file" <<'COMPOSE'
@@ -61,6 +61,7 @@ compose up --detach
 
 published="$(compose port zeroclaw 42617 | sed -n '1p')"
 published_port="${published##*:}"
+published_address="${published%:*}"
 case "$published_port" in
   ''|*[!0-9]*)
     echo "could not resolve published gateway port from: $published" >&2
@@ -71,10 +72,26 @@ if [[ "$published_port" != "$requested_host_port" ]]; then
   echo "expected host port $requested_host_port, Compose published $published" >&2
   exit 1
 fi
+# Assert the publication address, not just the port, so the CI host-loopback
+# safeguard cannot drift into publishing on every host interface.
+if [[ "$published_address" != "127.0.0.1" ]]; then
+  echo "expected publication on 127.0.0.1, Compose published $published" >&2
+  exit 1
+fi
 
 for _attempt in $(seq 1 30); do
   if health_response="$(curl --fail --silent --show-error --max-time 2 \
     "http://127.0.0.1:${published_port}/health" 2>/dev/null)"; then
+    # The mounted fixture sets require_pairing=true; the image's baked config
+    # leaves it false. Asserting the fixture's value proves the nested config
+    # bind actually applied, so reachability here proves override precedence
+    # rather than the baked `[::]` listener answering an identical probe.
+    if ! printf '%s' "$health_response" | grep -q '"require_pairing":[[:space:]]*true'; then
+      printf '%s\n' "$health_response" >&2
+      echo "health payload did not report the mounted fixture's require_pairing=true;" >&2
+      echo "the persisted config bind did not apply, so this probe proves nothing" >&2
+      exit 1
+    fi
     printf '%s\n' "$health_response"
     exit 0
   fi

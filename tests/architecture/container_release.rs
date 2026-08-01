@@ -155,23 +155,28 @@ fn scheduled_trivy_verifies_published_tag_before_scan() {
 }
 
 #[test]
-fn root_compose_pins_gateway_host_and_public_bind_permission() {
+fn root_compose_publishes_on_host_loopback_by_default() {
     let compose = repository_file("docker-compose.yml");
     let required_overrides =
         "- ZEROCLAW_gateway__host=0.0.0.0\n      - ZEROCLAW_gateway__allow_public_bind=true";
 
     assert!(
         compose.contains(required_overrides),
-        "Compose must keep the non-loopback gateway host beside its explicit public-bind permission"
+        "Compose must keep the non-loopback gateway host beside its public-bind acknowledgement"
     );
+    // The in-container listener is 0.0.0.0, and `allow_public_bind` only
+    // silences a startup warning rather than refusing a public bind, so the
+    // `ports:` mapping is the only enforced host-side boundary. Default it to
+    // loopback: a persisted `require_pairing = false` config answers
+    // unauthenticated requests on /webhook, /api/config, and /api/browse.
     assert!(
-        compose.contains("${HOST_PORT:-42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"),
-        "Compose must publish the configured gateway port"
+        compose.contains("${HOST_PORT:-127.0.0.1:42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"),
+        "Compose must publish the gateway port on host loopback by default"
     );
 }
 
 #[test]
-fn compose_smoke_probes_host_port_with_a_loopback_persisted_config() {
+fn compose_smoke_proves_override_precedence_through_the_published_port() {
     let workflow = workflow("docker-image-pr.yml");
     let smoke = repository_file("scripts/ci/smoke_docker_compose.sh");
 
@@ -199,6 +204,24 @@ fn compose_smoke_probes_host_port_with_a_loopback_persisted_config() {
             "Compose smoke test is missing published-port invariant: {required}"
         );
     }
+
+    // The fixture must stay observably different from the image's baked
+    // config, and the probe must assert that difference. Otherwise a lost
+    // config bind lets the baked `[::]` listener answer the same /health and
+    // the smoke passes while proving nothing about override precedence.
+    assert!(
+        smoke.contains("require_pairing = true"),
+        "Compose smoke fixture must differ from the baked require_pairing=false config"
+    );
+    assert!(
+        smoke.contains(r#"grep -q '"require_pairing":[[:space:]]*true'"#),
+        "Compose smoke must assert the fixture's require_pairing in the health payload"
+    );
+    assert!(
+        smoke.contains(r#"published_address="${published%:*}""#)
+            && smoke.contains(r#"if [[ "$published_address" != "127.0.0.1" ]]"#),
+        "Compose smoke must assert the resolved publication address, not only the port"
+    );
 }
 
 #[test]

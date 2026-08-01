@@ -85,12 +85,12 @@ services:
     image: ghcr.io/zeroclaw-labs/zeroclaw:latest
     restart: unless-stopped
     ports:
-      - "42617:42617"      # gateway
+      - "127.0.0.1:42617:42617"      # gateway, host loopback only
     volumes:
       - ./data:/zeroclaw-data
     environment:
-      # Both settings are required: host selects the container interface and
-      # allow_public_bind is the explicit permission for that exposure.
+      # host selects the container interface; allow_public_bind acknowledges
+      # the non-loopback listener and silences the startup warning.
       - ZEROCLAW_gateway__host=0.0.0.0
       - ZEROCLAW_gateway__allow_public_bind=true
 ```
@@ -110,16 +110,30 @@ docker compose exec zeroclaw zeroclaw quickstart
 Compose should set both {{#env-var-name gateway.host}} and
 {{#env-var-name gateway.allow_public_bind}} explicitly. Publishing a port does
 not make a gateway bound to `127.0.0.1` inside the container reachable, and
-`allow_public_bind = true` permits a public bind without selecting one. Keeping
-the two overrides together also makes an existing volume or custom config with
-localhost defaults behave consistently.
+`allow_public_bind = true` acknowledges a public bind without selecting one.
+Keeping the two overrides together also makes an existing volume or custom
+config with localhost defaults behave consistently.
 
-This intentionally changes exposure. The gateway must retain the explicit
-`allow_public_bind` opt-in when it listens on `0.0.0.0`. The Compose mapping
-`"42617:42617"` publishes on the host interfaces configured by Docker. To make
-the gateway reachable only from the container host, use
-`"127.0.0.1:42617:42617"`; keep the gateway's in-container host at `0.0.0.0`
-because Docker bridge traffic does not arrive through container loopback.
+This changes exposure, so the examples publish on host loopback. Two separate
+boundaries are involved and only one of them is enforced:
+
+- `gateway.host = 0.0.0.0` selects the in-container interface. Docker bridge
+  traffic does not arrive through container loopback, so this must stay
+  `0.0.0.0` for a published port to reach the gateway at all.
+- {{#env-var-name gateway.allow_public_bind}} is an acknowledgement, not a
+  gate. When it is `false` the gateway logs a startup warning and binds
+  anyway; setting it to `true` only silences that warning. Do not rely on it
+  to keep a listener private.
+- The Compose `ports:` mapping is the boundary that Docker actually enforces.
+  `"127.0.0.1:42617:42617"` publishes to the container host only;
+  `"42617:42617"` publishes on every host interface Docker is configured with.
+
+The authentication boundary is {{#env-var-name gateway.require_pairing}}, which
+defaults to `true` in the schema but is `false` in the image's baked config. With
+pairing disabled the gateway answers unauthenticated requests on `/webhook`,
+`/api/config`, `/api/memory`, `/api/browse`, and the session endpoints. To serve
+other hosts, drop the `127.0.0.1:` prefix **and** enable pairing or put the
+gateway behind an authenticating reverse proxy or tunnel.
 
 ### Rootless Compose with the Debian image
 
@@ -133,7 +147,7 @@ services:
     container_name: zeroclaw
     restart: unless-stopped
     ports:
-      - "42617:42617"
+      - "127.0.0.1:42617:42617"
     volumes:
       - ./data:/zeroclaw-data
     environment:
@@ -152,8 +166,8 @@ The current Debian image carries the packaged dashboard outside
 `gateway.web_dist_dir` override is needed. The gateway overrides use the
 schema-mirror spellings shown by {{#env-var-name gateway.host}} and
 {{#env-var-name gateway.allow_public_bind}}. They take precedence over a
-persisted localhost-default config while retaining the separate permission
-opt-in.
+persisted localhost-default config, and the loopback-scoped `ports:` mapping
+remains the boundary that limits host-side reach.
 
 ## macOS: OrbStack vs Colima
 
@@ -207,10 +221,12 @@ Wants=network-online.target
 # Pin a release in production; :latest is distroless (no shell — use :debian to exec a shell).
 Image=ghcr.io/zeroclaw-labs/zeroclaw:latest
 ContainerName=zeroclaw
-PublishPort=42617:42617
+PublishPort=127.0.0.1:42617:42617
 Volume=zeroclaw-data:/zeroclaw-data
-# The official image already binds publicly. If you mount a localhost-default
-# config, override both gateway.host and gateway.allow_public_bind together.
+# Published on host loopback only; drop the 127.0.0.1: prefix to serve other
+# hosts, and enable pairing or a tunnel before you do. If you mount a
+# localhost-default config, override both gateway.host and
+# gateway.allow_public_bind together.
 # Optional rolling-upgrade path — re-pull a newer image on (re)start and opt into `podman auto-update`:
 Pull=newer
 AutoUpdate=registry
@@ -316,9 +332,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /zeroclaw-data
-          # The official image already binds publicly. If you mount a
-          # localhost-default config, override both gateway.host and
-          # gateway.allow_public_bind together.
+          # `containerPort` does not publish to the host; a Service or Ingress
+          # governs exposure here. If you mount a localhost-default config,
+          # override both gateway.host and gateway.allow_public_bind together.
       volumes:
         - name: data
           persistentVolumeClaim:
