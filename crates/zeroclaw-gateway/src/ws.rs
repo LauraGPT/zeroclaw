@@ -1652,7 +1652,7 @@ mod tests {
     fn context_exhausted_frame_carries_the_localized_notice() {
         // Pins the wire shape the dashboard's `context_exhausted` case reads.
         // A renamed field would silently degrade to the pre-fix behavior: the
-        // notice persisted but never shown on the live turn (#8758).
+        // notice persisted but never shown on the live turn.
         let notice = zeroclaw_runtime::i18n::get_required_cli_string("turn-context-exhausted");
         let frame = context_exhausted_ws_frame(&notice);
 

@@ -34,6 +34,34 @@ export function initialTerminalExplanationState(): TerminalExplanationState {
   return { explained: false };
 }
 
+/** Which status banner an `error` frame should raise, if any. */
+export type TerminalBanner =
+  | { kind: 'none' }
+  | { kind: 'configuration' }
+  | { kind: 'message' };
+
+/**
+ * Decide the banner for an `error` frame, given the arbitration outcome.
+ *
+ * Split out of the context provider because the banner is a *second* surface
+ * that must honour the same verdict as the bubble. Context exhaustion arrives
+ * as `PROVIDER_ERROR`, so keying the banner off `code` alone re-surfaced the
+ * raw provider text under a "Configuration error" heading even while the
+ * bubble was correctly suppressed — misleading, since nothing is
+ * misconfigured. Pure so it is testable without a DOM harness (#8758).
+ */
+export function bannerForErrorFrame(render: TerminalRender, code?: string): TerminalBanner {
+  // An explained turn renders no banner: the notice is the whole explanation.
+  if (render.kind !== 'error') return { kind: 'none' };
+  if (code === 'AGENT_INIT_FAILED' || code === 'AUTH_ERROR' || code === 'PROVIDER_ERROR') {
+    return { kind: 'configuration' };
+  }
+  if (code === 'INVALID_JSON' || code === 'UNKNOWN_MESSAGE_TYPE' || code === 'EMPTY_CONTENT') {
+    return { kind: 'message' };
+  }
+  return { kind: 'none' };
+}
+
 export function reduceTerminalFrame(
   state: TerminalExplanationState,
   frame: TerminalFrame,

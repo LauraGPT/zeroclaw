@@ -5,6 +5,7 @@ import {
   initialTerminalExplanationState,
   reduceTerminalFrame,
   type TerminalFrame,
+  bannerForErrorFrame,
   type TerminalRender,
 } from './terminalExplanation.logic.ts';
 
@@ -119,4 +120,65 @@ test('state resets across turns so no explanation leaks forward', () => {
   ]);
 
   assert.equal(state.explained, false);
+});
+
+// ── Banner arbitration (#8758 follow-up) ─────────────────────────────
+//
+// Regression cover for a real escape: the bubble was correctly suppressed
+// while the banner was keyed off `msg.code` alone, so an explained turn still
+// flashed the raw provider text as "Configuration error". Caught in a browser,
+// not by the wire probe — both frames are on the wire by design, so only the
+// render decision can distinguish the bug.
+
+test('an explained turn raises no banner even though the code is PROVIDER_ERROR', () => {
+  const { rendered } = runFrames([
+    { type: 'turn_start' },
+    { type: 'context_exhausted', notice: NOTICE },
+    { type: 'error' },
+  ]);
+  // The error frame rendered nothing...
+  assert.deepEqual(rendered, [{ kind: 'notice', content: NOTICE }]);
+
+  // ...so the banner must stay silent for the very code context exhaustion
+  // travels under. This is the assertion that fails on the buggy version.
+  const outcome = reduceTerminalFrame({ explained: true }, { type: 'error' });
+  assert.deepEqual(bannerForErrorFrame(outcome.render, 'PROVIDER_ERROR'), { kind: 'none' });
+});
+
+test('an unexplained provider failure still raises the configuration banner', () => {
+  // The guard must not swallow genuine misconfiguration (dead endpoint, bad key).
+  const outcome = reduceTerminalFrame({ explained: false }, { type: 'error' });
+  assert.deepEqual(outcome.render, { kind: 'error' });
+  assert.deepEqual(bannerForErrorFrame(outcome.render, 'PROVIDER_ERROR'), {
+    kind: 'configuration',
+  });
+  assert.deepEqual(bannerForErrorFrame(outcome.render, 'AUTH_ERROR'), { kind: 'configuration' });
+});
+
+test('malformed-message codes still raise the message banner', () => {
+  const outcome = reduceTerminalFrame({ explained: false }, { type: 'error' });
+  assert.deepEqual(bannerForErrorFrame(outcome.render, 'INVALID_JSON'), { kind: 'message' });
+  assert.deepEqual(bannerForErrorFrame(outcome.render, 'EMPTY_CONTENT'), { kind: 'message' });
+});
+
+test('an unknown or absent error code raises no banner', () => {
+  const outcome = reduceTerminalFrame({ explained: false }, { type: 'error' });
+  assert.deepEqual(bannerForErrorFrame(outcome.render, 'SOMETHING_NEW'), { kind: 'none' });
+  assert.deepEqual(bannerForErrorFrame(outcome.render, undefined), { kind: 'none' });
+});
+
+test('a notice frame with no text leaves the banner intact', () => {
+  // Defensive pairing with the bubble fallback: a malformed notice must not
+  // suppress the banner, or a real failure goes fully silent.
+  const { rendered } = runFrames([
+    { type: 'turn_start' },
+    { type: 'context_exhausted' },
+    { type: 'error' },
+  ]);
+  assert.deepEqual(rendered, [{ kind: 'error' }]);
+
+  const outcome = reduceTerminalFrame({ explained: false }, { type: 'error' });
+  assert.deepEqual(bannerForErrorFrame(outcome.render, 'PROVIDER_ERROR'), {
+    kind: 'configuration',
+  });
 });

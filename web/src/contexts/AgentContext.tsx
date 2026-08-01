@@ -14,6 +14,7 @@ import {
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
 import {
+  bannerForErrorFrame,
   initialTerminalExplanationState,
   reduceTerminalFrame,
   type TerminalExplanationState,
@@ -505,6 +506,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         // wording. `reduceTerminalFrame` owns that arbitration.
         const errorOutcome = reduceTerminalFrame(terminalExplanationRef.current, { type: 'error' });
         terminalExplanationRef.current = errorOutcome.state;
+        // `render.kind !== 'error'` means a context-exhaustion notice already
+        // explained this turn. That verdict has to govern *every* surface, not
+        // just the bubble: context exhaustion arrives as `PROVIDER_ERROR`, so
+        // an unguarded banner would restate the stop in raw provider wording
+        // AND mislabel it "Configuration error" — nothing is misconfigured,
+        // the conversation simply outgrew the window (#8758).
         if (errorOutcome.render.kind === 'error') {
           localMessageMutationVersionRef.current += 1;
           setMessages((prev) => [
@@ -516,11 +523,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
               timestamp: new Date(),
             },
           ]);
-        }
-        if (msg.code === 'AGENT_INIT_FAILED' || msg.code === 'AUTH_ERROR' || msg.code === 'PROVIDER_ERROR') {
-          setError(`${t('agent.configuration_error')}: ${friendlyMessage}`);
-        } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
-          setError(`${t('agent.message_error')}: ${msg.message}`);
+          const banner = bannerForErrorFrame(errorOutcome.render, msg.code);
+          if (banner.kind === 'configuration') {
+            setError(`${t('agent.configuration_error')}: ${friendlyMessage}`);
+          } else if (banner.kind === 'message') {
+            setError(`${t('agent.message_error')}: ${msg.message}`);
+          }
         }
         setTyping(false);
         foldTurnStream({ type: 'error' });
