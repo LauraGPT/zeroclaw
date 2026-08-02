@@ -1341,8 +1341,6 @@ impl RpcClient {
     /// daemon returns `{ "runs": [SopRunSummary...] }`; rows that fail to
     /// deserialize are impossible by construction (every view field
     /// defaults), so a newer daemon cannot break this surface.
-    // Staged for the SOP pane status-icon surface; no pane consumer yet.
-    #[allow(dead_code)]
     pub async fn sops_runs(&self, sop: Option<&str>) -> Result<Vec<SopRunSummaryView>> {
         let value: Value = self
             .call(method::SOPS_RUNS, serde_json::json!({ "sop": sop }))
@@ -2482,8 +2480,6 @@ pub struct TriggerSourceRegistryView {
 /// Run status as serialized by the runtime's `SopRunStatus`. Unknown
 /// variants from a newer daemon fold into [`SopRunStatusView::Unknown`]
 /// so an older zerocode keeps rendering rather than dropping the run.
-// Staged for the SOP pane status-icon surface; no pane consumer yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SopRunStatusView {
@@ -2502,15 +2498,11 @@ pub enum SopRunStatusView {
 impl SopRunStatusView {
     /// True while the run is parked on an operator decision (approval gate
     /// or deterministic checkpoint).
-    // Staged for the status-icon surface; consumed by the icon aggregation rule.
-    #[allow(dead_code)]
     pub fn needs_input(self) -> bool {
         matches!(self, Self::WaitingApproval | Self::PausedCheckpoint)
     }
 
     /// True once the run has reached a terminal state.
-    // Staged for the status-icon surface; consumed by the icon aggregation rule.
-    #[allow(dead_code)]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
@@ -2519,8 +2511,6 @@ impl SopRunStatusView {
 /// One run row from `sops/runs`; mirrors the runtime `SopRunSummary`.
 /// Every field defaults so a field added daemon-side never breaks an
 /// older zerocode.
-// Staged for the SOP pane status-icon surface; no pane consumer yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SopRunSummaryView {
