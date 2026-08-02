@@ -459,4 +459,132 @@ mod tests {
             "the no-op repetition passes only when it cannot see the first run's marker"
         );
     }
+
+    /// The baseline retry path calls `run_case_repeated`, so a case whose
+    /// contract is `repeat = k` must clear pass^k again to be excused. One
+    /// lucky run is not enough: the representative's grades must fail when any
+    /// repetition failed.
+    #[tokio::test]
+    async fn repeat_retry_uses_pass_hat_k_not_one_lucky_run() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "retry-pass-hat-k", "repeat": 5,
+                 "turns": [{ "user_input": "run" }],
+                 "expects": { "response_contains": ["ok"] } }"#,
+        )
+        .unwrap();
+
+        // 4 of 5 repetitions pass; the second one returns the wrong text.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let deps = live_deps(
+            move |_| {
+                let call = c.fetch_add(1, Ordering::SeqCst);
+                let content = if call == 1 { "nope" } else { "ok" };
+                Ok(driver_provider(&format!(
+                    r#"{{"model_name":"d","turns":[{{"user_input":"","steps":[{{"response":{{"type":"text","content":"{content}"}}}}]}}]}}"#
+                )))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let (outcome, repeat) = crate::runner::run_case_repeated(&trace, &deps)
+            .await
+            .unwrap();
+        let repeat = repeat.expect("repeat=5 must produce statistics");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 5, "all 5 repetitions ran");
+        assert_eq!(repeat.passes, 4);
+        assert!(repeat.pass_at_k(), "4 of 5 passed, so pass@k holds");
+        assert!(!repeat.pass_hat_k(), "pass^k must fail at 4 of 5");
+        // This is what the baseline retry reads to decide "flaky or real".
+        assert!(
+            !outcome.grades.iter().all(|g| g.passed),
+            "the representative must be a failing run so the retry is not excused"
+        );
+    }
+
+    /// A mid-loop error must not discard the repetitions already paid for, and
+    /// the case must not pass on a truncated set.
+    #[tokio::test]
+    async fn repeat_error_retains_completed_run_evidence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "repeat-partial", "repeat": 5,
+                 "turns": [{ "user_input": "run" }],
+                 "expects": { "response_contains": ["ok"] } }"#,
+        )
+        .unwrap();
+
+        // Two repetitions succeed, the third errors before producing a record.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let deps = live_deps(
+            move |_| {
+                let call = c.fetch_add(1, Ordering::SeqCst);
+                if call < 2 {
+                    Ok(driver_provider(
+                        r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"ok"}}]}]}"#,
+                    ))
+                } else {
+                    anyhow::bail!("provider exploded on repetition 3")
+                }
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let (_, repeat) = crate::runner::run_case_repeated(&trace, &deps)
+            .await
+            .expect("completed repetitions must be reported, not discarded");
+        let repeat = repeat.expect("partial repeat must still produce statistics");
+
+        assert_eq!(repeat.k, 5, "the requested repeat policy is preserved");
+        assert_eq!(repeat.completed, 2, "both completed runs are retained");
+        assert_eq!(repeat.passes, 2, "their passing evidence survives");
+        assert!(repeat.truncated());
+        assert!(
+            repeat
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("provider exploded")),
+            "the truncating error is retained: {:?}",
+            repeat.error
+        );
+        // Fail-closed: 2 passes out of a requested 5 is not pass^k.
+        assert!(
+            !repeat.pass_hat_k(),
+            "a truncated set must never establish pass^k"
+        );
+        // Exactly 3 provider builds: two successes plus the failing one.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the loop stops at the error"
+        );
+    }
+
+    /// With no completed repetition there is nothing to report, so the error
+    /// propagates and the case is recorded as errored.
+    #[tokio::test]
+    async fn repeat_error_on_first_run_still_propagates() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "repeat-total-failure", "repeat": 3,
+                 "turns": [{ "user_input": "run" }], "expects": {} }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            move |_| anyhow::bail!("provider exploded immediately"),
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let err = crate::runner::run_case_repeated(&trace, &deps)
+            .await
+            .expect_err("no evidence at all must surface as an error");
+        assert!(err.to_string().contains("provider exploded immediately"));
+    }
 }

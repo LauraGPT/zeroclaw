@@ -95,8 +95,10 @@ tool_surface)`:
   never gated.
 
 **Live flakiness rule:** in live mode, a comparable case that regressed is re-run
-once; if the re-run passes it is reported as `flaky (unconfirmed regression)` and
-does not gate. Replay flips the gate directly with no retry (it is deterministic).
+under its own effective repeat policy; if the re-run clears `pass^k` it is
+reported as `flaky (unconfirmed regression)` and does not gate. A `repeat: k`
+case therefore cannot be excused by one lucky attempt. Replay flips the gate
+directly with no retry (it is deterministic).
 
 Gating is strictly per-case Pass to Fail flips; aggregate score deltas are never a
 gate. To refresh a baseline after an intentional behavior change, re-run with
@@ -115,14 +117,34 @@ iff `pass^k` (the consistency standard).
 
 At the suite level, each case's success proportion `p_i = passes_i / k_i` is
 collapsed first (one value per case), so correlated resamples do not fake
-precision; the report prints `pass rate p̄ +/-t·SEM (95% CI)`, using the Student-t
-multiplier on n-1 degrees of freedom (the normal z=1.96 understates the interval
-for the few-unit suites repeated runs typically produce). An optional
-per-case `cluster` label averages correlated case families together before the
-error bar; omitting it asserts independence. With fewer than two independent
-units, the report shows the observed pass rate and marks the 95% CI unavailable.
+precision; the report prints `repeated-case pass rate p̄ +/-t·SEM (95% CI, n of N
+cases repeated)`, using the Student-t multiplier on n-1 degrees of freedom (the
+normal z=1.96 understates the interval for the few-unit suites repeated runs
+typically produce).
+
+That statistic is deliberately restricted to cases that actually repeated
+(effective `k > 1`). Effective `k = 1` cases and cases whose run errored have no
+within-case success proportion, so including them would give a single-shot case
+the same weight as a 20-run case. It is therefore **not** the suite pass rate --
+the suite's own `passed/total` line is reported separately, and the two can
+legitimately differ. The printed population (`n of N cases repeated`) makes the
+exclusion explicit.
+
+An optional per-case `cluster` label averages correlated case families together
+before the error bar; omitting it asserts independence. With fewer than two
+independent units, the report shows the observed rate and marks the 95% CI
+unavailable.
+
 A case with `0/k` passes at `k >= 5` is flagged low-signal, and at `k >= 20` as a
 suspect (broken) task.
+
+**Partial repetition sets.** If a repetition errors partway through, the
+repetitions that already completed are retained and reported (`repeat p/k (c
+completed)`) together with the error, rather than discarded -- live runs are paid
+for, and the partial evidence is what makes the aggregate disputable. Such a set
+is fail-closed: the missing repetitions never count as passes, so it cannot
+establish `pass^k`, and the case fails. Only a set with no completed repetition
+at all is reported purely as an errored case.
 
 ## Exit-code contract
 

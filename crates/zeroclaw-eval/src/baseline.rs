@@ -137,7 +137,8 @@ pub enum CaseComparison {
     /// Baseline passed, current failed: a confirmed regression, with the
     /// categories whose checks flipped.
     Regression { categories: Vec<GradeCategory> },
-    /// A live regression that passed on a single re-run: reported, never gated.
+    /// A live regression whose re-run cleared the case's effective repeat
+    /// policy (pass^k): reported, never gated.
     FlakyUnconfirmed,
     /// Current passed, baseline failed (reported, never gated).
     Improvement,
@@ -243,11 +244,12 @@ pub fn compare(current: &SuiteReport, baseline: &Baseline) -> BaselineComparison
     BaselineComparison { per_case }
 }
 
-/// Downgrade live regressions that passed on a single re-run to
+/// Downgrade live regressions whose re-run confirmed a pass to
 /// `FlakyUnconfirmed` (reported, never gated). Only applies when `mode` is Live;
 /// replay flips the gate directly with no retry (deterministic).
-/// `rerun_passed[case_id] == true` means that case's one re-run passed. Returns
-/// the case ids downgraded to flaky.
+/// `rerun_passed[case_id] == true` means that case's re-run cleared its
+/// effective repeat policy (pass^k), not merely one lucky attempt. Returns the
+/// case ids downgraded to flaky.
 pub fn downgrade_flaky_regressions(
     comparison: &mut BaselineComparison,
     mode: Mode,

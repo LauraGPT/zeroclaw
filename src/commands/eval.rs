@@ -95,8 +95,14 @@ pub async fn finalize(
     Ok(report.exit_code(kind, comparison.as_ref()))
 }
 
-/// Re-run each regressed case once against the same config, returning whether the
-/// single re-run passed, keyed by case id. Used only for live suites.
+/// Re-run each regressed case against the same config, returning whether the
+/// re-run confirmed a pass, keyed by case id. Used only for live suites.
+///
+/// The re-run honors the case's own effective repeat policy via
+/// [`zeroclaw_eval::run_case_repeated`], so a `repeat = k` case must clear
+/// `pass^k` again to be excused as flaky. Re-running once would let a single
+/// lucky attempt downgrade a real regression on a case whose documented
+/// contract is "passes iff all k runs pass".
 async fn rerun_live_regressions(
     config: &Config,
     suite_path: &Path,
@@ -117,9 +123,12 @@ async fn rerun_live_regressions(
     for (_, trace) in &traces {
         let id = trace.display_id();
         if regressed.contains(&id) {
+            // `run_case_repeated` applies the case's effective repeat policy and
+            // returns a representative whose grades already encode pass^k: for
+            // k > 1 it is a failing run whenever any repetition failed.
             let passed = matches!(
-                Box::pin(zeroclaw_eval::run_case(trace, &deps)).await,
-                Ok(outcome) if outcome.grades.iter().all(|g| g.passed)
+                Box::pin(zeroclaw_eval::run_case_repeated(trace, &deps)).await,
+                Ok((outcome, _)) if outcome.grades.iter().all(|g| g.passed)
             );
             out.insert(id.to_string(), passed);
         }
@@ -393,6 +402,56 @@ mod tests {
         write_dumps(&report, Some(explicit.path()), auto.path()).unwrap();
         let count = std::fs::read_dir(explicit.path()).unwrap().count();
         assert_eq!(count, 2, "colliding ids must produce two files, not one");
+    }
+
+    /// The `--baseline` retry must honor `pass^k`. A `repeat = 5` case that
+    /// regressed is only excused when the retry itself clears pass^k; a retry
+    /// that passes 4 of 5 must stay a gating regression.
+    ///
+    /// `rerun_live_regressions` needs a live provider, so this pins the pure
+    /// boundary it feeds: the bool it inserts per case drives
+    /// `downgrade_flaky_regressions`, and therefore the exit code. The
+    /// companion test `repeat_retry_uses_pass_hat_k_not_one_lucky_run` in
+    /// `zeroclaw-eval` proves `run_case_repeated` produces `false` for 4/5.
+    #[test]
+    fn baseline_retry_excuses_only_a_pass_hat_k_rerun() {
+        use zeroclaw_eval::baseline::{BaselineComparison, CaseComparison, SuiteKind};
+
+        let regression = || CaseComparison::Regression {
+            categories: Vec::new(),
+        };
+        let report = SuiteReport {
+            cases: vec![case_report("flaky", false)],
+        };
+
+        // A retry that did NOT clear pass^k (e.g. 4 of 5 runs passed).
+        let mut cmp = BaselineComparison {
+            per_case: [("flaky".to_string(), regression())].into_iter().collect(),
+        };
+        let rerun: BTreeMap<String, bool> = [("flaky".to_string(), false)].into_iter().collect();
+        let flaky =
+            zeroclaw_eval::baseline::downgrade_flaky_regressions(&mut cmp, Mode::Live, &rerun);
+        assert!(
+            flaky.is_empty(),
+            "a retry short of pass^k must not be excused as flaky"
+        );
+        assert_eq!(
+            report.exit_code(SuiteKind::Regression, Some(&cmp)),
+            1,
+            "an unexcused regression must gate"
+        );
+
+        // A retry that DID clear pass^k is still excused, as designed.
+        let mut cmp_ok = BaselineComparison {
+            per_case: [("flaky".to_string(), regression())].into_iter().collect(),
+        };
+        let rerun_ok: BTreeMap<String, bool> = [("flaky".to_string(), true)].into_iter().collect();
+        let flaky_ok = zeroclaw_eval::baseline::downgrade_flaky_regressions(
+            &mut cmp_ok,
+            Mode::Live,
+            &rerun_ok,
+        );
+        assert_eq!(flaky_ok, vec!["flaky".to_string()]);
     }
 
     #[test]

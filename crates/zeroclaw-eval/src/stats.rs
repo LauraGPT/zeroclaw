@@ -159,14 +159,23 @@ pub struct RunSample {
 /// Aggregated statistics over k isolated runs of one case.
 #[derive(Debug, Clone)]
 pub struct RepeatStats {
+    /// Repetitions requested by the effective repeat policy.
     pub k: u32,
     pub passes: u32,
+    /// Repetitions that actually produced an outcome. Equals `k` for a complete
+    /// set, and is lower when an error truncated the loop. Kept distinct from
+    /// `k` so `pass^k` stays fail-closed on a truncated set: the missing
+    /// repetitions never count as passes.
+    pub completed: u32,
+    /// The error that truncated the repetition loop, if any. Evidence from the
+    /// repetitions completed before it is still retained.
+    pub error: Option<String>,
     pub token_mean: f64,
     pub token_stddev: f64,
     pub duration_mean: f64,
     pub duration_stddev: f64,
     /// Per-check count of runs whose result differed from that check's modal
-    /// (most common) result across the k runs.
+    /// (most common) result across the completed runs.
     pub check_flips: std::collections::BTreeMap<String, u32>,
 }
 
@@ -197,12 +206,30 @@ impl RepeatStats {
         RepeatStats {
             k,
             passes,
+            completed: runs.len() as u32,
+            error: None,
             token_mean: mean(&tokens),
             token_stddev: sample_stddev(&tokens),
             duration_mean: mean(&durations),
             duration_stddev: sample_stddev(&durations),
             check_flips,
         }
+    }
+
+    /// Statistics for a repetition loop that errored partway through: the
+    /// completed repetitions are aggregated as usual and the error is retained
+    /// alongside them, so paid live runs are never discarded as evidence.
+    pub fn from_partial_runs(k: u32, runs: &[RunSample], error: String) -> RepeatStats {
+        RepeatStats {
+            error: Some(error),
+            ..RepeatStats::from_runs(k, runs)
+        }
+    }
+
+    /// True when the repetition loop ended early. `passes` and `proportion()`
+    /// then describe only the completed repetitions.
+    pub fn truncated(&self) -> bool {
+        self.error.is_some() || self.completed < self.k
     }
 
     pub fn proportion(&self) -> f64 {

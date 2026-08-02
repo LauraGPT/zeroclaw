@@ -95,15 +95,32 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
             .to_string();
 
         let report = match run_case_repeated(&trace, deps).await {
-            Ok((outcome, repeat)) => CaseReport {
-                name,
-                source,
-                record: Some(outcome.record),
-                grades: outcome.grades,
-                error: None,
-                repeat,
-                cluster: trace.cluster.clone(),
-            },
+            Ok((outcome, repeat)) => {
+                // A truncated repetition set must not pass: the representative's
+                // grades only describe the repetitions that completed, so a
+                // case whose completed runs all passed would otherwise clear
+                // pass^k on fewer than k runs. Surface the truncation as the
+                // case error (which counts as a failure) while keeping the
+                // record, grades, and partial statistics as evidence.
+                let error = repeat.as_ref().and_then(|r| {
+                    r.truncated().then(|| {
+                        let detail = r.error.as_deref().unwrap_or("repetition did not complete");
+                        format!(
+                            "repeat {}/{} runs completed (pass^k not established): {detail}",
+                            r.completed, r.k
+                        )
+                    })
+                });
+                CaseReport {
+                    name,
+                    source,
+                    record: Some(outcome.record),
+                    grades: outcome.grades,
+                    error,
+                    repeat,
+                    cluster: trace.cluster.clone(),
+                }
+            }
             Err(e) => CaseReport {
                 name,
                 source,
@@ -125,6 +142,13 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
 /// representative outcome (a failing run when any exists, so its grades explain
 /// the failure; otherwise the first run) plus aggregated [`RepeatStats`]. The
 /// representative's grades make the case pass iff every run passed (pass^k).
+///
+/// If a repetition errors, the repetitions already completed are still
+/// aggregated and returned rather than discarded: live runs are paid, and the
+/// evidence from a partial set is what makes the aggregate disputable. The
+/// error is retained on the stats, and the case still fails `pass^k` because
+/// the missing repetitions never count as passes. The error only propagates
+/// when it leaves no completed repetition to report.
 pub async fn run_case_repeated(
     trace: &LlmTrace,
     deps: &RunDeps,
@@ -137,8 +161,27 @@ pub async fn run_case_repeated(
         return Ok((run_case(trace, deps).await?, None));
     }
     let mut outcomes = Vec::with_capacity(k as usize);
-    for _ in 0..k {
-        outcomes.push(run_case(trace, deps).await?);
+    let mut run_error: Option<String> = None;
+    for i in 0..k {
+        match run_case(trace, deps).await {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(e) => {
+                // Keep the evidence from repetitions 0..i and stop; with no
+                // completed repetition there is nothing to report, so the error
+                // propagates as an errored case instead.
+                if outcomes.is_empty() {
+                    return Err(e);
+                }
+                eprintln!(
+                    "  {} (repeat): repetition {}/{k} errored, reporting {} completed run(s): {e}",
+                    trace.display_id(),
+                    i + 1,
+                    outcomes.len()
+                );
+                run_error = Some(e.to_string());
+                break;
+            }
+        }
     }
     let all_pass = |o: &CaseOutcome| o.grades.iter().all(|g| g.passed);
     let samples: Vec<crate::stats::RunSample> = outcomes
@@ -154,7 +197,10 @@ pub async fn run_case_repeated(
                 .collect(),
         })
         .collect();
-    let stats = crate::stats::RepeatStats::from_runs(k, &samples);
+    let stats = match run_error {
+        Some(e) => crate::stats::RepeatStats::from_partial_runs(k, &samples, e),
+        None => crate::stats::RepeatStats::from_runs(k, &samples),
+    };
     let rep_idx = outcomes.iter().position(|o| !all_pass(o)).unwrap_or(0);
     let representative = outcomes.swap_remove(rep_idx);
     Ok((representative, Some(stats)))

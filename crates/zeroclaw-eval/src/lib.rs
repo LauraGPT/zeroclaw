@@ -16,7 +16,9 @@ pub use case::{CaseSetup, LlmTrace, TraceExpects};
 pub use grader::{GradeCategory, GradeContext, GradeResult, Grader};
 pub use record::RunRecord;
 pub use report::{CaseReport, SuiteReport};
-pub use runner::{CaseOutcome, RunDeps, ensure_live_provider, run_case, run_suite};
+pub use runner::{
+    CaseOutcome, RunDeps, ensure_live_provider, run_case, run_case_repeated, run_suite,
+};
 
 use std::str::FromStr;
 
