@@ -74,8 +74,12 @@ certificates. The configured certificates are added to the default trust store;
 certificate-chain, expiry, and hostname verification remain enabled.
 
 A relative, missing, unreadable, empty, oversized, non-regular, or invalid CA
-file is a hard connection error for that server. The path must name a regular
-file no larger than 1 MiB. ZeroClaw never disables verification or silently
+file is a hard connection error for that server. The path must resolve to a
+regular file no larger than 1 MiB. Symlinks are followed, so certificate
+rotation and mounted-secret layouts that publish the bundle through a symlink
+work as configured; the resolved file is validated after it is opened, and a
+symlink that resolves to a directory, device, or FIFO is rejected. ZeroClaw
+never disables verification or silently
 falls back when this field is set. The configured server URL and any message
 endpoint advertised by an SSE server must use `https://`; plaintext URLs and
 downgrade redirects are rejected before request headers or content are sent.

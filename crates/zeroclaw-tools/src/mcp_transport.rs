@@ -90,27 +90,32 @@ fn require_https_url(server_name: &str, url: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "MCP server `{}`: cannot inspect TLS CA certificate at `{path}`",
-            config.name
-        )
-    })?;
-    if !metadata.file_type().is_file() {
-        bail!(
-            "MCP server `{}`: TLS CA certificate path must name a regular file: `{path}`",
-            config.name
-        );
+/// Open a candidate CA file without letting a special file block the caller.
+///
+/// The open itself carries `O_NONBLOCK` on unix so that a FIFO (or a symlink to
+/// one) substituted at `path` returns a handle immediately instead of parking
+/// the thread until a writer appears. Classification happens on the returned
+/// handle, never on a second pathname lookup, so the file object we validate is
+/// the same one we read.
+///
+/// Symlinks are followed deliberately: certificate rotation and mounted-secret
+/// deployments publish CA bundles through symlink indirection. Following them is
+/// safe here precisely because the resulting handle is classified after the
+/// open — a symlink that retargets to a special file still yields a handle we
+/// reject rather than a blocking open.
+fn open_tls_ca_file(path: &str) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
     }
-    if metadata.len() > MAX_TLS_CA_BYTES as u64 {
-        bail!(
-            "MCP server `{}`: TLS CA certificate at `{path}` exceeds the {MAX_TLS_CA_BYTES}-byte limit",
-            config.name
-        );
-    }
+    options.open(path)
+}
 
-    let file = std::fs::File::open(path).with_context(|| {
+fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
+    let file = open_tls_ca_file(path).with_context(|| {
         format!(
             "MCP server `{}`: cannot read TLS CA certificate at `{path}`",
             config.name
@@ -2557,7 +2562,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remote_transport_rejects_special_custom_ca_file_without_opening_it() {
+    fn remote_transport_rejects_special_custom_ca_file() {
         let config = McpServerConfig {
             name: "internal".into(),
             transport: McpTransport::Http,
@@ -2568,7 +2573,95 @@ mod tests {
 
         let error = HttpTransport::new(&config)
             .err()
-            .expect("a non-terminating device must be rejected before opening");
+            .expect("a non-terminating device must be rejected");
+        assert!(error.to_string().contains("must name a regular file"));
+    }
+
+    /// Create a FIFO at `path` using the POSIX utility, so the test does not
+    /// need `unsafe` to reach `mkfifo(3)`.
+    #[cfg(unix)]
+    fn make_test_fifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo must be available on unix");
+        assert!(status.success(), "mkfifo failed for {}", path.display());
+    }
+
+    /// A CA path that alternates between a regular file and a FIFO must never
+    /// park the loader. The pathname is classified only through the opened
+    /// handle, so the losing side of the race is rejected rather than blocking
+    /// MCP registry startup on a writer that never arrives.
+    #[cfg(unix)]
+    #[test]
+    fn custom_ca_path_swapped_for_a_fifo_returns_instead_of_hanging() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let ca_path = directory.path().join("rotating-ca.pem");
+        let pem = test_ca_file();
+        let pem_bytes = std::fs::read(pem.path()).unwrap();
+
+        let config_for = |path: &std::path::Path| McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        // Alternate the same path between a readable bundle and a FIFO. Each
+        // iteration must terminate: the regular file loads, the FIFO is
+        // rejected as a non-regular file. A blocking open would hang here
+        // forever because nothing ever opens the FIFO for writing.
+        for _ in 0..10 {
+            std::fs::write(&ca_path, &pem_bytes).unwrap();
+            load_tls_ca_pem(&config_for(&ca_path), &ca_path.to_string_lossy())
+                .expect("a regular CA bundle must still load");
+
+            std::fs::remove_file(&ca_path).unwrap();
+            make_test_fifo(&ca_path);
+            let error = load_tls_ca_pem(&config_for(&ca_path), &ca_path.to_string_lossy())
+                .expect_err("a FIFO must be rejected, not opened for reading");
+            assert!(error.to_string().contains("must name a regular file"));
+
+            std::fs::remove_file(&ca_path).unwrap();
+        }
+    }
+
+    /// Certificate rotation and mounted-secret deployments publish CA bundles
+    /// through symlink indirection, so a symlink to a bounded regular file is
+    /// supported. A symlink pointing at a special file is still rejected,
+    /// because classification happens on the opened handle.
+    #[cfg(unix)]
+    #[test]
+    fn custom_ca_follows_symlinks_to_regular_files_but_not_to_special_files() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let pem = test_ca_file();
+        let pem_bytes = std::fs::read(pem.path()).unwrap();
+
+        let target = directory.path().join("real-ca.pem");
+        std::fs::write(&target, &pem_bytes).unwrap();
+        let link = directory.path().join("linked-ca.pem");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let config_for = |path: &std::path::Path| McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let loaded = load_tls_ca_pem(&config_for(&link), &link.to_string_lossy())
+            .expect("a symlink to a bounded regular CA file must load");
+        assert_eq!(loaded, pem_bytes);
+
+        let fifo_target = directory.path().join("special");
+        make_test_fifo(&fifo_target);
+        let fifo_link = directory.path().join("linked-special");
+        std::os::unix::fs::symlink(&fifo_target, &fifo_link).unwrap();
+
+        let error = load_tls_ca_pem(&config_for(&fifo_link), &fifo_link.to_string_lossy())
+            .expect_err("a symlink to a FIFO must be rejected");
         assert!(error.to_string().contains("must name a regular file"));
     }
 
