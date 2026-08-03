@@ -102,10 +102,6 @@ impl HelpOverlayState {
 }
 
 /// Mode bar entries. Shared between drawing and click detection.
-/// SOP authoring is not exposed from any build: the web dashboard ships as the
-/// first experimental release while the TUI pane cooks longer. `Mode::Sop` is
-/// deliberately absent here so the pane is unreachable from navigation
-/// regardless of feature selection.
 const MODES: &[Mode] = &[
     Mode::Dashboard,
     Mode::Config,
@@ -114,6 +110,7 @@ const MODES: &[Mode] = &[
     Mode::Logs,
     Mode::Doctor,
     Mode::Quickstart,
+    Mode::Sop,
 ];
 
 // ── Mode enum ────────────────────────────────────────────────────
@@ -127,7 +124,6 @@ enum Mode {
     Chat,
     Logs,
     Quickstart,
-    #[allow(dead_code)]
     Sop,
 }
 
