@@ -71,7 +71,7 @@ The connection is one-to-one. ZeroClaw reconnects with bounded backoff and sends
 | Direction | Native backend | Wyoming backend | Effect |
 |---|---|---|---|
 | Host → ZeroClaw | `speech_end { transcript }` | `transcript` with `data.text` | Start an agent turn from a final transcript |
-| Host → ZeroClaw | — | `transcript-chunk` with `data.text` | Add passive context when `forward_partials = true` |
+| Host → ZeroClaw | Not supported | `transcript-chunk` with `data.text` | Add passive context when `forward_partials = true` |
 | Host → ZeroClaw | `barge_in` | `user-event` named `barge_in` | Cancel the current turn without starting another |
 | ZeroClaw → host | `say { text, voice? }` | `synthesize` | Synthesize and play the agent response |
 | ZeroClaw → host | `tts_cancel` | `user-event` named `tts_cancel` | Stop current playback |
