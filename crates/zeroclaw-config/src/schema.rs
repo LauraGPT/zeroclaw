@@ -16512,15 +16512,24 @@ pub struct AuditConfig {
     #[serde(default = "default_audit_enabled")]
     pub enabled: bool,
 
-    /// Path to audit log file (relative to zeroclaw dir)
+    /// Path to audit log file (relative to zeroclaw dir).
+    ///
+    /// **Currently inert.** No production audit writer exists, so no file is
+    /// ever created at this path. Reserved for the future audit pipeline.
     #[serde(default = "default_audit_log_path")]
     pub log_path: String,
 
-    /// Maximum log size in MB before rotation
+    /// Maximum log size in MB before rotation.
+    ///
+    /// **Currently inert.** No production audit writer exists, so nothing is
+    /// written or rotated. Reserved for the future audit pipeline.
     #[serde(default = "default_audit_max_size_mb")]
     pub max_size_mb: u32,
 
-    /// Sign events with HMAC for tamper evidence
+    /// Sign events with HMAC for tamper evidence.
+    ///
+    /// **Currently inert.** No production audit writer exists, so no events
+    /// are recorded or signed. Reserved for the future audit pipeline.
     #[serde(default)]
     pub sign_events: bool,
 }
