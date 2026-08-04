@@ -10975,9 +10975,15 @@ fn build_ws_request(
         "wss" => 443,
         scheme => anyhow::bail!("Unsupported WebSocket URL scheme '{scheme}'"),
     };
-    let target_host = target
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("WebSocket URL has no host: {ws_url}"))?;
+    let target_host = target.host_str().ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "WebSocket URL has no host"
+        );
+        anyhow::Error::msg("WebSocket URL has no host")
+    })?;
     let authority_host = if target_host.contains(':') {
         format!("[{target_host}]")
     } else {
