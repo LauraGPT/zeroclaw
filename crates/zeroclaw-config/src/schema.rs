@@ -11154,6 +11154,68 @@ fn resolve_ws_proxy_url(
     preferred.or_else(|| normalize_proxy_url_option(cfg.all_proxy.as_deref()))
 }
 
+fn build_ws_request(
+    ws_url: &str,
+    extra_headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    use tokio_tungstenite::tungstenite::http::header;
+
+    let target =
+        reqwest::Url::parse(ws_url).with_context(|| format!("Invalid WebSocket URL: {ws_url}"))?;
+    let default_port = match target.scheme() {
+        "ws" => 80,
+        "wss" => 443,
+        scheme => anyhow::bail!("Unsupported WebSocket URL scheme '{scheme}'"),
+    };
+    let target_host = target
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("WebSocket URL has no host: {ws_url}"))?;
+    let authority_host = if target_host.contains(':') {
+        format!("[{target_host}]")
+    } else {
+        target_host.to_string()
+    };
+    let target_port = target.port().unwrap_or(default_port);
+    let host_header = if target_port == default_port {
+        authority_host
+    } else {
+        format!("{authority_host}:{target_port}")
+    };
+
+    const RESERVED_HEADERS: [&str; 5] = [
+        "host",
+        "connection",
+        "upgrade",
+        "sec-websocket-key",
+        "sec-websocket-version",
+    ];
+    for name in extra_headers.keys() {
+        if RESERVED_HEADERS.contains(&name.as_str()) {
+            anyhow::bail!(
+                "WebSocket extra headers must not override reserved handshake header '{}'",
+                name.as_str()
+            );
+        }
+    }
+
+    let mut request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(ws_url)
+        .header(header::HOST, host_header)
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(
+            header::SEC_WEBSOCKET_KEY,
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        )
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .body(())
+        .with_context(|| "Failed to build WebSocket upgrade request")?;
+    for (name, value) in extra_headers {
+        request.headers_mut().append(name, value.clone());
+    }
+    Ok(request)
+}
+
 /// Connect a WebSocket through the configured proxy (if any).
 ///
 /// When no proxy applies, this is a thin wrapper around
@@ -11167,6 +11229,21 @@ pub async fn ws_connect_with_proxy(
     ws_url: &str,
     service_key: &str,
     channel_proxy_url: Option<&str>,
+) -> anyhow::Result<(
+    ProxiedWsStream,
+    tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+)> {
+    let headers = tokio_tungstenite::tungstenite::http::HeaderMap::new();
+    ws_connect_with_proxy_headers(ws_url, service_key, channel_proxy_url, &headers).await
+}
+
+/// Connect a WebSocket through the configured proxy while adding safe HTTP
+/// upgrade headers. Mandatory WebSocket handshake headers cannot be replaced.
+pub async fn ws_connect_with_proxy_headers(
+    ws_url: &str,
+    service_key: &str,
+    channel_proxy_url: Option<&str>,
+    extra_headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
 ) -> anyhow::Result<(
     ProxiedWsStream,
     tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
@@ -11230,25 +11307,7 @@ pub async fn ws_connect_with_proxy(
                 BoxedIo(Box::new(tcp))
             };
 
-            let default_port = if is_secure { 443 } else { 80 };
-            let host_header = if target_port == default_port {
-                target_host.clone()
-            } else {
-                format!("{target_host}:{target_port}")
-            };
-
-            let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-                .uri(ws_url)
-                .header("Host", host_header)
-                .header("Connection", "Upgrade")
-                .header("Upgrade", "websocket")
-                .header(
-                    "Sec-WebSocket-Key",
-                    tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-                )
-                .header("Sec-WebSocket-Version", "13")
-                .body(())
-                .with_context(|| "Failed to build WebSocket upgrade request")?;
+            let ws_request = build_ws_request(ws_url, extra_headers)?;
 
             let (ws_stream, response) =
                 tokio_tungstenite::client_async(ws_request, stream)
@@ -11257,7 +11316,7 @@ pub async fn ws_connect_with_proxy(
 
             Ok((ws_stream, response))
         }
-        Some(proxy) => ws_connect_via_proxy(ws_url, &proxy).await,
+        Some(proxy) => ws_connect_via_proxy(ws_url, &proxy, extra_headers).await,
     }
 }
 
@@ -11265,6 +11324,7 @@ pub async fn ws_connect_with_proxy(
 async fn ws_connect_via_proxy(
     ws_url: &str,
     proxy_url: &str,
+    extra_headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
 ) -> anyhow::Result<(
     ProxiedWsStream,
     tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
@@ -11397,18 +11457,7 @@ async fn ws_connect_via_proxy(
     };
 
     // Perform the WebSocket client handshake over the tunnelled stream.
-    let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(ws_url)
-        .header("Host", format!("{target_host}:{target_port}"))
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header(
-            "Sec-WebSocket-Key",
-            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-        )
-        .header("Sec-WebSocket-Version", "13")
-        .body(())
-        .with_context(|| "Failed to build WebSocket upgrade request")?;
+    let ws_request = build_ws_request(ws_url, extra_headers)?;
 
     let (ws_stream, response) = tokio_tungstenite::client_async(ws_request, stream)
         .await
@@ -28307,6 +28356,53 @@ auto_save = true
         config
             .validate()
             .expect("disabled voicehost stub must not fail validation");
+    }
+
+    #[test]
+    async fn ws_request_preserves_authorization_and_handshake_headers() {
+        use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer test-token"),
+        );
+        headers.insert("x-voicehost-client", HeaderValue::from_static("zeroclaw"));
+
+        let request = build_ws_request("wss://voice.example.test/ws", &headers).unwrap();
+        assert_eq!(request.uri(), "wss://voice.example.test/ws");
+        assert_eq!(request.headers()[header::HOST], "voice.example.test");
+        assert_eq!(request.headers()[header::CONNECTION], "Upgrade");
+        assert_eq!(request.headers()[header::UPGRADE], "websocket");
+        assert_eq!(request.headers()["sec-websocket-version"], "13");
+        assert!(!request.headers()["sec-websocket-key"].as_bytes().is_empty());
+        assert_eq!(
+            request.headers()[header::AUTHORIZATION],
+            "Bearer test-token"
+        );
+        assert_eq!(request.headers()["x-voicehost-client"], "zeroclaw");
+    }
+
+    #[test]
+    async fn ws_request_rejects_reserved_handshake_header_overrides() {
+        use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
+
+        for name in [
+            header::HOST,
+            header::CONNECTION,
+            header::UPGRADE,
+            header::SEC_WEBSOCKET_KEY,
+            header::SEC_WEBSOCKET_VERSION,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name.clone(), HeaderValue::from_static("override"));
+            let error = build_ws_request("ws://127.0.0.1:8765/ws", &headers)
+                .expect_err("mandatory handshake headers must not be replaceable");
+            assert!(
+                error.to_string().contains(name.as_str()),
+                "error must name reserved header {name}: {error:#}"
+            );
+        }
     }
 
     #[test]
