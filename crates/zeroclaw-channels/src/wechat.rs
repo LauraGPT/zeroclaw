@@ -2452,6 +2452,29 @@ impl Channel for WeChatChannel {
             // attachment that will never succeed would wedge the listener.
             let mut batch_has_retryable_attachment_failure = false;
 
+            // Everything the batch wants to do downstream, staged in batch
+            // order. Nothing is published to `tx` — and no unauthorized-user
+            // side effect (pairing attempt, reply) runs — until the ENTIRE
+            // batch has been prepared without a retryable attachment
+            // failure. Publishing earlier would redeliver every
+            // already-sent message on each held-batch re-poll: the cursor
+            // is retained across held passes, so the same batch is fetched
+            // again and any message that already crossed `tx.send` would
+            // start another agent turn (and repeat downstream tool
+            // effects) per pass.
+            enum StagedInbound {
+                /// An authorized message, fully prepared and ready to
+                /// publish downstream.
+                Deliver(Box<ChannelMessage>),
+                /// A message from an unauthorized sender. Handling it has
+                /// side effects (pairing attempts, outbound replies), so
+                /// it is deferred the same way as delivery: a held batch
+                /// re-polls these messages, and running the side effect on
+                /// every held pass would spam pairing replies.
+                Unauthorized { from_user_id: String, text: String },
+            }
+            let mut staged: Vec<StagedInbound> = Vec::new();
+
             for msg in &msgs {
                 let from_user_id = msg
                     .get("from_user_id")
@@ -2482,9 +2505,14 @@ impl Channel for WeChatChannel {
 
                 let text = extract_text_from_items(&items);
 
-                // Check authorization
+                // Check authorization. The unauthorized handler sends
+                // replies (side effects), so it is staged like a delivery
+                // rather than run mid-preparation — see `StagedInbound`.
                 if !self.is_user_allowed(from_user_id) {
-                    self.handle_unauthorized_message(from_user_id, &text).await;
+                    staged.push(StagedInbound::Unauthorized {
+                        from_user_id: from_user_id.to_string(),
+                        text,
+                    });
                     continue;
                 }
 
@@ -2493,14 +2521,16 @@ impl Channel for WeChatChannel {
                         AttachmentDisposition::Ready(marker) => Some(marker),
                         AttachmentDisposition::None | AttachmentDisposition::Permanent => None,
                         AttachmentDisposition::Retryable => {
-                            // Defer the rest of the batch. The cursor is held
-                            // below, so this exact batch is re-fetched on the
-                            // next poll. Enqueueing this message's degraded
-                            // (attachment-less) content — or any later message
-                            // in the batch — would therefore redeliver it on
-                            // every pass for as long as the failure persists,
-                            // and each duplicate can start another agent turn
-                            // and repeat downstream tool effects.
+                            // Defer the whole batch. The cursor is held
+                            // below, so this exact batch is re-fetched on
+                            // the next poll. The messages staged so far are
+                            // discarded — NOT published — because the held
+                            // cursor means they will be re-fetched and
+                            // re-staged on the next pass; publishing them
+                            // now would deliver them again on every pass
+                            // for as long as the failure persists, and each
+                            // duplicate can start another agent turn and
+                            // repeat downstream tool effects.
                             batch_has_retryable_attachment_failure = true;
                             break;
                         }
@@ -2534,17 +2564,38 @@ impl Channel for WeChatChannel {
                     ..Default::default()
                 };
 
-                if tx.send(channel_msg).await.is_err() {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        "channel receiver dropped, stopping"
-                    );
-                    // Do NOT commit `next_cursor` here: the batch is only
-                    // partially (or not at all) enqueued, so the old
-                    // cursor must stay on disk. On supervised restart
-                    // `listen()` reloads it and re-polls this batch.
-                    return Ok(());
+                staged.push(StagedInbound::Deliver(Box::new(channel_msg)));
+            }
+
+            // Publish only after the WHOLE batch prepared cleanly. A
+            // retryable failure discards the staged messages instead —
+            // they are re-fetched with the held cursor on the next pass,
+            // so nothing is lost, and nothing was delivered twice.
+            if !batch_has_retryable_attachment_failure {
+                for item in staged {
+                    match item {
+                        StagedInbound::Deliver(channel_msg) => {
+                            if tx.send(*channel_msg).await.is_err() {
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    ),
+                                    "channel receiver dropped, stopping"
+                                );
+                                // Do NOT commit `next_cursor` here: the batch is
+                                // only partially (or not at all) enqueued, so the
+                                // old cursor must stay on disk. On supervised
+                                // restart `listen()` reloads it and re-polls this
+                                // batch.
+                                return Ok(());
+                            }
+                        }
+                        StagedInbound::Unauthorized { from_user_id, text } => {
+                            self.handle_unauthorized_message(&from_user_id, &text).await;
+                        }
+                    }
                 }
             }
 
@@ -2566,12 +2617,13 @@ impl Channel for WeChatChannel {
             // the cursor: the attachment is genuinely unfetchable, and
             // holding forever would wedge the listener on it.
             if batch_has_retryable_attachment_failure {
-                // The batch is deferred, not dropped: the enqueue loop
-                // broke at the failing message, so nothing from this batch
-                // past that point was delivered, and the cursor stays put.
-                // Back off before re-polling so a sustained CDN outage
-                // cannot spin this loop; the delay doubles per consecutive
-                // held pass up to a ceiling.
+                // The batch is deferred, not dropped: preparation broke at
+                // the failing message, the staged messages were discarded
+                // unpublished, and the cursor stays put — so the next poll
+                // re-fetches the identical batch and NOTHING from this
+                // pass was delivered. Back off before re-polling so a
+                // sustained CDN outage cannot spin this loop; the delay
+                // doubles per consecutive held pass up to a ceiling.
                 let delay = ATTACHMENT_RETRY_BASE_DELAY
                     .saturating_mul(1u32 << consecutive_attachment_holds.min(5))
                     .min(ATTACHMENT_RETRY_MAX_DELAY);
@@ -3897,6 +3949,160 @@ mod tests {
             *probe.cursor.lock(),
             "cursor_after_batch",
             "cursor must advance once the held batch finally delivers in full"
+        );
+    }
+
+    /// The reviewer-required multi-message staging regression: ordinary
+    /// text message A followed by message B whose attachment fails
+    /// retryably (CDN 503). While the batch is held, NOTHING may be
+    /// delivered — in particular A must not cross `tx.send`, or it would
+    /// start a fresh agent turn on every held re-poll. Once the CDN
+    /// recovers, A and B arrive exactly once, in order, with no
+    /// duplicates afterward.
+    #[tokio::test]
+    async fn listen_stages_whole_batch_before_publishing_any_message() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        let two_message_batch = || {
+            getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "plain text A"}}]
+                    },
+                    {
+                        "from_user_id": "user_b",
+                        "message_id": 2,
+                        "create_time_ms": 1_700_000_001_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "caption B"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )
+        };
+
+        // The server replays the batch for as long as the client polls
+        // with the pre-batch cursor, and has nothing once it acknowledges.
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(two_message_batch()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        // CDN: retryable failure (503) on the first attempt, success after.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // While the batch is held by B's 503, NOTHING is delivered — not
+        // even A, whose own preparation succeeded. Publishing A here would
+        // redeliver it on every held re-poll.
+        let held = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            held.is_err(),
+            "message A must not be published while a later message holds the batch"
+        );
+
+        // After the backed-off re-poll the CDN succeeds: A then B arrive,
+        // in order, on the same listener.
+        let first = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("timed out waiting for message A after recovery")
+            .expect("channel closed before message A");
+        assert_eq!(first.sender, "user_a");
+        assert_eq!(first.content, "plain text A");
+
+        let second = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("timed out waiting for message B after recovery")
+            .expect("channel closed before message B");
+        assert_eq!(second.sender, "user_b");
+        assert!(
+            second.content.contains("[IMAGE:"),
+            "message B must carry its recovered attachment, got: {}",
+            second.content
+        );
+        assert!(
+            second.content.contains("caption B"),
+            "message B must still carry its text, got: {}",
+            second.content
+        );
+
+        // Exactly once: the committed cursor means the next poll returns
+        // an empty batch, so no duplicate of A or B may appear.
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            duplicate.is_err(),
+            "a recovered batch must deliver exactly once, got a duplicate"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "cursor_after_batch",
+            "cursor must advance once the held batch delivers in full"
         );
     }
 
