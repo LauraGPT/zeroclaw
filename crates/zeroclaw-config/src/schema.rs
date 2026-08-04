@@ -14024,6 +14024,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub voice_call: HashMap<String, crate::scattered_types::VoiceCallConfig>,
+    /// External voice host channel instances (`[channels.voicehost.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub voicehost: HashMap<String, VoiceHostConfig>,
     /// Voice wake word detection channel instances (`[channels.voice_wake.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -14282,6 +14286,12 @@ impl ChannelsConfig {
                 configured: !self.voice_call.is_empty(),
             },
             ChannelInfo {
+                kind: "voicehost",
+                name: "VoiceHost",
+                desc: "external ASR and TTS host over WebSocket",
+                configured: !self.voicehost.is_empty(),
+            },
+            ChannelInfo {
                 kind: "voice-wake",
                 name: "VoiceWake",
                 desc: "voice wake word detection",
@@ -14355,6 +14365,7 @@ impl ChannelsConfig {
             || self.reddit.values().any(|c| c.enabled)
             || self.bluesky.values().any(|c| c.enabled)
             || self.voice_call.values().any(|c| c.enabled)
+            || self.voicehost.values().any(|c| c.enabled)
             || self.voice_wake.values().any(|c| c.enabled)
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
@@ -14371,7 +14382,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -14403,6 +14414,7 @@ impl ChannelsConfig {
             ("bluesky", !self.bluesky.is_empty(), true),
             ("git", !self.git.is_empty(), true),
             ("voice_call", !self.voice_call.is_empty(), true),
+            ("voicehost", !self.voicehost.is_empty(), true),
             ("voice_wake", !self.voice_wake.is_empty(), false),
             ("voice_duplex", !self.voice_duplex.is_empty(), false),
             ("mqtt", !self.mqtt.is_empty(), false),
@@ -14489,6 +14501,7 @@ impl Default for ChannelsConfig {
             bluesky: HashMap::new(),
             git: HashMap::new(),
             voice_call: HashMap::new(),
+            voicehost: HashMap::new(),
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
@@ -18433,6 +18446,77 @@ pub struct VoiceDuplexConfig {
     pub excluded_tools: Vec<String>,
 }
 
+/// External voice host configuration.
+///
+/// The host owns audio capture, VAD, ASR, TTS, and playback. ZeroClaw exchanges
+/// transcripts and text responses over WebSocket and remains responsible for
+/// the agent, RAG, MCP, tools, and approval loop.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.voicehost"]
+pub struct VoiceHostConfig {
+    /// Whether this channel instance is active. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Wire codec used by the voice host. Default: `native`.
+    #[serde(default = "default_voicehost_backend")]
+    pub backend: String,
+    /// Voice host WebSocket endpoint (`ws://` or `wss://`).
+    #[serde(default)]
+    pub url: String,
+    /// Optional bearer token sent only in the WebSocket upgrade request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+    /// Optional voice name forwarded with spoken responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// Forward partial transcripts as passive conversation context.
+    #[serde(default)]
+    pub forward_partials: bool,
+    /// Optional per-channel proxy URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    /// Seconds to wait for an operator approval response. Default: 300.
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// Tools excluded from this channel's tool spec.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+fn default_voicehost_backend() -> String {
+    "native".into()
+}
+
+impl Default for VoiceHostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: default_voicehost_backend(),
+            url: String::new(),
+            api_key: None,
+            voice: None,
+            forward_partials: false,
+            proxy_url: None,
+            approval_timeout_secs: default_channel_approval_timeout_secs(),
+            excluded_tools: Vec::new(),
+        }
+    }
+}
+
+impl ChannelConfig for VoiceHostConfig {
+    fn name() -> &'static str {
+        "VoiceHost"
+    }
+
+    fn desc() -> &'static str {
+        "external ASR and TTS host over WebSocket"
+    }
+}
+
 /// Voice wake word detection channel configuration.
 ///
 /// Listens on the default microphone for a configurable wake word,
@@ -21267,6 +21351,47 @@ impl Config {
                 vc.enabled,
                 &vc.from_number,
             )?;
+        }
+
+        for (alias, voicehost) in &self.channels.voicehost {
+            if !voicehost.enabled {
+                continue;
+            }
+
+            let backend_path = format!("channels.voicehost.{alias}.backend");
+            if voicehost.backend.trim().is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    backend_path,
+                    "{backend_path} must not be empty when the channel is enabled"
+                );
+            }
+
+            let url_path = format!("channels.voicehost.{alias}.url");
+            let parsed = match reqwest::Url::parse(&voicehost.url) {
+                Ok(parsed) => parsed,
+                Err(error) => validation_bail!(
+                    InvalidFormat,
+                    url_path,
+                    "{url_path} must be an absolute ws:// or wss:// URL: {error}"
+                ),
+            };
+            if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
+                validation_bail!(
+                    InvalidFormat,
+                    url_path,
+                    "{url_path} must be an absolute ws:// or wss:// URL"
+                );
+            }
+
+            if voicehost.approval_timeout_secs == 0 {
+                let timeout_path = format!("channels.voicehost.{alias}.approval_timeout_secs");
+                validation_bail!(
+                    InvalidNumericRange,
+                    timeout_path,
+                    "{timeout_path} must be greater than 0"
+                );
+            }
         }
 
         // Git forge channel: a PAT-backed provider must name its API origin
@@ -27746,12 +27871,111 @@ auto_save = true
         assert!(c.cli);
         assert!(c.telegram.is_empty());
         assert!(c.discord.is_empty());
+        assert!(c.voicehost.is_empty());
         assert!(c.wecom_ws.is_empty());
         assert!(!c.show_tool_calls);
         assert_eq!(
             c.max_concurrent_per_channel,
             default_channel_max_concurrent_per_channel()
         );
+    }
+
+    #[test]
+    async fn voicehost_config_serde_defaults_and_secret_metadata() {
+        let parsed: Config = toml::from_str(
+            r#"
+                [channels.voicehost.office]
+                enabled = true
+                url = "wss://voice.example.test/ws"
+                api_key = "secret-token"
+                voice = "en-US"
+            "#,
+        )
+        .unwrap();
+        let voicehost = parsed.channels.voicehost.get("office").unwrap();
+
+        assert!(voicehost.enabled);
+        assert_eq!(voicehost.backend, "native");
+        assert_eq!(voicehost.url, "wss://voice.example.test/ws");
+        assert_eq!(voicehost.api_key.as_deref(), Some("secret-token"));
+        assert_eq!(voicehost.voice.as_deref(), Some("en-US"));
+        assert!(!voicehost.forward_partials);
+        assert_eq!(voicehost.approval_timeout_secs, 300);
+        assert!(voicehost.excluded_tools.is_empty());
+        assert!(!VoiceHostConfig::default().enabled);
+        assert!(VoiceHostConfig::prop_is_secret(
+            "channels.voicehost.api_key"
+        ));
+    }
+
+    fn voicehost_config(url: &str) -> VoiceHostConfig {
+        VoiceHostConfig {
+            enabled: true,
+            url: url.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    async fn validate_voicehost_requires_backend_url_and_positive_timeout() {
+        let cases = [
+            (
+                VoiceHostConfig {
+                    backend: "   ".into(),
+                    ..voicehost_config("ws://127.0.0.1:8765")
+                },
+                "channels.voicehost.office.backend",
+            ),
+            (voicehost_config(""), "channels.voicehost.office.url"),
+            (
+                voicehost_config("https://voice.example.test/ws"),
+                "channels.voicehost.office.url",
+            ),
+            (
+                VoiceHostConfig {
+                    approval_timeout_secs: 0,
+                    ..voicehost_config("wss://voice.example.test/ws")
+                },
+                "channels.voicehost.office.approval_timeout_secs",
+            ),
+        ];
+
+        for (voicehost, expected_path) in cases {
+            let mut config = Config::default();
+            config.channels.voicehost.insert("office".into(), voicehost);
+            let error = config.validate().expect_err("invalid voicehost config");
+            assert!(
+                error.to_string().contains(expected_path),
+                "expected {expected_path} in {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_voicehost_accepts_ws_wss_and_ignores_disabled_stubs() {
+        for url in ["ws://127.0.0.1:8765", "wss://voice.example.test/ws"] {
+            let mut config = Config::default();
+            config
+                .channels
+                .voicehost
+                .insert("office".into(), voicehost_config(url));
+            config.validate().expect("valid voicehost URL must pass");
+        }
+
+        let mut config = Config::default();
+        config.channels.voicehost.insert(
+            "staged".into(),
+            VoiceHostConfig {
+                enabled: false,
+                backend: String::new(),
+                url: String::new(),
+                approval_timeout_secs: 0,
+                ..Default::default()
+            },
+        );
+        config
+            .validate()
+            .expect("disabled voicehost stub must not fail validation");
     }
 
     #[test]
@@ -27976,6 +28200,7 @@ auto_save = true
                 bluesky: HashMap::new(),
                 git: HashMap::new(),
                 voice_call: HashMap::new(),
+                voicehost: HashMap::new(),
                 voice_duplex: HashMap::new(),
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
@@ -29887,6 +30112,7 @@ allowed_users = ["@u:matrix.org"]
             bluesky: HashMap::new(),
             git: HashMap::new(),
             voice_call: HashMap::new(),
+            voicehost: HashMap::new(),
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
@@ -30438,6 +30664,7 @@ allowed_numbers = ["+1", "+2"]
             bluesky: HashMap::new(),
             git: HashMap::new(),
             voice_call: HashMap::new(),
+            voicehost: HashMap::new(),
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
