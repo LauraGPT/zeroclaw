@@ -21720,6 +21720,16 @@ impl Config {
                     "{backend_path} must not be empty when the channel is enabled"
                 );
             }
+            if !matches!(
+                voicehost.backend.trim().to_ascii_lowercase().as_str(),
+                "native" | "wyoming"
+            ) {
+                validation_bail!(
+                    InvalidFormat,
+                    backend_path,
+                    "{backend_path} must be either 'native' or 'wyoming'"
+                );
+            }
 
             let url_path = format!("channels.voicehost.{alias}.url");
             let parsed = match reqwest::Url::parse(&voicehost.url) {
@@ -28323,6 +28333,13 @@ auto_save = true
                     ..voicehost_config("wss://voice.example.test/ws")
                 },
                 "channels.voicehost.office.approval_timeout_secs",
+            ),
+            (
+                VoiceHostConfig {
+                    backend: "wyomign".into(),
+                    ..voicehost_config("wss://voice.example.test/ws")
+                },
+                "channels.voicehost.office.backend",
             ),
         ];
 

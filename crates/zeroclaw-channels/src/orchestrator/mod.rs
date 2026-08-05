@@ -6554,18 +6554,20 @@ async fn process_channel_message_body(
         memory_sessions.push(Some(history_key.clone()));
     }
 
-    let per_turn_excluded_tools: &[String] =
-        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-            &[]
-        } else {
-            ctx.non_cli_excluded_tools.as_ref()
-        };
+    // Combine the global non-CLI policy with the channel's own exclusions.
+    // VoiceHost must not bypass either safety boundary for a single turn.
+    let per_turn_excluded_tools = effective_excluded_tools(
+        &msg,
+        ctx.autonomy_level,
+        ctx.non_cli_excluded_tools.as_ref(),
+        target_channel.as_deref(),
+    );
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
             route.model.as_str(),
             ctx.tools_registry.as_ref(),
-            per_turn_excluded_tools,
+            per_turn_excluded_tools.as_slice(),
             ctx.activated_tools.as_ref(),
         )
         .unwrap_or(false);
@@ -6590,7 +6592,7 @@ async fn process_channel_message_body(
         target_channel.as_ref(),
         per_turn_native_tool_specs_present,
     );
-    if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
+    if send_message_to_peer_tool_available(ctx.as_ref(), per_turn_excluded_tools.as_slice())
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {
         let peer_map =
@@ -7128,12 +7130,6 @@ async fn process_channel_message_body(
                 .clone()
                 .or_else(|| msg.thread_ts.clone())
                 .or_else(|| Some(msg.id.clone()));
-            let excluded_tools: &[String] =
-                if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                };
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -7160,7 +7156,7 @@ async fn process_channel_message_body(
                     },
                     ResolvedRuntimeKnobs {
                         max_tool_iterations: ctx.max_tool_iterations,
-                        excluded_tools,
+                        excluded_tools: per_turn_excluded_tools.as_slice(),
                         dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
                         pacing: &ctx.pacing,
                         strict_tool_parsing: ctx.agent_cfg.resolved.strict_tool_parsing,
@@ -10085,14 +10081,11 @@ fn find_channel_for_message<'a>(
 
 fn send_message_to_peer_tool_available(
     ctx: &ChannelRuntimeContext,
-    msg: &zeroclaw_api::channel::ChannelMessage,
+    excluded_tools: &[String],
 ) -> bool {
-    let excluded_for_turn = msg.channel != "cli" && ctx.autonomy_level != AutonomyLevel::Full;
-    if excluded_for_turn
-        && ctx
-            .non_cli_excluded_tools
-            .iter()
-            .any(|tool_name| tool_name == "send_message_to_peer")
+    if excluded_tools
+        .iter()
+        .any(|tool_name| tool_name == "send_message_to_peer")
     {
         return false;
     }
@@ -10100,6 +10093,24 @@ fn send_message_to_peer_tool_available(
     ctx.tools_registry
         .iter()
         .any(|tool| tool.name() == "send_message_to_peer")
+}
+
+fn effective_excluded_tools(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    autonomy_level: AutonomyLevel,
+    non_cli_excluded_tools: &[String],
+    target_channel: Option<&dyn Channel>,
+) -> Vec<String> {
+    let mut excluded_tools = Vec::new();
+    if msg.channel != "cli" && autonomy_level != AutonomyLevel::Full {
+        excluded_tools.extend_from_slice(non_cli_excluded_tools);
+    }
+    if let Some(channel) = target_channel {
+        excluded_tools.extend_from_slice(channel.excluded_tools());
+    }
+    excluded_tools.sort_unstable();
+    excluded_tools.dedup();
+    excluded_tools
 }
 
 fn peer_prompt_channel_ref(
@@ -19834,6 +19845,37 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             names.contains(&"aa_mcp__find_npcs"),
             "allowed MCP tool missing from the channel registry; got {names:?}"
+        );
+    }
+
+    #[cfg(feature = "channel-voicehost")]
+    #[test]
+    fn voicehost_excluded_tools_join_non_cli_risk_policy() {
+        let channel = VoiceHostChannel::new(
+            "office".into(),
+            zeroclaw_config::schema::VoiceHostConfig {
+                enabled: true,
+                url: "ws://127.0.0.1:8765/ws".into(),
+                excluded_tools: vec!["shell".into(), "send_message_to_peer".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let msg = ChannelMessage {
+            channel: "voicehost".into(),
+            channel_alias: Some("office".into()),
+            ..Default::default()
+        };
+        let risk_exclusions = vec!["filesystem".into(), "shell".into()];
+
+        assert_eq!(
+            effective_excluded_tools(
+                &msg,
+                AutonomyLevel::default(),
+                &risk_exclusions,
+                Some(&channel),
+            ),
+            ["filesystem", "send_message_to_peer", "shell"]
         );
     }
 

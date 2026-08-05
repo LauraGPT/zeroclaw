@@ -719,6 +719,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Human-readable channel name
     fn name(&self) -> &str;
 
+    /// Tools that must not be exposed while handling turns from this channel.
+    fn excluded_tools(&self) -> &[String] {
+        &[]
+    }
+
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
