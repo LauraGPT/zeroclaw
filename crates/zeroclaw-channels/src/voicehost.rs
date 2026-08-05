@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
@@ -23,6 +23,18 @@ const OUTBOUND_CAPACITY: usize = 64;
 const PING_INTERVAL_SECS: u64 = 20;
 const RECONNECT_DELAYS_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
 
+fn next_reconnect_delay(
+    reconnect_attempt: &mut usize,
+    connected_for: Option<Duration>,
+) -> Duration {
+    if connected_for.is_some_and(|duration| duration >= Duration::from_secs(PING_INTERVAL_SECS)) {
+        *reconnect_attempt = 0;
+    }
+    let delay = RECONNECT_DELAYS_SECS[(*reconnect_attempt).min(RECONNECT_DELAYS_SECS.len() - 1)];
+    *reconnect_attempt = reconnect_attempt.saturating_add(1);
+    Duration::from_secs(delay)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VoiceHostBackend {
     Native,
@@ -30,11 +42,13 @@ enum VoiceHostBackend {
 }
 
 impl VoiceHostBackend {
-    fn from_config(value: &str) -> Self {
-        if value.trim().eq_ignore_ascii_case("wyoming") {
-            Self::Wyoming
-        } else {
-            Self::Native
+    fn from_config(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "native" => Ok(Self::Native),
+            "wyoming" => Ok(Self::Wyoming),
+            other => anyhow::bail!(
+                "unsupported voice host backend '{other}'; expected native or wyoming"
+            ),
         }
     }
 
@@ -58,6 +72,13 @@ enum InboundAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BargeInOutcome {
+    Continue,
+    DispatchClosed,
+    RemoteClosed,
+}
+
 /// A text-only bridge to an external process that owns the audio pipeline.
 pub struct VoiceHostChannel {
     alias: String,
@@ -67,6 +88,7 @@ pub struct VoiceHostChannel {
     forward_partials: bool,
     proxy_url: Option<String>,
     approval_timeout_secs: u64,
+    excluded_tools: Vec<String>,
     headers: HeaderMap,
     outbound: Arc<RwLock<Option<mpsc::Sender<String>>>>,
     pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
@@ -84,12 +106,13 @@ impl VoiceHostChannel {
         let headers = build_auth_headers(config.api_key.as_deref())?;
         Ok(Self {
             alias,
-            backend: VoiceHostBackend::from_config(&config.backend),
+            backend: VoiceHostBackend::from_config(&config.backend)?,
             url: config.url,
             voice: config.voice,
             forward_partials: config.forward_partials,
             proxy_url: config.proxy_url,
             approval_timeout_secs: config.approval_timeout_secs,
+            excluded_tools: config.excluded_tools,
             headers,
             outbound: Arc::new(RwLock::new(None)),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
@@ -140,6 +163,27 @@ impl VoiceHostChannel {
         *self.outbound.write().await = None;
         self.pending_approvals.lock().await.clear();
     }
+
+    async fn handle_barge_in<S>(
+        &self,
+        tx: &mpsc::Sender<ChannelMessage>,
+        write: &mut S,
+    ) -> Result<BargeInOutcome>
+    where
+        S: futures_util::Sink<Message> + Unpin,
+    {
+        if let Some(message) = self.message_for_action(InboundAction::BargeIn)
+            && tx.send(message).await.is_err()
+        {
+            return Ok(BargeInOutcome::DispatchClosed);
+        }
+
+        let cancel = encode_tts_cancel(self.backend)?;
+        if write.send(Message::Text(cancel.into())).await.is_err() {
+            return Ok(BargeInOutcome::RemoteClosed);
+        }
+        Ok(BargeInOutcome::Continue)
+    }
 }
 
 impl Attributable for VoiceHostChannel {
@@ -156,6 +200,10 @@ impl Attributable for VoiceHostChannel {
 impl Channel for VoiceHostChannel {
     fn name(&self) -> &str {
         "voicehost"
+    }
+
+    fn excluded_tools(&self) -> &[String] {
+        &self.excluded_tools
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -198,18 +246,16 @@ impl Channel for VoiceHostChannel {
                             })),
                         "voice host connection failed"
                     );
-                    let delay = RECONNECT_DELAYS_SECS
-                        [reconnect_attempt.min(RECONNECT_DELAYS_SECS.len() - 1)];
-                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    let delay = next_reconnect_delay(&mut reconnect_attempt, None);
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+                        _ = tokio::time::sleep(delay) => {}
                         _ = tx.closed() => return Ok(()),
                     }
                     continue;
                 }
             };
 
-            reconnect_attempt = 0;
+            let connected_at = Instant::now();
             let (mut write, mut read) = socket.split();
             let (outbound_tx, mut outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
             *self.outbound.write().await = Some(outbound_tx);
@@ -295,15 +341,13 @@ impl Channel for VoiceHostChannel {
                                 }
                             }
                             InboundAction::BargeIn => {
-                                let cancel = encode_tts_cancel(self.backend)?;
-                                if write.send(Message::Text(cancel.into())).await.is_err() {
-                                    break;
-                                }
-                                if let Some(message) = self.message_for_action(InboundAction::BargeIn)
-                                    && tx.send(message).await.is_err()
-                                {
-                                    dispatch_closed = true;
-                                    break;
+                                match self.handle_barge_in(&tx, &mut write).await? {
+                                    BargeInOutcome::Continue => {}
+                                    BargeInOutcome::DispatchClosed => {
+                                        dispatch_closed = true;
+                                        break;
+                                    }
+                                    BargeInOutcome::RemoteClosed => break,
                                 }
                             }
                             action @ (InboundAction::FinalTranscript(_)
@@ -338,9 +382,9 @@ impl Channel for VoiceHostChannel {
                 return Ok(());
             }
 
-            let delay = RECONNECT_DELAYS_SECS[0];
+            let delay = next_reconnect_delay(&mut reconnect_attempt, Some(connected_at.elapsed()));
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+                _ = tokio::time::sleep(delay) => {}
                 _ = tx.closed() => return Ok(()),
             }
         }
@@ -599,8 +643,41 @@ struct EmptyData {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
     use zeroclaw_api::channel::ChannelApprovalResponse;
     use zeroclaw_config::schema::VoiceHostConfig;
+
+    struct FailingSink;
+
+    impl futures_util::Sink<Message> for FailingSink {
+        type Error = anyhow::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            anyhow::bail!("remote closed")
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn channel(forward_partials: bool) -> VoiceHostChannel {
         VoiceHostChannel::new(
@@ -613,6 +690,80 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unknown_backend_is_rejected() {
+        let error = match VoiceHostChannel::new(
+            "office".into(),
+            VoiceHostConfig {
+                enabled: true,
+                backend: "wyomign".into(),
+                url: "ws://127.0.0.1:8765/ws".into(),
+                ..Default::default()
+            },
+        ) {
+            Ok(_) => panic!("unknown voice host backend must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("voice host backend"));
+        assert!(error.to_string().contains("native"));
+        assert!(error.to_string().contains("wyoming"));
+    }
+
+    #[test]
+    fn configured_tools_are_excluded_from_voice_turns() {
+        let channel = VoiceHostChannel::new(
+            "office".into(),
+            VoiceHostConfig {
+                enabled: true,
+                url: "ws://127.0.0.1:8765/ws".into(),
+                excluded_tools: vec!["shell".into(), "send_message_to_peer".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(channel.excluded_tools(), ["shell", "send_message_to_peer"]);
+    }
+
+    #[tokio::test]
+    async fn barge_in_reaches_local_dispatch_when_remote_cancel_write_fails() {
+        let channel = channel(false);
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut failing_remote = FailingSink;
+
+        assert_eq!(
+            channel
+                .handle_barge_in(&tx, &mut failing_remote)
+                .await
+                .unwrap(),
+            BargeInOutcome::RemoteClosed
+        );
+        assert!(rx.recv().await.unwrap().interrupt_only);
+    }
+
+    #[test]
+    fn reconnect_backoff_survives_flapping_and_resets_after_stable_connection() {
+        let mut attempt = 0;
+        let flapping = [
+            next_reconnect_delay(&mut attempt, Some(Duration::from_secs(1))),
+            next_reconnect_delay(&mut attempt, Some(Duration::from_secs(1))),
+            next_reconnect_delay(&mut attempt, Some(Duration::from_secs(1))),
+        ];
+        assert_eq!(
+            flapping,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+            ]
+        );
+        assert_eq!(
+            next_reconnect_delay(&mut attempt, Some(Duration::from_secs(PING_INTERVAL_SECS)),),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]
