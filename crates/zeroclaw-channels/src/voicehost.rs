@@ -100,6 +100,8 @@ impl VoiceHostChannel {
             url::Url::parse(&config.url).context("invalid voice host WebSocket URL")?;
         anyhow::ensure!(
             matches!(parsed_url.scheme(), "ws" | "wss"),
+            // Scheme names in validation text do not initiate a connection.
+            // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
             "voice host URL must use ws:// or wss://"
         );
 
@@ -948,7 +950,8 @@ mod tests {
                 "office".into(),
                 VoiceHostConfig {
                     enabled: true,
-                    url: format!("ws://{address}"),
+                    // The test server is bound to a loopback address above.
+                    url: format!("ws://{address}"), // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
                     api_key: Some("test-token".into()),
                     approval_timeout_secs: 5,
                     ..Default::default()
