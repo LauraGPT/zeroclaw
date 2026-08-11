@@ -18499,7 +18499,8 @@ pub struct VoiceHostConfig {
     /// Whether this channel instance is active. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
-    /// Wire codec used by the voice host. Default: `native`.
+    /// WebSocket JSON profile used by the voice host: `native` or
+    /// `wyoming-events-ws`. The latter is not the Wyoming TCP protocol.
     #[serde(default = "default_voicehost_backend")]
     pub backend: String,
     /// Voice host WebSocket endpoint (`ws://` or `wss://`).
@@ -21409,12 +21410,12 @@ impl Config {
             }
             if !matches!(
                 voicehost.backend.trim().to_ascii_lowercase().as_str(),
-                "native" | "wyoming"
+                "native" | "wyoming-events-ws"
             ) {
                 validation_bail!(
                     InvalidFormat,
                     backend_path,
-                    "{backend_path} must be either 'native' or 'wyoming'"
+                    "{backend_path} must be either 'native' or 'wyoming-events-ws'"
                 );
             }
 
@@ -21432,6 +21433,24 @@ impl Config {
                     InvalidFormat,
                     url_path,
                     "{url_path} must be an absolute ws:// or wss:// URL"
+                );
+            }
+            let has_api_key = voicehost
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty());
+            let is_loopback = parsed.host_str().is_some_and(|host| {
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
+            if has_api_key && parsed.scheme() == "ws" && !is_loopback {
+                validation_bail!(
+                    InvalidFormat,
+                    url_path,
+                    "{url_path} must use wss:// when api_key is configured for a non-loopback host"
                 );
             }
 
@@ -28034,6 +28053,40 @@ auto_save = true
         config
             .validate()
             .expect("disabled voicehost stub must not fail validation");
+    }
+
+    #[test]
+    async fn validate_voicehost_requires_tls_for_remote_bearer_credentials() {
+        let mut remote_plaintext = voicehost_config("ws://voice.example.test/ws");
+        remote_plaintext.api_key = Some("secret-token".into());
+        let mut config = Config::default();
+        config
+            .channels
+            .voicehost
+            .insert("office".into(), remote_plaintext);
+        let error = config
+            .validate()
+            .expect_err("remote plaintext bearer transport must be rejected");
+        assert!(error.to_string().contains("channels.voicehost.office.url"));
+        assert!(error.to_string().contains("wss://"));
+
+        for url in [
+            "ws://voice.example.test/ws",
+            "ws://localhost:8765/ws",
+            "ws://127.0.0.1:8765/ws",
+            "ws://[::1]:8765/ws",
+            "wss://voice.example.test/ws",
+        ] {
+            let mut voicehost = voicehost_config(url);
+            if url != "ws://voice.example.test/ws" {
+                voicehost.api_key = Some("secret-token".into());
+            }
+            let mut config = Config::default();
+            config.channels.voicehost.insert("office".into(), voicehost);
+            config.validate().unwrap_or_else(|error| {
+                panic!("expected {url} credential policy to pass: {error:#}")
+            });
+        }
     }
 
     #[test]
