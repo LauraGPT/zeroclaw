@@ -2109,6 +2109,140 @@ fn system_prompt_for_channel_turn(
     }
 }
 
+fn cached_mcp_prompt_section(system_prompt: &str) -> String {
+    const DEFERRED_HEADER: &str = "## Deferred Tools\n";
+    const PINNED_HEADER: &str = "## Pinned MCP Resources\n";
+    const RECEIPTS_HEADER: &str = "## Tool Execution Receipts\n";
+
+    let start = [
+        system_prompt.find(DEFERRED_HEADER),
+        system_prompt.find(PINNED_HEADER),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    let Some(start) = start else {
+        return String::new();
+    };
+    let tail = &system_prompt[start..];
+    let end = tail.find(RECEIPTS_HEADER).unwrap_or(tail.len());
+    tail[..end].trim_end().to_string()
+}
+
+fn channel_turn_requires_prompt_rebuild(
+    ctx: &ChannelRuntimeContext,
+    model_provider_ref: &str,
+    model: &str,
+    excluded_tools: &[String],
+) -> bool {
+    model_provider_ref != ctx.model_provider_ref.as_str()
+        || model != ctx.model.as_str()
+        || excluded_tools.iter().any(|excluded| {
+            !ctx.non_cli_excluded_tools
+                .iter()
+                .any(|baseline| baseline == excluded)
+        })
+}
+
+fn build_channel_turn_base_system_prompt(
+    ctx: &ChannelRuntimeContext,
+    model_provider: &dyn ModelProvider,
+    model: &str,
+    excluded_tools: &[String],
+) -> Result<String> {
+    let fallback_risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+        level: ctx.autonomy_level,
+        excluded_tools: ctx.non_cli_excluded_tools.as_ref().clone(),
+        ..Default::default()
+    };
+    let risk_profile = ctx
+        .prompt_config
+        .risk_profile_for_agent(ctx.agent_alias.as_str())
+        .unwrap_or(&fallback_risk_profile);
+    let tool_descs: Vec<(&str, &str)> = ctx
+        .tools_registry
+        .iter()
+        .map(|tool| (tool.name(), tool.description()))
+        .collect();
+    let skills = zeroclaw_runtime::skills::load_skills_for_agent(
+        ctx.workspace_dir.as_ref(),
+        ctx.prompt_config.as_ref(),
+        ctx.agent_alias.as_str(),
+    );
+    let bootstrap_max_chars = ctx.agent_cfg.resolved.compact_context.then_some(6000);
+    let mcp_prompt_section = cached_mcp_prompt_section(ctx.system_prompt.as_str());
+    let mut system_prompt = zeroclaw_runtime::agent::loop_::build_system_prompt_for_turn(
+        ctx.workspace_dir.as_ref(),
+        model,
+        &tool_descs,
+        &mcp_prompt_section,
+        &skills,
+        Some(&ctx.agent_cfg.identity),
+        bootstrap_max_chars,
+        risk_profile,
+        model_provider,
+        ctx.tools_registry.as_ref(),
+        excluded_tools,
+        ctx.activated_tools.as_ref(),
+        ctx.agent_cfg.resolved.strict_tool_parsing,
+        ctx.prompt_config
+            .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
+        ctx.agent_cfg.resolved.compact_context,
+        ctx.agent_cfg.resolved.max_system_prompt_chars,
+        true,
+        ctx.show_tool_calls,
+        None,
+    )?;
+    if ctx.agent_cfg.resolved.tool_receipts.enabled
+        && ctx.agent_cfg.resolved.tool_receipts.inject_system_prompt
+    {
+        system_prompt.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+    }
+    Ok(system_prompt)
+}
+
+fn compose_channel_turn_system_prompt(
+    ctx: &ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+    model_provider: &dyn ModelProvider,
+    excluded_tools: &[String],
+    base_system_prompt: &str,
+    thinking_prefix: Option<&str>,
+) -> String {
+    let native_tool_specs_present =
+        zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+            model_provider,
+            ctx.tools_registry.as_ref(),
+            excluded_tools,
+            ctx.activated_tools.as_ref(),
+        )
+        .unwrap_or(false);
+    let mut system_prompt = build_channel_system_prompt_for_message_with_signal(
+        base_system_prompt,
+        msg,
+        target_channel,
+        native_tool_specs_present,
+    );
+    if send_message_to_peer_tool_available(ctx, excluded_tools)
+        && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx, msg)
+    {
+        let peer_map =
+            zeroclaw_runtime::tools::send_message_to_peer::render_sender_peer_map_for_channel(
+                ctx.prompt_config.as_ref(),
+                ctx.agent_alias.as_str(),
+                &current_channel_ref,
+            );
+        if !peer_map.is_empty() {
+            let _ = write!(system_prompt, "\n\n{peer_map}");
+        }
+    }
+    if let Some(prefix) = thinking_prefix {
+        system_prompt = format!("{prefix}\n\n{system_prompt}");
+    }
+    system_prompt
+}
+
 fn read_skill_available_for_channel_turn(
     model_provider: &dyn ModelProvider,
     strict_tool_parsing: bool,
@@ -2148,6 +2282,7 @@ fn text_tool_prompt_advertises(system_prompt: &str, tool_name: &str) -> bool {
     tools.lines().any(|line| line.starts_with(&expected_prefix))
 }
 
+#[cfg(test)]
 fn refresh_channel_history_skills(
     ctx: &ChannelRuntimeContext,
     history: &mut [ChatMessage],
@@ -5470,53 +5605,67 @@ async fn process_channel_message_body(
         ctx.non_cli_excluded_tools.as_ref(),
         target_channel.as_deref(),
     );
-    let read_skill_available = read_skill_available_for_channel_turn(
-        active_model_provider.as_ref(),
-        ctx.agent_cfg.resolved.strict_tool_parsing,
-        ctx.tools_registry.as_ref(),
-        per_turn_excluded_tools.as_slice(),
-        ctx.system_prompt.as_str(),
-    );
-    let base_system_prompt = system_prompt_for_channel_turn(
+    let rebuild_prompt = channel_turn_requires_prompt_rebuild(
         ctx.as_ref(),
-        ctx.system_prompt.as_str(),
-        !had_prior_history,
-        read_skill_available,
+        route.model_provider.as_str(),
+        route.model.as_str(),
+        per_turn_excluded_tools.as_slice(),
     );
-    let per_turn_native_tool_specs_present =
-        ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+    let base_system_prompt = if rebuild_prompt {
+        match build_channel_turn_base_system_prompt(
+            ctx.as_ref(),
             active_model_provider.as_ref(),
+            route.model.as_str(),
+            per_turn_excluded_tools.as_slice(),
+        ) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "Failed to build policy-filtered channel prompt"
+                );
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    None,
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        let read_skill_available = read_skill_available_for_channel_turn(
+            active_model_provider.as_ref(),
+            ctx.agent_cfg.resolved.strict_tool_parsing,
             ctx.tools_registry.as_ref(),
             per_turn_excluded_tools.as_slice(),
-            ctx.activated_tools.as_ref(),
+            ctx.system_prompt.as_str(),
+        );
+        system_prompt_for_channel_turn(
+            ctx.as_ref(),
+            ctx.system_prompt.as_str(),
+            !had_prior_history,
+            read_skill_available,
         )
-        .unwrap_or(false);
-    let mut system_prompt = build_channel_system_prompt_for_message_with_signal(
-        &base_system_prompt,
+    };
+    let system_prompt = compose_channel_turn_system_prompt(
+        ctx.as_ref(),
         &msg,
         target_channel.as_ref(),
-        per_turn_native_tool_specs_present,
+        active_model_provider.as_ref(),
+        per_turn_excluded_tools.as_slice(),
+        &base_system_prompt,
+        thinking.params.system_prompt_prefix.as_deref(),
     );
-    if send_message_to_peer_tool_available(ctx.as_ref(), per_turn_excluded_tools.as_slice())
-        && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
-    {
-        let peer_map =
-            zeroclaw_runtime::tools::send_message_to_peer::render_sender_peer_map_for_channel(
-                ctx.prompt_config.as_ref(),
-                ctx.agent_alias.as_str(),
-                &current_channel_ref,
-            );
-        if !peer_map.is_empty() {
-            let _ = write!(system_prompt, "\n\n{peer_map}");
-        }
-    }
     // NOTE: memory_context is intentionally NOT appended to the system prompt
     // here — it carries per-turn data that would invalidate the provider-side
     // prompt cache The preamble below carries it into the outgoing
     // user turn instead, matching the CLI shape.
-    if let Some(ref prefix) = thinking.params.system_prompt_prefix {
-        system_prompt = format!("{prefix}\n\n{system_prompt}");
-    }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
 
@@ -6161,20 +6310,42 @@ async fn process_channel_message_body(
                             &runtime_defaults,
                         );
 
-                        let read_skill_available = read_skill_available_for_channel_turn(
-                            active_model_provider.as_ref(),
-                            ctx.agent_cfg.resolved.strict_tool_parsing,
-                            ctx.tools_registry.as_ref(),
-                            per_turn_excluded_tools.as_slice(),
-                            history
-                                .first()
-                                .map_or("", |message| message.content.as_str()),
-                        );
-                        refresh_channel_history_skills(
+                        let rebuilt_base_prompt = match build_channel_turn_base_system_prompt(
                             ctx.as_ref(),
-                            &mut history,
-                            read_skill_available,
-                        );
+                            active_model_provider.as_ref(),
+                            route.model.as_str(),
+                            per_turn_excluded_tools.as_slice(),
+                        ) {
+                            Ok(prompt) => prompt,
+                            Err(error) => {
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({
+                                        "error": error.to_string()
+                                    })),
+                                    "Failed to rebuild policy-filtered prompt after model switch"
+                                );
+                                break loop_result;
+                            }
+                        };
+                        if let Some(system_message) =
+                            history.first_mut().filter(|message| message.role == "system")
+                        {
+                            system_message.content = compose_channel_turn_system_prompt(
+                                ctx.as_ref(),
+                                &msg,
+                                target_channel.as_ref(),
+                                active_model_provider.as_ref(),
+                                per_turn_excluded_tools.as_slice(),
+                                &rebuilt_base_prompt,
+                                thinking.params.system_prompt_prefix.as_deref(),
+                            );
+                        }
 
                         continue;
                     }
@@ -16919,6 +17090,101 @@ BTC is currently around $65,000 based on latest tool output."#
                 Some(&channel),
             ),
             ["filesystem", "send_message_to_peer", "shell"]
+        );
+    }
+
+    #[cfg(feature = "channel-voicehost")]
+    #[tokio::test]
+    async fn voicehost_excluded_tools_are_absent_from_final_text_provider_prompt() {
+        let channel: Arc<dyn Channel> = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                zeroclaw_config::schema::VoiceHostConfig {
+                    enabled: true,
+                    url: "ws://127.0.0.1:8765/ws".into(),
+                    excluded_tools: vec!["shell".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let mut runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![
+                Box::new(NamedMockTool("shell")),
+                Box::new(NamedMockTool("file_read")),
+            ],
+        );
+
+        let tool_descs = [
+            ("shell", "Execute shell commands"),
+            ("file_read", "Read files"),
+        ];
+        let mut startup_prompt = build_system_prompt_with_mode_and_autonomy(
+            runtime_ctx.workspace_dir.as_ref(),
+            "test-model",
+            &tool_descs,
+            &[],
+            None,
+            None,
+            Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            true,
+        );
+        startup_prompt.push_str(&zeroclaw_runtime::agent::loop_::build_tool_instructions(
+            runtime_ctx.tools_registry.as_ref(),
+        ));
+        assert!(startup_prompt.contains("**shell**"));
+        assert!(startup_prompt.contains("**file_read**"));
+        Arc::get_mut(&mut runtime_ctx).unwrap().system_prompt = Arc::new(startup_prompt);
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            ChannelMessage {
+                id: "voicehost-prompt-policy".into(),
+                sender: "voice-user".into(),
+                reply_target: "office".into(),
+                content: "read the status file".into(),
+                channel: "voicehost".into(),
+                channel_alias: Some("office".into()),
+                timestamp: 1,
+                explicitly_addressed: true,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        let final_system_prompt = &calls[0][0].1;
+        assert!(
+            final_system_prompt.contains("**file_read**"),
+            "allowed tools must remain visible in the final model prompt: {final_system_prompt}"
+        );
+        assert!(
+            !final_system_prompt.contains("**shell**"),
+            "VoiceHost-excluded tools must be absent from the final model prompt: {final_system_prompt}"
+        );
+        assert!(
+            !final_system_prompt.contains("Execute shell commands")
+                && !final_system_prompt.contains("\"name\":\"shell\""),
+            "VoiceHost-excluded tools must not survive in descriptions or protocol examples: {final_system_prompt}"
         );
     }
 
