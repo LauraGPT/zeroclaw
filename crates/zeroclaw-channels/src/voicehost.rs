@@ -20,6 +20,9 @@ use zeroclaw_api::channel::{
 use zeroclaw_config::schema::{VoiceHostConfig, ws_connect_with_proxy_headers};
 
 const OUTBOUND_CAPACITY: usize = 64;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024;
+const PARTIAL_FORWARD_INTERVAL: Duration = Duration::from_millis(250);
 const PING_INTERVAL_SECS: u64 = 20;
 const RECONNECT_DELAYS_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
 
@@ -224,17 +227,30 @@ impl Channel for VoiceHostChannel {
                 return Ok(());
             }
 
-            let connected = ws_connect_with_proxy_headers(
-                &self.url,
-                &format!("channel.voicehost.{}", self.alias),
-                self.proxy_url.as_deref(),
-                &self.headers,
-            )
-            .await;
+            let service_key = format!("channel.voicehost.{}", self.alias);
+            let connected = tokio::select! {
+                result = tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    ws_connect_with_proxy_headers(
+                        &self.url,
+                        &service_key,
+                        self.proxy_url.as_deref(),
+                        &self.headers,
+                    ),
+                ) => match result {
+                    Ok(Ok(connection)) => Ok(connection),
+                    Ok(Err(_)) => Err("connect_failed"),
+                    Err(_) => Err("connect_timeout"),
+                },
+                _ = tx.closed() => {
+                    self.clear_connection_state().await;
+                    return Ok(());
+                }
+            };
 
             let (socket, _) = match connected {
                 Ok(connection) => connection,
-                Err(_) => {
+                Err(error) => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -242,7 +258,7 @@ impl Channel for VoiceHostChannel {
                             .with_attrs(::serde_json::json!({
                                 "alias": self.alias,
                                 "backend": self.backend.as_str(),
-                                "error": "connect_failed",
+                                "error": error,
                             })),
                         "voice host connection failed"
                     );
@@ -262,6 +278,7 @@ impl Channel for VoiceHostChannel {
             let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
             ping.tick().await;
             let mut dispatch_closed = false;
+            let mut last_partial_forwarded = None;
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -350,13 +367,30 @@ impl Channel for VoiceHostChannel {
                                     BargeInOutcome::RemoteClosed => break,
                                 }
                             }
-                            action @ (InboundAction::FinalTranscript(_)
-                            | InboundAction::PartialTranscript(_)) => {
+                            action @ InboundAction::FinalTranscript(_) => {
                                 if let Some(message) = self.message_for_action(action)
                                     && tx.send(message).await.is_err()
                                 {
                                     dispatch_closed = true;
                                     break;
+                                }
+                            }
+                            action @ InboundAction::PartialTranscript(_) => {
+                                let now = Instant::now();
+                                if last_partial_forwarded.is_some_and(|last: Instant| {
+                                    now.duration_since(last) < PARTIAL_FORWARD_INTERVAL
+                                }) {
+                                    continue;
+                                }
+                                if let Some(message) = self.message_for_action(action) {
+                                    match tx.try_send(message) {
+                                        Ok(()) => last_partial_forwarded = Some(now),
+                                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            dispatch_closed = true;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             InboundAction::None => {
@@ -481,7 +515,9 @@ fn parse_inbound(raw: &str, forward_partials: bool) -> InboundAction {
         return match event {
             VoiceEvent::SpeechEnd {
                 transcript: Some(text),
-            } if !text.trim().is_empty() => InboundAction::FinalTranscript(text.trim().to_string()),
+            } => bounded_transcript(&text)
+                .map(InboundAction::FinalTranscript)
+                .unwrap_or(InboundAction::None),
             VoiceEvent::BargeIn => InboundAction::BargeIn,
             VoiceEvent::SpeechStart
             | VoiceEvent::SpeechEnd { .. }
@@ -514,9 +550,12 @@ fn wyoming_text(value: &Value) -> Option<String> {
     value
         .pointer("/data/text")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
+        .and_then(bounded_transcript)
+}
+
+fn bounded_transcript(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty() && text.len() <= MAX_TRANSCRIPT_BYTES).then(|| text.to_string())
 }
 
 fn parse_wyoming_user_event(value: &Value) -> InboundAction {
@@ -766,6 +805,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shutdown_cancels_an_incomplete_websocket_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        let channel = VoiceHostChannel::new(
+            "office".into(),
+            VoiceHostConfig {
+                enabled: true,
+                url: format!("ws:{0}{0}{address}", '/'),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (inbound_tx, inbound_rx) = mpsc::channel(1);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            channel.listen(inbound_tx).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        drop(inbound_rx);
+        tokio::time::timeout(Duration::from_secs(1), channel_listener)
+            .await
+            .expect("listener should observe shutdown during WebSocket handshake")
+            .unwrap();
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn native_final_transcript_maps_to_channel_message() {
         let action = parse_inbound(r#"{"type":"speech_end","transcript":"hello world"}"#, false);
@@ -814,6 +891,100 @@ mod tests {
         let message = channel(true).message_for_action(action).unwrap();
         assert!(message.passive_context);
         assert!(!message.interrupt_only);
+    }
+
+    #[test]
+    fn oversized_native_and_wyoming_transcripts_are_ignored() {
+        let oversized = "x".repeat(16 * 1024 + 1);
+        let native = serde_json::json!({
+            "type": "speech_end",
+            "transcript": oversized,
+        });
+        let wyoming = serde_json::json!({
+            "type": "transcript",
+            "data": { "text": oversized },
+        });
+
+        assert!(matches!(
+            parse_inbound(&native.to_string(), false),
+            InboundAction::None
+        ));
+        assert!(matches!(
+            parse_inbound(&wyoming.to_string(), false),
+            InboundAction::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_burst_does_not_delay_barge_in() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for text in ["hel", "hello"] {
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "transcript-chunk",
+                            "data": { "text": text },
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            socket
+                .send(Message::Text(
+                    r#"{"type":"user-event","data":{"name":"barge_in","data":{}}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket.next().await.unwrap().unwrap().into_text().unwrap()
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    backend: "wyoming".into(),
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    forward_partials: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let listener_channel = channel.clone();
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel.listen(inbound_tx).await.unwrap();
+        });
+
+        let partial = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(partial.passive_context);
+        assert_eq!(partial.content, "hel");
+
+        let interrupt = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(interrupt.interrupt_only);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            r#"{"type":"user-event","data":{"name":"tts_cancel","data":{}}}"#
+        );
+
+        channel_listener.abort();
+        let _ = channel_listener.await;
     }
 
     #[test]

@@ -65,7 +65,7 @@ channels = ["voicehost.office"]
 
 ### Host contract
 
-The connection is one-to-one. ZeroClaw reconnects with bounded backoff and sends WebSocket ping frames while connected.
+The connection is one-to-one. Each connection attempt times out after 15 seconds. ZeroClaw reconnects with bounded backoff and sends WebSocket ping frames while connected.
 
 | Direction | Native backend | Wyoming backend | Effect |
 |---|---|---|---|
@@ -77,6 +77,8 @@ The connection is one-to-one. ZeroClaw reconnects with bounded backoff and sends
 | Both | `user-event` approval request/response | Same | Map approve, deny, and always-approve to the standard tool approval path |
 
 Approval requests contain a generated request ID, tool name, and compact argument summary. Raw tool arguments are not sent. Unknown, malformed, binary, and server-direction events are ignored without reaching the model.
+
+Final and partial transcripts are limited to 16 KiB after trimming. When partial forwarding is enabled, ZeroClaw forwards at most one partial every 250 ms and drops partials while the shared ingress queue is full. Final transcripts and barge-in controls remain reliable; a partial stream cannot block WebSocket reads or delay interruption behind an unbounded backlog.
 
 ### FunASR and SenseVoice deployment
 
