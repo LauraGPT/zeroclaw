@@ -61,7 +61,7 @@ channels = ["voicehost.office"]
 
 {{#secret-config channels.voicehost.<alias>.api_key}}
 
-When `api_key` is configured, non-loopback endpoints must use `wss://`. Plaintext `ws://` with a bearer token is accepted only for `localhost`, `127.0.0.0/8`, or `::1` development endpoints. A remote `ws://` endpoint without a token is allowed but has no transport confidentiality; prefer `wss://` off-machine.
+When `api_key` is configured, non-loopback endpoints must use secure WebSocket (`wss://`). Bearer credentials over the plaintext WebSocket scheme are accepted only for `localhost`, `127.0.0.0/8`, or `::1` development endpoints. An unauthenticated remote plaintext endpoint is allowed but has no transport confidentiality; prefer secure WebSocket off-machine.
 
 > **Build flag:** VoiceHost is gated by `channel-voicehost`, is off by default, and is included by `channels-full`.
 
