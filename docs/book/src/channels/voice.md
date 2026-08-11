@@ -38,12 +38,12 @@ The agent doesn't send audio anywhere; wake detection is local. Only post-wake s
 
 VoiceHost connects ZeroClaw as a WebSocket client to a process that owns the complete audio path: microphone capture, VAD, ASR, TTS, and speaker playback. ZeroClaw receives text and control events and remains responsible for the agent, model provider, RAG, MCP, tools, and approvals. Raw audio never enters this channel.
 
-This boundary works well when the audio stack has its own lifecycle or hardware requirements. A host can run FunASR or SenseVoice, sherpa-onnx, CrispASR, or a Wyoming-compatible satellite without adding that engine to ZeroClaw.
+This boundary works well when the audio stack has its own lifecycle or hardware requirements. A host can run FunASR or SenseVoice, sherpa-onnx, CrispASR, or a host-side Wyoming adapter without adding that engine to ZeroClaw.
 
 ```toml
 [channels.voicehost.office]
 enabled = true
-backend = "wyoming" # "native" is the default
+backend = "wyoming-events-ws" # "native" is the default
 url = "ws://127.0.0.1:8765/ws"
 api_key = "replace-through-secret-management"
 voice = "en-US"
@@ -61,13 +61,15 @@ channels = ["voicehost.office"]
 
 {{#secret-config channels.voicehost.<alias>.api_key}}
 
+When `api_key` is configured, non-loopback endpoints must use `wss://`. Plaintext `ws://` with a bearer token is accepted only for `localhost`, `127.0.0.0/8`, or `::1` development endpoints. A remote `ws://` endpoint without a token is allowed but has no transport confidentiality; prefer `wss://` off-machine.
+
 > **Build flag:** VoiceHost is gated by `channel-voicehost`, is off by default, and is included by `channels-full`.
 
 ### Host contract
 
 The connection is one-to-one. Each connection attempt times out after 15 seconds. ZeroClaw reconnects with bounded backoff and sends WebSocket ping frames while connected.
 
-| Direction | Native backend | Wyoming backend | Effect |
+| Direction | Native backend | `wyoming-events-ws` profile | Effect |
 |---|---|---|---|
 | Host → ZeroClaw | `speech_end { transcript }` | `transcript` with `data.text` | Start an agent turn from a final transcript |
 | Host → ZeroClaw | Not supported | `transcript-chunk` with `data.text` | Add passive context when `forward_partials = true` |
@@ -75,6 +77,8 @@ The connection is one-to-one. Each connection attempt times out after 15 seconds
 | ZeroClaw → host | `say { text, voice? }` | `synthesize` | Synthesize and play the agent response |
 | ZeroClaw → host | `tts_cancel` | `user-event` named `tts_cancel` | Stop current playback |
 | Both | `user-event` approval request/response | Same | Map approve, deny, and always-approve to the standard tool approval path |
+
+`wyoming-events-ws` is a custom text-only WebSocket profile: each WebSocket text frame contains one JSON object shaped like a Wyoming event. It is not the Wyoming peer-to-peer TCP protocol, which uses newline-terminated JSON headers followed by optional data and payload bytes. Standard Wyoming servers and satellites cannot connect directly; place an adapter in the host process to translate between Wyoming TCP framing and this WebSocket profile.
 
 Approval requests contain a generated request ID, tool name, and compact argument summary. Raw tool arguments are not sent. Unknown, malformed, binary, and server-direction events are ignored without reaching the model.
 

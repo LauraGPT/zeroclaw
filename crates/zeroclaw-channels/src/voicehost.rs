@@ -48,9 +48,9 @@ impl VoiceHostBackend {
     fn from_config(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "native" => Ok(Self::Native),
-            "wyoming" => Ok(Self::Wyoming),
+            "wyoming-events-ws" => Ok(Self::Wyoming),
             other => anyhow::bail!(
-                "unsupported voice host backend '{other}'; expected native or wyoming"
+                "unsupported voice host backend '{other}'; expected native or wyoming-events-ws"
             ),
         }
     }
@@ -58,9 +58,19 @@ impl VoiceHostBackend {
     fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
-            Self::Wyoming => "wyoming",
+            Self::Wyoming => "wyoming-events-ws",
         }
     }
+}
+
+fn is_loopback_endpoint(url: &url::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -106,7 +116,17 @@ impl VoiceHostChannel {
             "voice host URL scheme must be ws or wss"
         );
 
-        let headers = build_auth_headers(config.api_key.as_deref())?;
+        let api_key = config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        anyhow::ensure!(
+            api_key.is_none() || parsed_url.scheme() == "wss" || is_loopback_endpoint(&parsed_url),
+            "voice host bearer credentials require wss:// for non-loopback endpoints"
+        );
+
+        let headers = build_auth_headers(api_key)?;
         Ok(Self {
             alias,
             backend: VoiceHostBackend::from_config(&config.backend)?,
@@ -464,36 +484,26 @@ impl Channel for VoiceHostChannel {
             .await
             .insert(request_id.clone(), response_tx);
 
-        if self.queue_payload(payload).await.is_err() {
-            self.pending_approvals.lock().await.remove(&request_id);
-            return Ok(Some(AttributedApprovalResponse::from_runtime(
-                ChannelApprovalResponse::Deny,
-                ApprovalSource::Unreachable,
-            )));
-        }
-
-        let response = match tokio::time::timeout(
-            Duration::from_secs(self.approval_timeout_secs),
-            response_rx,
-        )
-        .await
-        {
-            Ok(Ok(decision)) => AttributedApprovalResponse::operator(decision),
-            Ok(Err(_)) => {
-                self.pending_approvals.lock().await.remove(&request_id);
-                AttributedApprovalResponse::from_runtime(
+        let response =
+            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), async {
+                self.queue_payload(payload).await?;
+                response_rx
+                    .await
+                    .context("voice host approval response channel closed")
+            })
+            .await
+            {
+                Ok(Ok(decision)) => AttributedApprovalResponse::operator(decision),
+                Ok(Err(_)) => AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     ApprovalSource::Unreachable,
-                )
-            }
-            Err(_) => {
-                self.pending_approvals.lock().await.remove(&request_id);
-                AttributedApprovalResponse::from_runtime(
+                ),
+                Err(_) => AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     ApprovalSource::TimedOut,
-                )
-            }
-        };
+                ),
+            };
+        self.pending_approvals.lock().await.remove(&request_id);
         Ok(Some(response))
     }
 }
@@ -752,6 +762,14 @@ mod tests {
     }
 
     #[test]
+    fn wyoming_event_websocket_profile_has_an_unambiguous_backend_name() {
+        let backend = VoiceHostBackend::from_config("wyoming-events-ws").unwrap();
+        assert_eq!(backend, VoiceHostBackend::Wyoming);
+        assert_eq!(backend.as_str(), "wyoming-events-ws");
+        assert!(VoiceHostBackend::from_config("wyoming").is_err());
+    }
+
+    #[test]
     fn configured_tools_are_excluded_from_voice_turns() {
         let channel = VoiceHostChannel::new(
             "office".into(),
@@ -949,7 +967,7 @@ mod tests {
                 "office".into(),
                 VoiceHostConfig {
                     enabled: true,
-                    backend: "wyoming".into(),
+                    backend: "wyoming-events-ws".into(),
                     url: format!("ws:{0}{0}{address}", '/'),
                     forward_partials: true,
                     ..Default::default()
@@ -1199,6 +1217,35 @@ mod tests {
 
         assert_eq!(response.response, ChannelApprovalResponse::Deny);
         assert_eq!(response.source, ApprovalSource::Unreachable);
+    }
+
+    #[tokio::test]
+    async fn approval_timeout_includes_waiting_for_outbound_queue_capacity() {
+        let mut channel = channel(false);
+        channel.approval_timeout_secs = 1;
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        outbound_tx.send("queue-is-full".into()).await.unwrap();
+        *channel.outbound.write().await = Some(outbound_tx);
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            channel.request_approval_attributed(
+                "office",
+                &ChannelApprovalRequest {
+                    tool_name: "shell".into(),
+                    arguments_summary: "Run command".into(),
+                    raw_arguments: None,
+                },
+            ),
+        )
+        .await
+        .expect("approval operation must honor its configured timeout")
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response.response, ChannelApprovalResponse::Deny);
+        assert_eq!(response.source, ApprovalSource::TimedOut);
+        assert!(channel.pending_approvals.lock().await.is_empty());
     }
 
     #[test]
