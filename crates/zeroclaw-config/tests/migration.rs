@@ -2264,7 +2264,6 @@ fn generate_v3_channel_breadth_lower_bound() {
         + cfg.channels.signal.len()
         + cfg.channels.whatsapp.len()
         + cfg.channels.linq.len()
-        + cfg.channels.wati.len()
         + cfg.channels.nextcloud_talk.len()
         + cfg.channels.mqtt.len()
         + cfg.channels.irc.len()

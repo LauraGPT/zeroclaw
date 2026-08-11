@@ -90,8 +90,6 @@ pub mod voice_call;
 pub mod voice_wake;
 #[cfg(feature = "channel-voicehost")]
 pub mod voicehost;
-#[cfg(feature = "channel-wati")]
-pub mod wati;
 #[cfg(feature = "channel-webhook")]
 pub mod webhook;
 #[cfg(feature = "channel-wechat")]
