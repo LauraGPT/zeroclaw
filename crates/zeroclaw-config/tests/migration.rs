@@ -1990,7 +1990,7 @@ schema_version = 2
 
 [channels.voicehost]
 enabled = true
-backend = "wyoming"
+backend = "wyoming-events-ws"
 url = "ws://127.0.0.1:8765"
 "#,
     );
@@ -2004,7 +2004,7 @@ url = "ws://127.0.0.1:8765"
     );
     assert_eq!(
         voicehost.get("backend").and_then(toml::Value::as_str),
-        Some("wyoming")
+        Some("wyoming-events-ws")
     );
     assert_eq!(
         voicehost.get("url").and_then(toml::Value::as_str),
