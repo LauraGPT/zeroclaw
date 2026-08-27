@@ -1,7 +1,30 @@
 //! Voice duplex event dispatch for WebSocket sessions.
 #![cfg(feature = "gateway-voice-duplex")]
 
-use zeroclaw_api::channel::VoiceEvent;
+use serde::{Deserialize, Serialize};
+
+/// Public WebSocket voice events retained for gateway API compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum VoiceEvent {
+    #[serde(rename = "speech_start")]
+    SpeechStart,
+    #[serde(rename = "speech_end")]
+    SpeechEnd {
+        #[serde(default)]
+        transcript: Option<String>,
+    },
+    #[serde(rename = "barge_in")]
+    BargeIn,
+    #[serde(rename = "tts_cancel")]
+    TtsCancel,
+    #[serde(rename = "tts_chunk")]
+    TtsChunk {
+        audio_b64: String,
+        #[serde(default)]
+        format: Option<String>,
+    },
+}
 
 /// Attempt to parse a text frame as a voice event.
 /// Returns `Some(VoiceEvent)` if the JSON parses as a known voice event type,
@@ -38,7 +61,7 @@ pub fn handle_voice_event(event: VoiceEvent) -> Option<serde_json::Value> {
             // TODO: wire into session abort mechanism (ref upstream
             None
         }
-        VoiceEvent::TtsCancel | VoiceEvent::TtsChunk { .. } | VoiceEvent::Say { .. } => {
+        VoiceEvent::TtsCancel | VoiceEvent::TtsChunk { .. } => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

@@ -615,15 +615,19 @@ fn filter_deferred_tools_for_turn(
         return deferred_section.to_string();
     };
     let close_start = body_start + close_offset;
-    let kept_lines: Vec<&str> = deferred_section[body_start..close_start]
-        .lines()
-        .filter(|line| {
-            let name = line
-                .split_once(" - ")
-                .map_or_else(|| line.trim(), |(name, _)| name.trim());
-            name.is_empty() || !excluded_tool_names.contains(name)
-        })
-        .collect();
+    let kept_lines: Vec<&str> = if excluded_tool_names.contains("tool_search") {
+        Vec::new()
+    } else {
+        deferred_section[body_start..close_start]
+            .lines()
+            .filter(|line| {
+                let name = line
+                    .split_once(" - ")
+                    .map_or_else(|| line.trim(), |(name, _)| name.trim());
+                name.is_empty() || !excluded_tool_names.contains(name)
+            })
+            .collect()
+    };
 
     if kept_lines.iter().all(|line| line.trim().is_empty()) {
         let deferred_start = deferred_section[..open_start]
@@ -13573,6 +13577,62 @@ server__allowed - May remain visible\n\
         assert!(system_prompt.contains("server__allowed - May remain visible"));
         assert!(system_prompt.contains("## Pinned MCP Resources"));
         assert!(system_prompt.contains("Pinned handbook body"));
+    }
+
+    #[test]
+    fn excluding_tool_search_removes_deferred_section_for_all_provider_modes() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(CountingTool::new(
+            "tool_search",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+        let tool_descs = [("tool_search", "Load deferred tool schemas")];
+        let mcp_prompt = "## Deferred Tools\n\n\
+Call `tool_search` before using a deferred tool.\n\n\
+<available-deferred-tools>\n\
+server__allowed - Must disappear with its loader\n\
+</available-deferred-tools>\n\n\
+## Pinned MCP Resources\n\nPinned handbook body";
+        let excluded_tools = vec!["tool_search".to_string()];
+
+        for native_tools in [false, true] {
+            let provider = if native_tools {
+                ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support()
+            } else {
+                ScriptedModelProvider::from_text_responses(vec!["ok"])
+            };
+            let system_prompt = super::build_system_prompt_for_turn(
+                workspace.path(),
+                "test-model",
+                &tool_descs,
+                mcp_prompt,
+                &[],
+                None,
+                None,
+                &RiskProfileConfig::default(),
+                &provider,
+                &tools_registry,
+                &excluded_tools,
+                None,
+                false,
+                SkillsPromptInjectionMode::Full,
+                false,
+                usize::MAX,
+                true,
+                false,
+                None,
+                None,
+            )
+            .expect("turn prompt should build");
+
+            assert!(!system_prompt.contains("## Deferred Tools"));
+            assert!(!system_prompt.contains("server__allowed"));
+            assert!(!system_prompt.contains("Call `tool_search`"));
+            assert!(system_prompt.contains("## Pinned MCP Resources"));
+            assert!(system_prompt.contains("Pinned handbook body"));
+        }
     }
 
     #[test]

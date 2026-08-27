@@ -4830,6 +4830,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
+#[cfg(test)]
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -4849,10 +4850,54 @@ fn spawn_supervised_listener(
     )
 }
 
+fn spawn_supervised_listener_with_control(
+    ch: Arc<dyn Channel>,
+    alias: Option<String>,
+    tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    control_tx: tokio::sync::mpsc::UnboundedSender<zeroclaw_api::channel::ChannelMessage>,
+    initial_backoff_secs: u64,
+    max_backoff_secs: u64,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    spawn_supervised_listener_with_health_interval_and_control(
+        ch,
+        alias,
+        tx,
+        Some(control_tx),
+        initial_backoff_secs,
+        max_backoff_secs,
+        Duration::from_secs(CHANNEL_HEALTH_HEARTBEAT_SECS),
+        cancel,
+    )
+}
+
+#[cfg(test)]
 fn spawn_supervised_listener_with_health_interval(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
     tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    initial_backoff_secs: u64,
+    max_backoff_secs: u64,
+    health_interval: Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    spawn_supervised_listener_with_health_interval_and_control(
+        ch,
+        alias,
+        tx,
+        None,
+        initial_backoff_secs,
+        max_backoff_secs,
+        health_interval,
+        cancel,
+    )
+}
+
+fn spawn_supervised_listener_with_health_interval_and_control(
+    ch: Arc<dyn Channel>,
+    alias: Option<String>,
+    tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    control_tx: Option<tokio::sync::mpsc::UnboundedSender<zeroclaw_api::channel::ChannelMessage>>,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     health_interval: Duration,
@@ -4880,7 +4925,13 @@ fn spawn_supervised_listener_with_health_interval(
                 let mut health = tokio::time::interval(health_interval);
                 health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let result = {
-                    let listen_future = ch.listen(tx.clone());
+                    let listen_future = async {
+                        if let Some(control_tx) = control_tx.as_ref() {
+                            ch.listen_with_control(tx.clone(), control_tx.clone()).await
+                        } else {
+                            ch.listen(tx.clone()).await
+                        }
+                    };
                     tokio::pin!(listen_future);
 
                     loop {
@@ -8595,8 +8646,57 @@ fn resolve_effective_debounce_window(
     std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
 }
 
+async fn dispatch_channel_control(
+    router: &AgentRouter,
+    in_flight_by_sender: &Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+) {
+    let debounce_cancelled = if let Some(ctx) = router.resolve(&msg) {
+        let debounce_key = conversation_history_key(&msg);
+        ctx.debouncer.cancel(&debounce_key).await
+    } else {
+        false
+    };
+    let scope_key = interruption_scope_key(&msg);
+    let previous = {
+        let mut active = in_flight_by_sender.lock().await;
+        active.remove(&scope_key)
+    };
+    let in_flight_cancelled = previous.is_some();
+    if let Some(state) = previous {
+        state.cancellation.cancel();
+    }
+    if in_flight_cancelled || debounce_cancelled {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "channel": msg.channel,
+                    "channel_alias": msg.channel_alias,
+                    "sender": msg.sender,
+                    "debounce_cancelled": debounce_cancelled,
+                    "in_flight_cancelled": in_flight_cancelled,
+                })
+            ),
+            "cancelled in-flight request from channel control event"
+        );
+    }
+}
+
+#[cfg(test)]
 async fn run_message_dispatch_loop(
+    rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    router: AgentRouter,
+    max_in_flight_messages: usize,
+) {
+    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(control_tx);
+    run_message_dispatch_loop_with_control(rx, control_rx, router, max_in_flight_messages).await;
+}
+
+async fn run_message_dispatch_loop_with_control(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    mut control_rx: tokio::sync::mpsc::UnboundedReceiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
 ) {
@@ -8607,43 +8707,28 @@ async fn run_message_dispatch_loop(
         InFlightSenderTaskState,
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
+    let mut control_open = true;
 
-    while let Some(msg) = rx.recv().await {
-        // Transport-level interruption controls are consumed before ownership,
-        // hooks, debounce, acknowledgements, and worker creation. They cancel
-        // only the matching conversation and never become model input.
-        if msg.interrupt_only {
-            let debounce_cancelled = if let Some(ctx) = router.resolve(&msg) {
-                let debounce_key = conversation_history_key(&msg);
-                ctx.debouncer.cancel(&debounce_key).await
-            } else {
-                false
-            };
-            let scope_key = interruption_scope_key(&msg);
-            let previous = {
-                let mut active = in_flight_by_sender.lock().await;
-                active.remove(&scope_key)
-            };
-            let in_flight_cancelled = previous.is_some();
-            if let Some(state) = previous {
-                state.cancellation.cancel();
+    loop {
+        let msg = loop {
+            if !control_open {
+                break rx.recv().await;
             }
-            if in_flight_cancelled || debounce_cancelled {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({
-                            "channel": msg.channel,
-                            "channel_alias": msg.channel_alias,
-                            "sender": msg.sender,
-                            "debounce_cancelled": debounce_cancelled,
-                            "in_flight_cancelled": in_flight_cancelled,
-                        })),
-                    "cancelled in-flight request from channel control event"
-                );
+            tokio::select! {
+                biased;
+                control = control_rx.recv() => {
+                    if let Some(control) = control {
+                        dispatch_channel_control(&router, &in_flight_by_sender, control).await;
+                    } else {
+                        control_open = false;
+                    }
+                }
+                msg = rx.recv() => break msg,
             }
-            continue;
-        }
+        };
+        let Some(msg) = msg else {
+            break;
+        };
 
         // Gate answers (button-click markers / `approve <ref>` text replies)
         // resolve a PARKED run and must never start one, so they are consumed
@@ -8799,9 +8884,29 @@ async fn run_message_dispatch_loop(
             msg
         };
 
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
+        let permit = loop {
+            if !control_open {
+                break match Arc::clone(&semaphore).acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
+            }
+            tokio::select! {
+                biased;
+                control = control_rx.recv() => {
+                    if let Some(control) = control {
+                        dispatch_channel_control(&router, &in_flight_by_sender, control).await;
+                    } else {
+                        control_open = false;
+                    }
+                }
+                permit = Arc::clone(&semaphore).acquire_owned() => {
+                    break match permit {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                }
+            }
         };
 
         let worker_ctx = Arc::clone(&ctx);
@@ -12453,6 +12558,9 @@ pub async fn start_channels(
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
         None;
+    let mut control_rx_holder: Option<
+        tokio::sync::mpsc::UnboundedReceiver<zeroclaw_api::channel::ChannelMessage>,
+    > = None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
 
@@ -12865,18 +12973,21 @@ pub async fn start_channels(
                 .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+            let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
 
             for cc in &configured_channels {
-                listener_handles.push(spawn_supervised_listener(
+                listener_handles.push(spawn_supervised_listener_with_control(
                     cc.channel.clone(),
                     cc.alias.clone(),
                     tx.clone(),
+                    control_tx.clone(),
                     initial_backoff_secs,
                     max_backoff_secs,
                     cancel.clone(),
                 ));
             }
             drop(tx);
+            drop(control_tx);
 
             let in_flight =
                 max_in_flight_messages_for_config(configured_channels.len(), &config.channels);
@@ -12885,6 +12996,7 @@ pub async fn start_channels(
             max_in_flight_messages = Some(in_flight);
             channels_by_name_shared = Some(channels_by_name);
             rx_holder = Some(rx);
+            control_rx_holder = Some(control_rx);
         }
 
         let channels_by_name = Arc::clone(
@@ -13118,9 +13230,11 @@ pub async fn start_channels(
     let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
+    let control_rx =
+        control_rx_holder.expect("control_rx initialized by first agent's channel setup");
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
-    run_message_dispatch_loop(rx, router, max_in_flight).await;
+    run_message_dispatch_loop_with_control(rx, control_rx, router, max_in_flight).await;
 
     for h in listener_handles {
         let _ = h.await;
@@ -18965,6 +19079,57 @@ BTC is currently around $65,000 based on latest tool output."#
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
     }
 
+    struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    struct CancellationProbeModelProvider {
+        started: Arc<tokio::sync::Notify>,
+        cancelled: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CancellationProbeModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("REPLY".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let _notify_on_drop = NotifyOnDrop(self.cancelled.clone());
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CancellationProbeModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "CancellationProbeModelProvider"
+        }
+    }
+
     #[async_trait::async_trait]
     impl ModelProvider for DelayedHistoryCaptureModelProvider {
         async fn chat_with_system(
@@ -22708,7 +22873,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn interrupt_only_cancels_in_flight_turn_without_starting_another() {
+    async fn control_ingress_cancels_in_flight_turn_without_starting_another() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
@@ -22725,6 +22890,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
         let send_task = zeroclaw_spawn::spawn!(async move {
             tx.send(ChannelMessage {
                 id: "voice-1".into(),
@@ -22738,20 +22904,20 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
             tokio::time::sleep(Duration::from_millis(40)).await;
-            tx.send(ChannelMessage {
-                id: "voice-interrupt".into(),
-                sender: "voice-user".into(),
-                reply_target: "office".into(),
-                channel: "test-channel".into(),
-                timestamp: 2,
-                interrupt_only: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+            control_tx
+                .send(ChannelMessage {
+                    id: "voice-interrupt".into(),
+                    sender: "voice-user".into(),
+                    reply_target: "office".into(),
+                    channel: "test-channel".into(),
+                    timestamp: 2,
+                    ..Default::default()
+                })
+                .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        run_message_dispatch_loop_with_control(rx, control_rx, AgentRouter::single(runtime_ctx), 2)
+            .await;
         send_task.await.unwrap();
 
         let call_count = provider_impl
@@ -22767,7 +22933,83 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn interrupt_only_cancels_pending_debounce_before_model_work() {
+    async fn control_ingress_cancels_while_worker_permit_is_saturated() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(CancellationProbeModelProvider {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+        });
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dispatcher = zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_control(
+            rx,
+            control_rx,
+            AgentRouter::single(runtime_ctx),
+            1,
+        ));
+
+        tx.send(ChannelMessage {
+            id: "active".into(),
+            sender: "voice-user".into(),
+            reply_target: "office".into(),
+            content: "long running turn".into(),
+            channel: "test-channel".into(),
+            timestamp: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("first worker should reach the provider");
+
+        tx.send(ChannelMessage {
+            id: "queued".into(),
+            sender: "another-user".into(),
+            reply_target: "other-room".into(),
+            content: "wait for a permit".into(),
+            channel: "test-channel".into(),
+            timestamp: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        control_tx
+            .send(ChannelMessage {
+                id: "interrupt".into(),
+                sender: "voice-user".into(),
+                reply_target: "office".into(),
+                channel: "test-channel".into(),
+                timestamp: 3,
+                ..Default::default()
+            })
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_millis(200), cancelled.notified())
+            .await
+            .expect("control ingress must bypass a saturated worker permit");
+
+        drop(tx);
+        drop(control_tx);
+        dispatcher.abort();
+        let _ = dispatcher.await;
+    }
+
+    #[tokio::test]
+    async fn control_ingress_cancels_pending_debounce_before_model_work() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
@@ -22786,6 +23028,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
         let send_task = zeroclaw_spawn::spawn!(async move {
             tx.send(ChannelMessage {
                 id: "voice-pending".into(),
@@ -22799,20 +23042,20 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .unwrap();
             tokio::time::sleep(Duration::from_millis(40)).await;
-            tx.send(ChannelMessage {
-                id: "voice-pending-interrupt".into(),
-                sender: "voice-user".into(),
-                reply_target: "office".into(),
-                channel: "test-channel".into(),
-                timestamp: 2,
-                interrupt_only: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+            control_tx
+                .send(ChannelMessage {
+                    id: "voice-pending-interrupt".into(),
+                    sender: "voice-user".into(),
+                    reply_target: "office".into(),
+                    channel: "test-channel".into(),
+                    timestamp: 2,
+                    ..Default::default()
+                })
+                .unwrap();
         });
 
-        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
+        run_message_dispatch_loop_with_control(rx, control_rx, AgentRouter::single(runtime_ctx), 2)
+            .await;
         send_task.await.unwrap();
 
         let call_count = provider_impl
@@ -28629,7 +28872,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
                 interruption_scope_id: None,
-                interrupt_only: false,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "sticker.png".to_string(),
                     data: vec![1, 2, 3, 4],
@@ -30865,7 +31107,6 @@ This is an example JSON object for profile settings."#;
                 conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
                 thread_ts: None,
                 interruption_scope_id: None,
-                interrupt_only: false,
                 attachments: vec![zeroclaw_api::media::MediaAttachment {
                     file_name: "route.png".to_string(),
                     data: vec![1, 2, 3, 4],
