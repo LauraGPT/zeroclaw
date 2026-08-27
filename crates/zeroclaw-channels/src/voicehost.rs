@@ -104,7 +104,41 @@ pub struct VoiceHostChannel {
     excluded_tools: Vec<String>,
     headers: HeaderMap,
     outbound: Arc<RwLock<Option<mpsc::Sender<String>>>>,
+    control_tx: Arc<RwLock<Option<mpsc::UnboundedSender<ChannelMessage>>>>,
     pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+}
+
+struct PendingApprovalGuard {
+    request_id: Option<String>,
+    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+}
+
+impl PendingApprovalGuard {
+    fn new(
+        request_id: String,
+        pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    ) -> Self {
+        Self {
+            request_id: Some(request_id),
+            pending_approvals,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.request_id = None;
+    }
+}
+
+impl Drop for PendingApprovalGuard {
+    fn drop(&mut self) {
+        let Some(request_id) = self.request_id.take() else {
+            return;
+        };
+        let pending_approvals = Arc::clone(&self.pending_approvals);
+        zeroclaw_spawn::spawn!(async move {
+            pending_approvals.lock().await.remove(&request_id);
+        });
+    }
 }
 
 impl VoiceHostChannel {
@@ -138,15 +172,16 @@ impl VoiceHostChannel {
             excluded_tools: config.excluded_tools,
             headers,
             outbound: Arc::new(RwLock::new(None)),
+            control_tx: Arc::new(RwLock::new(None)),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     fn message_for_action(&self, action: InboundAction) -> Option<ChannelMessage> {
-        let (content, passive_context, interrupt_only) = match action {
-            InboundAction::FinalTranscript(text) => (text, false, false),
-            InboundAction::PartialTranscript(text) => (text, true, false),
-            InboundAction::BargeIn => (String::new(), false, true),
+        let (content, passive_context) = match action {
+            InboundAction::FinalTranscript(text) => (text, false),
+            InboundAction::PartialTranscript(text) => (text, true),
+            InboundAction::BargeIn => (String::new(), false),
             InboundAction::None | InboundAction::Approval { .. } => return None,
         };
 
@@ -162,7 +197,6 @@ impl VoiceHostChannel {
                 .unwrap_or_default()
                 .as_secs(),
             interruption_scope_id: None,
-            interrupt_only,
             passive_context,
             explicitly_addressed: true,
             ..Default::default()
@@ -195,10 +229,14 @@ impl VoiceHostChannel {
     where
         S: futures_util::Sink<Message> + Unpin,
     {
-        if let Some(message) = self.message_for_action(InboundAction::BargeIn)
-            && tx.send(message).await.is_err()
-        {
-            return Ok(BargeInOutcome::DispatchClosed);
+        if let Some(message) = self.message_for_action(InboundAction::BargeIn) {
+            if let Some(control_tx) = self.control_tx.read().await.as_ref() {
+                if control_tx.send(message).is_err() {
+                    return Ok(BargeInOutcome::DispatchClosed);
+                }
+            } else if tx.send(message).await.is_err() {
+                return Ok(BargeInOutcome::DispatchClosed);
+            }
         }
 
         let cancel = encode_tts_cancel(self.backend)?;
@@ -230,6 +268,10 @@ impl Channel for VoiceHostChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
+        if message.suppress_voice {
+            return Ok(());
+        }
+
         self.queue_payload(encode_reply(
             self.backend,
             &message.content,
@@ -388,11 +430,14 @@ impl Channel for VoiceHostChannel {
                                 }
                             }
                             action @ InboundAction::FinalTranscript(_) => {
-                                if let Some(message) = self.message_for_action(action)
-                                    && tx.send(message).await.is_err()
-                                {
-                                    dispatch_closed = true;
-                                    break;
+                                if let Some(message) = self.message_for_action(action) {
+                                    match tx.try_send(message) {
+                                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            dispatch_closed = true;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             action @ InboundAction::PartialTranscript(_) => {
@@ -444,6 +489,17 @@ impl Channel for VoiceHostChannel {
         }
     }
 
+    async fn listen_with_control(
+        &self,
+        tx: mpsc::Sender<ChannelMessage>,
+        control_tx: mpsc::UnboundedSender<ChannelMessage>,
+    ) -> Result<()> {
+        *self.control_tx.write().await = Some(control_tx);
+        let result = self.listen(tx).await;
+        *self.control_tx.write().await = None;
+        result
+    }
+
     async fn health_check(&self) -> bool {
         self.outbound
             .read()
@@ -483,6 +539,8 @@ impl Channel for VoiceHostChannel {
             .lock()
             .await
             .insert(request_id.clone(), response_tx);
+        let mut cleanup =
+            PendingApprovalGuard::new(request_id.clone(), Arc::clone(&self.pending_approvals));
 
         let response =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), async {
@@ -504,6 +562,7 @@ impl Channel for VoiceHostChannel {
                 ),
             };
         self.pending_approvals.lock().await.remove(&request_id);
+        cleanup.disarm();
         Ok(Some(response))
     }
 }
@@ -786,6 +845,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suppressed_voice_message_is_not_queued_for_speech() {
+        let channel = channel(false);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        *channel.outbound.write().await = Some(outbound_tx);
+
+        channel
+            .send(&SendMessage::new("internal error", "office").suppress_voice())
+            .await
+            .unwrap();
+
+        assert!(outbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn barge_in_reaches_local_dispatch_when_remote_cancel_write_fails() {
         let channel = channel(false);
         let (tx, mut rx) = mpsc::channel(1);
@@ -798,7 +871,7 @@ mod tests {
                 .unwrap(),
             BargeInOutcome::RemoteClosed
         );
-        assert!(rx.recv().await.unwrap().interrupt_only);
+        assert!(rx.recv().await.unwrap().content.is_empty());
     }
 
     #[test]
@@ -873,7 +946,6 @@ mod tests {
         assert_eq!(message.reply_target, "office");
         assert!(message.explicitly_addressed);
         assert!(!message.passive_context);
-        assert!(!message.interrupt_only);
     }
 
     #[test]
@@ -908,7 +980,6 @@ mod tests {
         assert_eq!(action, InboundAction::PartialTranscript("hel".into()));
         let message = channel(true).message_for_action(action).unwrap();
         assert!(message.passive_context);
-        assert!(!message.interrupt_only);
     }
 
     #[test]
@@ -992,13 +1063,73 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(interrupt.interrupt_only);
+        assert!(interrupt.content.is_empty());
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), server)
                 .await
                 .unwrap()
                 .unwrap(),
             r#"{"type":"user-event","data":{"name":"tts_cancel","data":{}}}"#
+        );
+
+        channel_listener.abort();
+        let _ = channel_listener.await;
+    }
+
+    #[tokio::test]
+    async fn full_transcript_queue_does_not_delay_barge_in_control() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"type":"speech_end","transcript":"queue pressure"}"#.into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(r#"{"type":"barge_in"}"#.into()))
+                .await
+                .unwrap();
+            socket.next().await.unwrap().unwrap().into_text().unwrap()
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        inbound_tx.send(ChannelMessage::default()).await.unwrap();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let listener_channel = channel.clone();
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel
+                .listen_with_control(inbound_tx, control_tx)
+                .await
+                .unwrap();
+        });
+
+        let control = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.reply_target, "office");
+        assert!(control.content.is_empty());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            r#"{"type":"tts_cancel"}"#
         );
 
         channel_listener.abort();
@@ -1018,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn barge_in_maps_to_interrupt_only_and_cancel_control() {
+    fn barge_in_maps_to_control_message_and_cancel_event() {
         for raw in [
             r#"{"type":"barge_in"}"#,
             r#"{"type":"user-event","data":{"name":"barge_in","data":{}}}"#,
@@ -1026,7 +1157,6 @@ mod tests {
             let action = parse_inbound(raw, false);
             assert_eq!(action, InboundAction::BargeIn);
             let message = channel(false).message_for_action(action).unwrap();
-            assert!(message.interrupt_only);
             assert!(message.content.is_empty());
         }
 
@@ -1166,7 +1296,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(interrupt.interrupt_only);
+        assert!(interrupt.content.is_empty());
 
         let approval = channel
             .request_approval_attributed(
@@ -1246,6 +1376,46 @@ mod tests {
         assert_eq!(response.response, ChannelApprovalResponse::Deny);
         assert_eq!(response.source, ApprovalSource::TimedOut);
         assert!(channel.pending_approvals.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborting_approval_cleans_pending_request() {
+        let channel = Arc::new(channel(false));
+        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+        *channel.outbound.write().await = Some(outbound_tx);
+
+        let request_channel = Arc::clone(&channel);
+        let request = zeroclaw_spawn::spawn!(async move {
+            request_channel
+                .request_approval_attributed(
+                    "office",
+                    &ChannelApprovalRequest {
+                        tool_name: "shell".into(),
+                        arguments_summary: "Run command".into(),
+                        raw_arguments: None,
+                    },
+                )
+                .await
+        });
+
+        outbound_rx
+            .recv()
+            .await
+            .expect("approval request should be queued before cancellation");
+        assert_eq!(channel.pending_approvals.lock().await.len(), 1);
+
+        request.abort();
+        let _ = request.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if channel.pending_approvals.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted approval should remove its pending responder");
     }
 
     #[test]
