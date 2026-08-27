@@ -384,9 +384,6 @@ pub struct ChannelMessage {
     /// is genuinely inside a reply thread and should be isolated from other threads.
     /// `None` means top-level — scope is sender+channel only.
     pub interruption_scope_id: Option<String>,
-    /// When true, cancel the in-flight turn for this conversation without
-    /// starting a replacement turn or emitting a channel acknowledgement.
-    pub interrupt_only: bool,
     /// Media attachments (audio, images, video) for the media pipeline.
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
@@ -739,6 +736,20 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
+
+    /// Start listening with a priority path for transport control events.
+    ///
+    /// Existing channels use [`Channel::listen`]. Voice transports can override
+    /// this method so interruption controls never wait behind ordinary inbound
+    /// messages. Control messages carry routing metadata only and never become
+    /// model input.
+    async fn listen_with_control(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        _control_tx: tokio::sync::mpsc::UnboundedSender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        self.listen(tx).await
+    }
 
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
@@ -1279,7 +1290,6 @@ mod tests {
         assert!(msg.attachments.is_empty());
         assert!(msg.subject.is_none());
         assert!(!msg.passive_context);
-        assert!(!msg.interrupt_only);
         assert!(!msg.explicitly_addressed);
         assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
         assert!(msg.references.is_empty());
