@@ -19401,6 +19401,7 @@ BTC is currently around $65,000 based on latest tool output."#
             usize::MAX,
             true,
             true,
+            None,
         );
         startup_prompt.push_str(&zeroclaw_runtime::agent::loop_::build_tool_instructions(
             runtime_ctx.tools_registry.as_ref(),
