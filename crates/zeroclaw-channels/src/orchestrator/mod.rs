@@ -2205,6 +2205,7 @@ fn channel_turn_requires_prompt_rebuild(
 ) -> bool {
     model_provider_ref != ctx.model_provider_ref.as_str()
         || model != ctx.model.as_str()
+        || (ctx.autonomy_level == AutonomyLevel::Full && !excluded_tools.is_empty())
         || excluded_tools.iter().any(|excluded| {
             !ctx.non_cli_excluded_tools
                 .iter()
@@ -19592,7 +19593,12 @@ BTC is currently around $65,000 based on latest tool output."#
             name: "pwsh".to_string(),
             dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
         };
-        Arc::get_mut(&mut runtime_ctx).unwrap().shell_profile = Some(shell_profile.clone());
+        {
+            let runtime_ctx = Arc::get_mut(&mut runtime_ctx).unwrap();
+            runtime_ctx.shell_profile = Some(shell_profile.clone());
+            runtime_ctx.autonomy_level = AutonomyLevel::Full;
+            runtime_ctx.non_cli_excluded_tools = Arc::new(vec!["file_read".into()]);
+        }
 
         let tool_descs = [
             ("shell", "Execute shell commands"),
