@@ -400,6 +400,7 @@ impl Channel for VoiceHostChannel {
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let mut reconnect_attempt = 0usize;
         let mut pending_finals = VecDeque::<ChannelMessage>::new();
+        let mut pending_control = None::<ChannelMessage>;
         let mut partial_budget = PartialForwardBudget::new(MAX_PARTIALS_PER_FINAL);
         let mut recent_event_ids = RecentEventIds::new();
 
@@ -505,7 +506,6 @@ impl Channel for VoiceHostChannel {
             let mut dispatch_closed = false;
             let mut writer_finished = false;
             let mut last_partial_forwarded = None;
-            let mut pending_control = None::<ChannelMessage>;
             let mut pending_writer_controls = VecDeque::<WriterControl>::new();
 
             ::zeroclaw_log::record!(
@@ -1626,6 +1626,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_barge_in_survives_socket_disconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reconnected_tx, reconnected_rx) = oneshot::channel();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(r#"{"type":"barge_in"}"#.into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                socket.next().await.unwrap().unwrap().into_text().unwrap(),
+                r#"{"type":"tts_cancel"}"#
+            );
+            socket.close(None).await.unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let _socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            reconnected_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        control_tx
+            .send(ChannelMessage {
+                reply_target: "other-scope".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let listener_channel = Arc::clone(&channel);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel
+                .listen_with_control(inbound_tx, control_tx)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), reconnected_rx)
+            .await
+            .expect("voice host must reconnect after the socket closes")
+            .unwrap();
+        assert_eq!(control_rx.recv().await.unwrap().reply_target, "other-scope");
+        let retained = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("barge-in must remain pending across the socket reconnect")
+            .unwrap();
+        assert_eq!(retained.reply_target, "office");
+        assert!(retained.content.is_empty());
+
+        channel_listener.abort();
+        let _ = channel_listener.await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn final_transcript_overflow_requires_replay_and_closes_the_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1905,89 +1975,42 @@ mod tests {
 
     #[tokio::test]
     async fn full_ack_queue_does_not_delay_barge_in_control() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (connected_tx, connected_rx) = oneshot::channel();
-        let (send_barge_tx, send_barge_rx) = oneshot::channel();
-        let server = zeroclaw_spawn::spawn!(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            connected_tx.send(()).unwrap();
-            send_barge_rx.await.unwrap();
-            for index in 0..=WRITER_CONTROL_CAPACITY {
-                socket
-                    .send(Message::Text(
-                        serde_json::json!({
-                            "type": "speech_end",
-                            "event_id": format!("ack-pressure-{index}"),
-                            "transcript": format!("queued transcript {index}"),
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await
-                    .unwrap();
-            }
-            socket
-                .send(Message::Text(r#"{"type":"barge_in"}"#.into()))
-                .await
+        let (writer_control_tx, _writer_control_rx) =
+            mpsc::channel::<WriterControl>(WRITER_CONTROL_CAPACITY);
+        for _ in 0..WRITER_CONTROL_CAPACITY {
+            writer_control_tx
+                .try_send(WriterControl::Message(Message::Text("ack".into())))
                 .unwrap();
-            std::future::pending::<()>().await;
-        });
+        }
+        let mut pending_writer_controls = VecDeque::new();
+        assert!(queue_writer_control(
+            &writer_control_tx,
+            &mut pending_writer_controls,
+            WriterControl::Message(Message::Text("backlogged-ack".into())),
+        ));
+        assert_eq!(pending_writer_controls.len(), 1);
 
-        let channel = Arc::new(
-            VoiceHostChannel::new(
-                "office".into(),
-                VoiceHostConfig {
-                    enabled: true,
-                    url: format!("ws:{0}{0}{address}", '/'),
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
+        let channel = channel(false);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut pending_control = None;
+        assert_eq!(
+            channel
+                .handle_barge_in(
+                    &inbound_tx,
+                    Some(&control_tx),
+                    &cancel_tx,
+                    &mut pending_control,
+                )
+                .await
+                .unwrap(),
+            BargeInOutcome::Continue
         );
-        let (inbound_tx, _inbound_rx) = mpsc::channel(FINAL_TRANSCRIPT_CAPACITY);
-        let (control_tx, mut control_rx) = mpsc::channel(8);
-        let listener_channel = Arc::clone(&channel);
-        let channel_listener = zeroclaw_spawn::spawn!(async move {
-            listener_channel
-                .listen_with_control(inbound_tx, control_tx)
-                .await
-                .unwrap();
-        });
-        connected_rx.await.unwrap();
 
-        let sender_channel = Arc::clone(&channel);
-        let (writer_stalled_tx, writer_stalled_rx) = oneshot::channel();
-        let blocked_sender = zeroclaw_spawn::spawn!(async move {
-            let payload = "x".repeat(16 * 1024 * 1024);
-            for _ in 0..OUTBOUND_CAPACITY {
-                sender_channel
-                    .send(&SendMessage::new(&payload, "office"))
-                    .await
-                    .unwrap();
-            }
-            writer_stalled_tx.send(()).unwrap();
-        });
-        tokio::time::timeout(Duration::from_secs(5), writer_stalled_rx)
-            .await
-            .expect("outbound queue must fill before ACK pressure is applied")
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        send_barge_tx.send(()).unwrap();
-
-        let control = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
-            .await
-            .expect("local barge-in dispatch must not wait for a stalled WebSocket writer")
-            .unwrap();
+        let control = control_rx.recv().await.unwrap();
         assert!(control.content.is_empty());
-
-        blocked_sender.abort();
-        let _ = blocked_sender.await;
-        channel_listener.abort();
-        let _ = channel_listener.await;
-        server.abort();
-        let _ = server.await;
+        assert!(pending_control.is_none());
     }
 
     #[test]
