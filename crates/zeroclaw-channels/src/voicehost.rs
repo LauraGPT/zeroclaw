@@ -21,6 +21,7 @@ use zeroclaw_config::schema::{VoiceHostConfig, ws_connect_with_proxy_headers_and
 
 const OUTBOUND_CAPACITY: usize = 64;
 const WRITER_CONTROL_CAPACITY: usize = 8;
+const WRITER_CONTROL_BACKLOG_CAPACITY: usize = 32;
 const FINAL_TRANSCRIPT_CAPACITY: usize = 32;
 const MAX_PARTIALS_PER_FINAL: usize = 32;
 const RECENT_EVENT_ID_CAPACITY: usize = 1024;
@@ -107,6 +108,32 @@ enum WriterControl {
         payload: String,
         completed: oneshot::Sender<()>,
     },
+}
+
+fn queue_writer_control(
+    sender: &mpsc::Sender<WriterControl>,
+    pending: &mut VecDeque<WriterControl>,
+    control: WriterControl,
+) -> bool {
+    if !pending.is_empty() {
+        if pending.len() >= WRITER_CONTROL_BACKLOG_CAPACITY {
+            return false;
+        }
+        pending.push_back(control);
+        return true;
+    }
+    match sender.try_send(control) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(control))
+            if pending.len() < WRITER_CONTROL_BACKLOG_CAPACITY =>
+        {
+            pending.push_back(control);
+            true
+        }
+        Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
+            false
+        }
+    }
 }
 
 struct PartialForwardBudget {
@@ -297,13 +324,17 @@ impl VoiceHostChannel {
     async fn handle_barge_in(
         &self,
         tx: &mpsc::Sender<ChannelMessage>,
+        control_tx: Option<&mpsc::Sender<ChannelMessage>>,
         cancel_tx: &mpsc::Sender<Message>,
         pending_control: &mut Option<ChannelMessage>,
     ) -> Result<BargeInOutcome> {
         if let Some(message) = self.message_for_action(InboundAction::BargeIn) {
-            if let Some(control_tx) = self.control_tx.read().await.as_ref() {
+            if let Some(control_tx) = control_tx {
                 match control_tx.try_send(message) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(message)) => {
+                        *pending_control = Some(message);
+                    }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         return Ok(BargeInOutcome::DispatchClosed);
                     }
@@ -433,6 +464,7 @@ impl Channel for VoiceHostChannel {
             let (writer_control_tx, mut writer_control_rx) =
                 mpsc::channel::<WriterControl>(WRITER_CONTROL_CAPACITY);
             let (cancel_tx, mut cancel_rx) = mpsc::channel::<Message>(1);
+            let dispatch_control_tx = self.control_tx.read().await.clone();
             *self.outbound.write().await = Some(outbound_tx);
             let mut writer_task = zeroclaw_spawn::spawn!(async move {
                 let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
@@ -474,6 +506,7 @@ impl Channel for VoiceHostChannel {
             let mut writer_finished = false;
             let mut last_partial_forwarded = None;
             let mut pending_control = None::<ChannelMessage>;
+            let mut pending_writer_controls = VecDeque::<WriterControl>::new();
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -511,7 +544,13 @@ impl Channel for VoiceHostChannel {
                         }
                         break;
                     }
-                    permit = tx.reserve(), if pending_control.is_some() => {
+                    permit = async {
+                        dispatch_control_tx
+                            .as_ref()
+                            .expect("guard requires a production control sender")
+                            .reserve()
+                            .await
+                    }, if pending_control.is_some() && dispatch_control_tx.is_some() => {
                         match permit {
                             Ok(permit) => {
                                 if let Some(message) = pending_control.take() {
@@ -522,6 +561,29 @@ impl Channel for VoiceHostChannel {
                                 dispatch_closed = true;
                                 break;
                             }
+                        }
+                    }
+                    permit = tx.reserve(), if pending_control.is_some() && dispatch_control_tx.is_none() => {
+                        match permit {
+                            Ok(permit) => {
+                                if let Some(message) = pending_control.take() {
+                                    permit.send(message);
+                                }
+                            }
+                            Err(_) => {
+                                dispatch_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    permit = writer_control_tx.reserve(), if !pending_writer_controls.is_empty() => {
+                        match permit {
+                            Ok(permit) => {
+                                if let Some(control) = pending_writer_controls.pop_front() {
+                                    permit.send(control);
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
                     permit = tx.reserve(), if !pending_finals.is_empty() => {
@@ -541,10 +603,11 @@ impl Channel for VoiceHostChannel {
                         let raw = match incoming {
                             Some(Ok(Message::Text(text))) => text,
                             Some(Ok(Message::Ping(payload))) => {
-                                if writer_control_tx
-                                    .try_send(WriterControl::Message(Message::Pong(payload)))
-                                    .is_err()
-                                {
+                                if !queue_writer_control(
+                                    &writer_control_tx,
+                                    &mut pending_writer_controls,
+                                    WriterControl::Message(Message::Pong(payload)),
+                                ) {
                                     break;
                                 }
                                 continue;
@@ -608,7 +671,12 @@ impl Channel for VoiceHostChannel {
                             }
                             InboundAction::BargeIn => {
                                 match self
-                                    .handle_barge_in(&tx, &cancel_tx, &mut pending_control)
+                                    .handle_barge_in(
+                                        &tx,
+                                        dispatch_control_tx.as_ref(),
+                                        &cancel_tx,
+                                        &mut pending_control,
+                                    )
                                     .await?
                                 {
                                     BargeInOutcome::Continue => {}
@@ -632,11 +700,11 @@ impl Channel for VoiceHostChannel {
                                         self.backend,
                                         event_id.as_deref(),
                                     )?;
-                                    if writer_control_tx
-                                        .send(WriterControl::Message(Message::Text(payload.into())))
-                                        .await
-                                        .is_err()
-                                    {
+                                    if !queue_writer_control(
+                                        &writer_control_tx,
+                                        &mut pending_writer_controls,
+                                        WriterControl::Message(Message::Text(payload.into())),
+                                    ) {
                                         break;
                                     }
                                     continue;
@@ -672,11 +740,11 @@ impl Channel for VoiceHostChannel {
                                         self.backend,
                                         event_id.as_deref(),
                                     )?;
-                                    if writer_control_tx
-                                        .send(WriterControl::Message(Message::Text(payload.into())))
-                                        .await
-                                        .is_err()
-                                    {
+                                    if !queue_writer_control(
+                                        &writer_control_tx,
+                                        &mut pending_writer_controls,
+                                        WriterControl::Message(Message::Text(payload.into())),
+                                    ) {
                                         break;
                                     }
                                 } else {
@@ -684,6 +752,16 @@ impl Channel for VoiceHostChannel {
                                         self.backend,
                                         event_id.as_deref(),
                                     )?;
+                                    let mut writer_closed = false;
+                                    while let Some(control) = pending_writer_controls.pop_front() {
+                                        if writer_control_tx.send(control).await.is_err() {
+                                            writer_closed = true;
+                                            break;
+                                        }
+                                    }
+                                    if writer_closed {
+                                        break;
+                                    }
                                     let (completed_tx, completed_rx) = oneshot::channel();
                                     if writer_control_tx
                                         .send(WriterControl::ReplayAndClose {
@@ -1200,7 +1278,7 @@ mod tests {
 
         assert_eq!(
             channel
-                .handle_barge_in(&tx, &cancel_tx, &mut pending_control)
+                .handle_barge_in(&tx, None, &cancel_tx, &mut pending_control)
                 .await
                 .unwrap(),
             BargeInOutcome::RemoteClosed
@@ -1487,6 +1565,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_shared_control_queue_retains_first_barge_in_for_scope() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(r#"{"type":"barge_in"}"#.into()))
+                .await
+                .unwrap();
+            socket.next().await.unwrap().unwrap().into_text().unwrap()
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        control_tx
+            .send(ChannelMessage {
+                reply_target: "other-scope".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let listener_channel = Arc::clone(&channel);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel
+                .listen_with_control(inbound_tx, control_tx)
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            r#"{"type":"tts_cancel"}"#
+        );
+        assert_eq!(control_rx.recv().await.unwrap().reply_target, "other-scope");
+        let retained = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("barge-in must be retained while the shared control queue is full")
+            .unwrap();
+        assert_eq!(retained.reply_target, "office");
+        assert!(retained.content.is_empty());
+
+        channel_listener.abort();
+        let _ = channel_listener.await;
+    }
+
+    #[tokio::test]
     async fn final_transcript_overflow_requires_replay_and_closes_the_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1765,7 +1904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_reading_peer_does_not_delay_barge_in_control() {
+    async fn full_ack_queue_does_not_delay_barge_in_control() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (connected_tx, connected_rx) = oneshot::channel();
@@ -1775,6 +1914,20 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             connected_tx.send(()).unwrap();
             send_barge_rx.await.unwrap();
+            for index in 0..=WRITER_CONTROL_CAPACITY {
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "speech_end",
+                            "event_id": format!("ack-pressure-{index}"),
+                            "transcript": format!("queued transcript {index}"),
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
             socket
                 .send(Message::Text(r#"{"type":"barge_in"}"#.into()))
                 .await
@@ -1793,7 +1946,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(FINAL_TRANSCRIPT_CAPACITY);
         let (control_tx, mut control_rx) = mpsc::channel(8);
         let listener_channel = Arc::clone(&channel);
         let channel_listener = zeroclaw_spawn::spawn!(async move {
@@ -1805,16 +1958,22 @@ mod tests {
         connected_rx.await.unwrap();
 
         let sender_channel = Arc::clone(&channel);
+        let (writer_stalled_tx, writer_stalled_rx) = oneshot::channel();
         let blocked_sender = zeroclaw_spawn::spawn!(async move {
             let payload = "x".repeat(16 * 1024 * 1024);
-            for _ in 0..8 {
+            for _ in 0..OUTBOUND_CAPACITY {
                 sender_channel
                     .send(&SendMessage::new(&payload, "office"))
                     .await
                     .unwrap();
             }
+            writer_stalled_tx.send(()).unwrap();
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(5), writer_stalled_rx)
+            .await
+            .expect("outbound queue must fill before ACK pressure is applied")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
         send_barge_tx.send(()).unwrap();
 
         let control = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
