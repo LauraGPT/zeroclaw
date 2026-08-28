@@ -5,23 +5,25 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use uuid::Uuid;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{
     ApprovalSource, AttributedApprovalResponse, Channel, ChannelApprovalRequest,
     ChannelApprovalResponse, ChannelMessage, SendMessage, VoiceEvent,
 };
-use zeroclaw_config::schema::{VoiceHostConfig, ws_connect_with_proxy_headers};
+use zeroclaw_config::schema::{VoiceHostConfig, ws_connect_with_proxy_headers_and_config};
 
 const OUTBOUND_CAPACITY: usize = 64;
 const WRITER_CONTROL_CAPACITY: usize = 8;
 const FINAL_TRANSCRIPT_CAPACITY: usize = 32;
+const MAX_PARTIALS_PER_FINAL: usize = 32;
+const RECENT_EVENT_ID_CAPACITY: usize = 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024;
@@ -80,7 +82,10 @@ fn is_loopback_endpoint(url: &url::Url) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 enum InboundAction {
     None,
-    FinalTranscript(String),
+    FinalTranscript {
+        text: String,
+        event_id: Option<String>,
+    },
     PartialTranscript(String),
     BargeIn,
     Approval {
@@ -96,6 +101,70 @@ enum BargeInOutcome {
     RemoteClosed,
 }
 
+enum WriterControl {
+    Message(Message),
+    ReplayAndClose {
+        payload: String,
+        completed: oneshot::Sender<()>,
+    },
+}
+
+struct PartialForwardBudget {
+    remaining: usize,
+    capacity: usize,
+}
+
+struct RecentEventIds {
+    order: VecDeque<String>,
+    values: HashSet<String>,
+}
+
+impl RecentEventIds {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::with_capacity(RECENT_EVENT_ID_CAPACITY),
+            values: HashSet::with_capacity(RECENT_EVENT_ID_CAPACITY),
+        }
+    }
+
+    fn contains(&self, event_id: &str) -> bool {
+        self.values.contains(event_id)
+    }
+
+    fn insert(&mut self, event_id: String) {
+        if !self.values.insert(event_id.clone()) {
+            return;
+        }
+        self.order.push_back(event_id);
+        if self.order.len() > RECENT_EVENT_ID_CAPACITY
+            && let Some(expired) = self.order.pop_front()
+        {
+            self.values.remove(&expired);
+        }
+    }
+}
+
+impl PartialForwardBudget {
+    fn new(capacity: usize) -> Self {
+        Self {
+            remaining: capacity,
+            capacity,
+        }
+    }
+
+    fn admit(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    fn reset_after_final(&mut self) {
+        self.remaining = self.capacity;
+    }
+}
+
 /// A text-only bridge to an external process that owns the audio pipeline.
 pub struct VoiceHostChannel {
     alias: String,
@@ -108,7 +177,7 @@ pub struct VoiceHostChannel {
     excluded_tools: Vec<String>,
     headers: HeaderMap,
     outbound: Arc<RwLock<Option<mpsc::Sender<String>>>>,
-    control_tx: Arc<RwLock<Option<mpsc::UnboundedSender<ChannelMessage>>>>,
+    control_tx: Arc<RwLock<Option<mpsc::Sender<ChannelMessage>>>>,
     pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
 }
 
@@ -183,7 +252,7 @@ impl VoiceHostChannel {
 
     fn message_for_action(&self, action: InboundAction) -> Option<ChannelMessage> {
         let (content, passive_context) = match action {
-            InboundAction::FinalTranscript(text) => (text, false),
+            InboundAction::FinalTranscript { text, .. } => (text, false),
             InboundAction::PartialTranscript(text) => (text, true),
             InboundAction::BargeIn => (String::new(), false),
             InboundAction::None | InboundAction::Approval { .. } => return None,
@@ -233,8 +302,11 @@ impl VoiceHostChannel {
     ) -> Result<BargeInOutcome> {
         if let Some(message) = self.message_for_action(InboundAction::BargeIn) {
             if let Some(control_tx) = self.control_tx.read().await.as_ref() {
-                if control_tx.send(message).is_err() {
-                    return Ok(BargeInOutcome::DispatchClosed);
+                match control_tx.try_send(message) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Ok(BargeInOutcome::DispatchClosed);
+                    }
                 }
             } else {
                 match tx.try_send(message) {
@@ -296,6 +368,9 @@ impl Channel for VoiceHostChannel {
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let mut reconnect_attempt = 0usize;
+        let mut pending_finals = VecDeque::<ChannelMessage>::new();
+        let mut partial_budget = PartialForwardBudget::new(MAX_PARTIALS_PER_FINAL);
+        let mut recent_event_ids = RecentEventIds::new();
 
         loop {
             if tx.is_closed() {
@@ -307,11 +382,16 @@ impl Channel for VoiceHostChannel {
             let connected = tokio::select! {
                 result = tokio::time::timeout(
                     CONNECT_TIMEOUT,
-                    ws_connect_with_proxy_headers(
+                    ws_connect_with_proxy_headers_and_config(
                         &self.url,
                         &service_key,
                         self.proxy_url.as_deref(),
                         &self.headers,
+                        Some(
+                            WebSocketConfig::default()
+                                .max_message_size(Some(MAX_EVENT_BYTES))
+                                .max_frame_size(Some(MAX_EVENT_BYTES)),
+                        ),
                     ),
                 ) => match result {
                     Ok(Ok(connection)) => Ok(connection),
@@ -351,7 +431,7 @@ impl Channel for VoiceHostChannel {
             let (mut write, mut read) = socket.split();
             let (outbound_tx, mut outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
             let (writer_control_tx, mut writer_control_rx) =
-                mpsc::channel::<Message>(WRITER_CONTROL_CAPACITY);
+                mpsc::channel::<WriterControl>(WRITER_CONTROL_CAPACITY);
             let (cancel_tx, mut cancel_rx) = mpsc::channel::<Message>(1);
             *self.outbound.write().await = Some(outbound_tx);
             let mut writer_task = zeroclaw_spawn::spawn!(async move {
@@ -361,7 +441,24 @@ impl Channel for VoiceHostChannel {
                     let message = tokio::select! {
                         biased;
                         Some(message) = cancel_rx.recv() => message,
-                        Some(message) = writer_control_rx.recv() => message,
+                        Some(control) = writer_control_rx.recv() => match control {
+                            WriterControl::Message(message) => message,
+                            WriterControl::ReplayAndClose { payload, completed } => {
+                                tokio::time::timeout(
+                                    WRITE_TIMEOUT,
+                                    write.send(Message::Text(payload.into())),
+                                )
+                                .await
+                                .context("voice host replay notice write timed out")?
+                                .context("voice host replay notice write failed")?;
+                                tokio::time::timeout(WRITE_TIMEOUT, write.send(Message::Close(None)))
+                                    .await
+                                    .context("voice host close write timed out")?
+                                    .context("voice host close write failed")?;
+                                let _ = completed.send(());
+                                return Ok::<(), anyhow::Error>(());
+                            }
+                        },
                         Some(payload) = outbound_rx.recv() => Message::Text(payload.into()),
                         _ = ping.tick() => Message::Ping(Vec::new().into()),
                     };
@@ -377,8 +474,6 @@ impl Channel for VoiceHostChannel {
             let mut writer_finished = false;
             let mut last_partial_forwarded = None;
             let mut pending_control = None::<ChannelMessage>;
-            let mut pending_finals = VecDeque::<ChannelMessage>::new();
-            let mut backpressure_reported = false;
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -435,9 +530,6 @@ impl Channel for VoiceHostChannel {
                                 if let Some(message) = pending_finals.pop_front() {
                                     permit.send(message);
                                 }
-                                if pending_finals.len() < FINAL_TRANSCRIPT_CAPACITY {
-                                    backpressure_reported = false;
-                                }
                             }
                             Err(_) => {
                                 dispatch_closed = true;
@@ -449,7 +541,10 @@ impl Channel for VoiceHostChannel {
                         let raw = match incoming {
                             Some(Ok(Message::Text(text))) => text,
                             Some(Ok(Message::Ping(payload))) => {
-                                if writer_control_tx.try_send(Message::Pong(payload)).is_err() {
+                                if writer_control_tx
+                                    .try_send(WriterControl::Message(Message::Pong(payload)))
+                                    .is_err()
+                                {
                                     break;
                                 }
                                 continue;
@@ -524,43 +619,101 @@ impl Channel for VoiceHostChannel {
                                     BargeInOutcome::RemoteClosed => break,
                                 }
                             }
-                            action @ InboundAction::FinalTranscript(_) => {
-                                if let Some(message) = self.message_for_action(action) {
-                                    if pending_finals.is_empty() {
-                                        match tx.try_send(message) {
-                                            Ok(()) => continue,
-                                            Err(mpsc::error::TrySendError::Full(message)) => {
-                                                pending_finals.push_back(message);
-                                            }
-                                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                dispatch_closed = true;
-                                                break;
-                                            }
+                            action @ InboundAction::FinalTranscript { .. } => {
+                                let event_id = match &action {
+                                    InboundAction::FinalTranscript { event_id, .. } => event_id.clone(),
+                                    _ => None,
+                                };
+                                if event_id
+                                    .as_deref()
+                                    .is_some_and(|event_id| recent_event_ids.contains(event_id))
+                                {
+                                    let payload = encode_transcript_ack(
+                                        self.backend,
+                                        event_id.as_deref(),
+                                    )?;
+                                    if writer_control_tx
+                                        .send(WriterControl::Message(Message::Text(payload.into())))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                let Some(message) = self.message_for_action(action) else {
+                                    continue;
+                                };
+                                let accepted = if pending_finals.is_empty() {
+                                    match tx.try_send(message) {
+                                        Ok(()) => true,
+                                        Err(mpsc::error::TrySendError::Full(message)) => {
+                                            pending_finals.push_back(message);
+                                            true
                                         }
-                                    } else if pending_finals.len() < FINAL_TRANSCRIPT_CAPACITY {
-                                        pending_finals.push_back(message);
-                                    } else if !backpressure_reported {
-                                        let payload = encode_transcript_backpressure(self.backend)?;
-                                        if writer_control_tx
-                                            .try_send(Message::Text(payload.into()))
-                                            .is_err()
-                                        {
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            dispatch_closed = true;
                                             break;
                                         }
-                                        backpressure_reported = true;
-                                        ::zeroclaw_log::record!(
-                                            WARN,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Reject
-                                            )
-                                            .with_attrs(::serde_json::json!({
-                                                "alias": self.alias,
-                                                "capacity": FINAL_TRANSCRIPT_CAPACITY,
-                                            })),
-                                            "voice host final transcript queue reached capacity"
-                                        );
                                     }
+                                } else if pending_finals.len() < FINAL_TRANSCRIPT_CAPACITY {
+                                    pending_finals.push_back(message);
+                                    true
+                                } else {
+                                    false
+                                };
+
+                                if accepted {
+                                    partial_budget.reset_after_final();
+                                    if let Some(event_id) = event_id.clone() {
+                                        recent_event_ids.insert(event_id);
+                                    }
+                                    let payload = encode_transcript_ack(
+                                        self.backend,
+                                        event_id.as_deref(),
+                                    )?;
+                                    if writer_control_tx
+                                        .send(WriterControl::Message(Message::Text(payload.into())))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                } else {
+                                    let payload = encode_transcript_replay_required(
+                                        self.backend,
+                                        event_id.as_deref(),
+                                    )?;
+                                    let (completed_tx, completed_rx) = oneshot::channel();
+                                    if writer_control_tx
+                                        .send(WriterControl::ReplayAndClose {
+                                            payload,
+                                            completed: completed_tx,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    let _ = tokio::time::timeout(
+                                        WRITE_TIMEOUT + WRITE_TIMEOUT,
+                                        completed_rx,
+                                    )
+                                    .await;
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Reject
+                                        )
+                                        .with_attrs(::serde_json::json!({
+                                            "alias": self.alias,
+                                            "capacity": FINAL_TRANSCRIPT_CAPACITY,
+                                            "event_id": event_id,
+                                        })),
+                                        "voice host requires final transcript replay after reconnect"
+                                    );
+                                    break;
                                 }
                             }
                             action @ InboundAction::PartialTranscript(_) => {
@@ -568,6 +721,9 @@ impl Channel for VoiceHostChannel {
                                 if last_partial_forwarded.is_some_and(|last: Instant| {
                                     now.duration_since(last) < PARTIAL_FORWARD_INTERVAL
                                 }) {
+                                    continue;
+                                }
+                                if !partial_budget.admit() {
                                     continue;
                                 }
                                 if let Some(message) = self.message_for_action(action) {
@@ -620,7 +776,7 @@ impl Channel for VoiceHostChannel {
     async fn listen_with_control(
         &self,
         tx: mpsc::Sender<ChannelMessage>,
-        control_tx: mpsc::UnboundedSender<ChannelMessage>,
+        control_tx: mpsc::Sender<ChannelMessage>,
     ) -> Result<()> {
         *self.control_tx.write().await = Some(control_tx);
         let result = self.listen(tx).await;
@@ -713,7 +869,10 @@ fn parse_inbound(raw: &str, forward_partials: bool) -> InboundAction {
             VoiceEvent::SpeechEnd {
                 transcript: Some(text),
             } => bounded_transcript(&text)
-                .map(InboundAction::FinalTranscript)
+                .map(|text| InboundAction::FinalTranscript {
+                    text,
+                    event_id: event_id_from_raw(raw, "/event_id"),
+                })
                 .unwrap_or(InboundAction::None),
             VoiceEvent::BargeIn => InboundAction::BargeIn,
             VoiceEvent::SpeechStart
@@ -733,7 +892,11 @@ fn parse_inbound(raw: &str, forward_partials: bool) -> InboundAction {
 
     match event_type {
         "transcript" => wyoming_text(&value)
-            .map(InboundAction::FinalTranscript)
+            .map(|text| InboundAction::FinalTranscript {
+                text,
+                event_id: event_id_from_value(&value, "/data/event_id")
+                    .or_else(|| event_id_from_value(&value, "/data/data/event_id")),
+            })
             .unwrap_or(InboundAction::None),
         "transcript-chunk" if forward_partials => wyoming_text(&value)
             .map(InboundAction::PartialTranscript)
@@ -741,6 +904,21 @@ fn parse_inbound(raw: &str, forward_partials: bool) -> InboundAction {
         "user-event" => parse_wyoming_user_event(&value),
         _ => InboundAction::None,
     }
+}
+
+fn event_id_from_raw(raw: &str, pointer: &str) -> Option<String> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| event_id_from_value(&value, pointer))
+}
+
+fn event_id_from_value(value: &Value, pointer: &str) -> Option<String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 fn wyoming_text(value: &Value) -> Option<String> {
@@ -827,19 +1005,45 @@ fn encode_tts_cancel(backend: VoiceHostBackend) -> Result<String> {
     }
 }
 
-fn encode_transcript_backpressure(backend: VoiceHostBackend) -> Result<String> {
+fn encode_transcript_ack(backend: VoiceHostBackend, event_id: Option<&str>) -> Result<String> {
     match backend {
         VoiceHostBackend::Native => Ok(serde_json::json!({
-            "type": "error",
-            "code": "transcript_backpressure",
-            "retryable": true,
+            "type": "transcript_ack",
+            "event_id": event_id,
         })
         .to_string()),
         VoiceHostBackend::Wyoming => Ok(serde_json::to_string(&WyomingEnvelope {
             kind: "user-event",
             data: WyomingUserEvent {
-                name: "transcript_backpressure",
-                data: TranscriptBackpressureData { retryable: true },
+                name: "transcript_ack",
+                data: TranscriptAckData { event_id },
+            },
+        })?),
+    }
+}
+
+fn encode_transcript_replay_required(
+    backend: VoiceHostBackend,
+    event_id: Option<&str>,
+) -> Result<String> {
+    match backend {
+        VoiceHostBackend::Native => Ok(serde_json::json!({
+            "type": "error",
+            "code": "transcript_replay_required",
+            "event_id": event_id,
+            "retryable": true,
+            "reconnect": true,
+        })
+        .to_string()),
+        VoiceHostBackend::Wyoming => Ok(serde_json::to_string(&WyomingEnvelope {
+            kind: "user-event",
+            data: WyomingUserEvent {
+                name: "transcript_replay_required",
+                data: TranscriptReplayRequiredData {
+                    event_id,
+                    retryable: true,
+                    reconnect: true,
+                },
             },
         })?),
     }
@@ -895,8 +1099,17 @@ struct ApprovalRequestData<'a> {
 struct EmptyData {}
 
 #[derive(Serialize)]
-struct TranscriptBackpressureData {
+struct TranscriptAckData<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct TranscriptReplayRequiredData<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_id: Option<&'a str>,
     retryable: bool,
+    reconnect: bool,
 }
 
 #[cfg(test)]
@@ -1058,7 +1271,13 @@ mod tests {
     #[test]
     fn native_final_transcript_maps_to_channel_message() {
         let action = parse_inbound(r#"{"type":"speech_end","transcript":"hello world"}"#, false);
-        assert_eq!(action, InboundAction::FinalTranscript("hello world".into()));
+        assert_eq!(
+            action,
+            InboundAction::FinalTranscript {
+                text: "hello world".into(),
+                event_id: None,
+            }
+        );
 
         let message = channel(false).message_for_action(action).unwrap();
         assert_eq!(message.content, "hello world");
@@ -1076,7 +1295,10 @@ mod tests {
                 r#"{"type":"transcript","data":{"text":"hello from wyoming"}}"#,
                 false,
             ),
-            InboundAction::FinalTranscript("hello from wyoming".into())
+            InboundAction::FinalTranscript {
+                text: "hello from wyoming".into(),
+                event_id: None,
+            }
         );
     }
 
@@ -1230,7 +1452,7 @@ mod tests {
         );
         let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
         inbound_tx.send(ChannelMessage::default()).await.unwrap();
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::channel(8);
         let listener_channel = channel.clone();
         let channel_listener = zeroclaw_spawn::spawn!(async move {
             listener_channel
@@ -1265,17 +1487,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_transcript_overflow_is_reported_to_the_voice_host() {
+    async fn final_transcript_overflow_requires_replay_and_closes_the_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = zeroclaw_spawn::spawn!(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            for index in 0..128 {
+            for index in 0..=FINAL_TRANSCRIPT_CAPACITY {
                 socket
                     .send(Message::Text(
                         serde_json::json!({
                             "type": "speech_end",
+                            "event_id": format!("final-{index}"),
                             "transcript": format!("queued-{index}"),
                         })
                         .to_string()
@@ -1284,7 +1507,23 @@ mod tests {
                     .await
                     .unwrap();
             }
-            socket.next().await.unwrap().unwrap().into_text().unwrap()
+
+            let mut acknowledged = Vec::new();
+            let replay = loop {
+                let message = socket.next().await.unwrap().unwrap();
+                let payload: serde_json::Value =
+                    serde_json::from_str(message.to_text().unwrap()).unwrap();
+                if payload["type"] == "transcript_ack" {
+                    acknowledged.push(payload["event_id"].as_str().unwrap().to_string());
+                } else {
+                    break payload;
+                }
+            };
+            let closed = matches!(
+                tokio::time::timeout(Duration::from_secs(1), socket.next()).await,
+                Ok(None) | Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_)))
+            );
+            (acknowledged, replay, closed)
         });
 
         let channel = Arc::new(
@@ -1305,17 +1544,224 @@ mod tests {
             listener_channel.listen(inbound_tx).await.unwrap();
         });
 
-        let response = tokio::time::timeout(Duration::from_secs(5), server)
+        let (acknowledged, replay, closed) = tokio::time::timeout(Duration::from_secs(5), server)
             .await
-            .expect("overflow must produce an observable protocol response")
+            .expect("overflow must produce a replay contract and close")
             .unwrap();
-        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(response["type"], "error");
-        assert_eq!(response["code"], "transcript_backpressure");
-        assert_eq!(response["retryable"], true);
+        assert_eq!(acknowledged.len(), FINAL_TRANSCRIPT_CAPACITY);
+        assert_eq!(acknowledged.first().map(String::as_str), Some("final-0"));
+        assert_eq!(acknowledged.last().map(String::as_str), Some("final-31"));
+        assert_eq!(replay["type"], "error");
+        assert_eq!(replay["code"], "transcript_replay_required");
+        assert_eq!(replay["event_id"], "final-32");
+        assert_eq!(replay["retryable"], true);
+        assert_eq!(replay["reconnect"], true);
+        assert!(
+            closed,
+            "overflow must terminate the connection after the replay notice"
+        );
 
         channel_listener.abort();
         let _ = channel_listener.await;
+    }
+
+    #[tokio::test]
+    async fn acknowledged_pending_finals_survive_a_socket_disconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for index in 0..2 {
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "speech_end",
+                            "event_id": format!("retained-{index}"),
+                            "transcript": format!("retained transcript {index}"),
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            for index in 0..2 {
+                let ack = socket.next().await.unwrap().unwrap();
+                let ack: serde_json::Value = serde_json::from_str(ack.to_text().unwrap()).unwrap();
+                assert_eq!(ack["type"], "transcript_ack");
+                assert_eq!(ack["event_id"], format!("retained-{index}"));
+            }
+            socket.close(None).await.unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let _socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        inbound_tx.send(ChannelMessage::default()).await.unwrap();
+        let listener_channel = Arc::clone(&channel);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel.listen(inbound_tx).await.unwrap();
+        });
+
+        let _placeholder = inbound_rx.recv().await.unwrap();
+        for index in 0..2 {
+            let transcript = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+                .await
+                .expect("acknowledged final must survive reconnect")
+                .unwrap();
+            assert_eq!(transcript.content, format!("retained transcript {index}"));
+        }
+
+        channel_listener.abort();
+        let _ = channel_listener.await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn replayed_event_id_is_acknowledged_without_duplicate_dispatch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "speech_end",
+                            "event_id": "replayed-final",
+                            "transcript": "dispatch once",
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let ack = socket.next().await.unwrap().unwrap();
+                let ack: Value = serde_json::from_str(ack.to_text().unwrap()).unwrap();
+                assert_eq!(ack["type"], "transcript_ack");
+                assert_eq!(ack["event_id"], "replayed-final");
+                socket.close(None).await.unwrap();
+            }
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let listener_channel = Arc::clone(&channel);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel.listen(inbound_tx).await.unwrap();
+        });
+
+        let transcript = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(transcript.content, "dispatch once");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), inbound_rx.recv())
+                .await
+                .is_err(),
+            "a replayed acknowledged event_id must not dispatch twice"
+        );
+
+        channel_listener.abort();
+        let _ = channel_listener.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_decoder_rejects_a_padded_oversized_event() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "speech_end",
+                        "event_id": "oversized",
+                        "transcript": "small",
+                        "padding": "x".repeat(MAX_EVENT_BYTES),
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            matches!(
+                tokio::time::timeout(Duration::from_secs(2), socket.next()).await,
+                Ok(None) | Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_)))
+            )
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
+        let listener_channel = Arc::clone(&channel);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel.listen(inbound_tx).await.unwrap();
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            "decoder must close before materializing a padded oversized event"
+        );
+        assert!(inbound_rx.try_recv().is_err());
+
+        channel_listener.abort();
+        let _ = channel_listener.await;
+    }
+
+    #[test]
+    fn passive_partial_budget_resets_only_after_a_final() {
+        let mut budget = PartialForwardBudget::new(MAX_PARTIALS_PER_FINAL);
+        for _ in 0..MAX_PARTIALS_PER_FINAL {
+            assert!(budget.admit());
+        }
+        assert!(!budget.admit());
+        budget.reset_after_final();
+        assert!(budget.admit());
     }
 
     #[tokio::test]
@@ -1348,7 +1794,7 @@ mod tests {
             .unwrap(),
         );
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::channel(8);
         let listener_channel = Arc::clone(&channel);
         let channel_listener = zeroclaw_spawn::spawn!(async move {
             listener_channel
@@ -1420,28 +1866,32 @@ mod tests {
     }
 
     #[test]
-    fn transcript_backpressure_encodes_for_native_and_wyoming_backends() {
+    fn transcript_replay_and_ack_encode_for_native_and_wyoming_backends() {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
-                &encode_transcript_backpressure(VoiceHostBackend::Native).unwrap()
+                &encode_transcript_ack(VoiceHostBackend::Native, Some("final-1")).unwrap()
             )
             .unwrap(),
             serde_json::json!({
-                "type": "error",
-                "code": "transcript_backpressure",
-                "retryable": true,
+                "type": "transcript_ack",
+                "event_id": "final-1",
             })
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
-                &encode_transcript_backpressure(VoiceHostBackend::Wyoming).unwrap()
+                &encode_transcript_replay_required(VoiceHostBackend::Wyoming, Some("final-2"),)
+                    .unwrap()
             )
             .unwrap(),
             serde_json::json!({
                 "type": "user-event",
                 "data": {
-                    "name": "transcript_backpressure",
-                    "data": { "retryable": true },
+                    "name": "transcript_replay_required",
+                    "data": {
+                        "event_id": "final-2",
+                        "retryable": true,
+                        "reconnect": true,
+                    },
                 },
             })
         );
@@ -1512,6 +1962,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            let ack = socket.next().await.unwrap().unwrap().into_text().unwrap();
             let reply = socket.next().await.unwrap().unwrap().into_text().unwrap();
 
             socket
@@ -1536,7 +1987,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            (reply.to_string(), cancel.to_string(), approval.to_string())
+            (
+                ack.to_string(),
+                reply.to_string(),
+                cancel.to_string(),
+                approval.to_string(),
+            )
         });
 
         let channel = Arc::new(
@@ -1590,11 +2046,15 @@ mod tests {
         assert_eq!(approval.response, ChannelApprovalResponse::Approve);
         assert_eq!(approval.source, ApprovalSource::Operator);
 
-        let (reply, cancel, approval_payload) =
+        let (ack, reply, cancel, approval_payload) =
             tokio::time::timeout(Duration::from_secs(5), server)
                 .await
                 .unwrap()
                 .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&ack).unwrap()["type"],
+            "transcript_ack"
+        );
         assert_eq!(reply, r#"{"type":"say","text":"meeting booked"}"#);
         assert_eq!(cancel, r#"{"type":"tts_cancel"}"#);
         assert!(!approval_payload.contains("never-send"));

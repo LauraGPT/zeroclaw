@@ -72,21 +72,22 @@ The connection is one-to-one. Each connection attempt times out after 15 seconds
 
 | Direction | Native backend | `wyoming-events-ws` profile | Effect |
 |---|---|---|---|
-| Host → ZeroClaw | `speech_end { transcript }` | `transcript` with `data.text` | Start an agent turn from a final transcript |
+| Host → ZeroClaw | `speech_end { transcript, event_id? }` | `transcript` with `data.text` and optional `data.event_id` | Submit a final transcript |
 | Host → ZeroClaw | Not supported | `transcript-chunk` with `data.text` | Add passive context when `forward_partials = true` |
 | Host → ZeroClaw | `barge_in` | `user-event` named `barge_in` | Cancel the current turn without starting another |
 | ZeroClaw → host | `say { text, voice? }` | `synthesize` | Synthesize and play the agent response |
 | ZeroClaw → host | `tts_cancel` | `user-event` named `tts_cancel` | Stop current playback |
-| ZeroClaw → host | `error { code: "transcript_backpressure", retryable: true }` | `user-event` named `transcript_backpressure` with `data.retryable = true` | The preceding final transcript was not admitted; pause and retry it |
+| ZeroClaw → host | `transcript_ack { event_id? }` | `user-event` named `transcript_ack` | The final was accepted into ordered local delivery |
+| ZeroClaw → host | `error { code: "transcript_replay_required", event_id?, retryable: true, reconnect: true }` | `user-event` named `transcript_replay_required` | The final was not accepted; reconnect and replay it |
 | Both | `user-event` approval request/response | Same | Map approve, deny, and always-approve to the standard tool approval path |
 
 `wyoming-events-ws` is a custom text-only WebSocket profile: each WebSocket text frame contains one JSON object shaped like a Wyoming event. It is not the Wyoming peer-to-peer TCP protocol, which uses newline-terminated JSON headers followed by optional data and payload bytes. Standard Wyoming servers and satellites cannot connect directly; place an adapter in the host process to translate between Wyoming TCP framing and this WebSocket profile.
 
 Approval requests contain a generated request ID, tool name, and compact argument summary. Raw tool arguments are not sent. Unknown, malformed, binary, and server-direction events are ignored without reaching the model.
 
-Final and partial transcripts are limited to 16 KiB after trimming. When partial forwarding is enabled, ZeroClaw forwards at most one partial every 250 ms and drops partials while the shared ingress queue is full. Passive partials are recorded as context only; they never trigger an SOP workflow.
+Final and partial transcripts are limited to 16 KiB after trimming, and the WebSocket decoder rejects messages or frames larger than 20 KiB before materializing the JSON event. When partial forwarding is enabled, ZeroClaw forwards at most one partial every 250 ms and at most 32 partials between accepted finals, including across reconnects. It drops partials while the shared ingress queue is full. Passive partials are recorded as context only; they never trigger an SOP workflow.
 
-Final transcripts preserve arrival order. If the shared ingress queue is full, ZeroClaw keeps up to 32 finals in a local FIFO while continuing to read interruption events. When that FIFO is also full, the next final is not admitted and ZeroClaw emits `transcript_backpressure` once; the host must pause final emission and retry the rejected final after ingress has drained. Because the signal has no transcript payload, a host that can burst finals must serialize emission during recovery so the rejected final is unambiguous. Barge-in uses a separate priority path, and duplicate remote TTS-cancel requests are coalesced while one is pending.
+Final transcripts preserve arrival order. If the shared ingress queue is full, ZeroClaw keeps up to 32 accepted finals in a local FIFO that survives socket reconnects while continuing to read interruption events. Every accepted final receives `transcript_ack`; an unacknowledged final must be replayed. Hosts should include a stable `event_id` so acknowledgements and replay requests can be correlated; recently accepted IDs are acknowledged without dispatching a duplicate turn. When the FIFO is full, ZeroClaw sends `transcript_replay_required` for the rejected final, flushes the notice, and closes the socket; the host must reconnect and replay that final. Barge-in uses a bounded priority path, and duplicate interruption controls and remote TTS-cancel requests are coalesced while one is pending.
 
 VoiceHost is an audio delivery surface. A text-only `SendMessage` is rejected rather than reported as delivered; callers such as `send_via` receive a failed result and can choose a channel that supports text.
 
