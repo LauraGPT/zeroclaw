@@ -6273,6 +6273,13 @@ async fn process_channel_message_body(
         }
     }
 
+    let history_key = conversation_history_key(&msg);
+    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
+    if msg.passive_context {
+        record_passive_context(ctx.as_ref(), &msg, &history_key);
+        return;
+    }
+
     if ctx.sop_engine.is_some() || ctx.sop_audit.is_some() {
         let topic = match &msg.channel_alias {
             Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
@@ -6290,13 +6297,6 @@ async fn process_channel_message_body(
             None,
         )
         .await;
-    }
-
-    let history_key = conversation_history_key(&msg);
-    stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
-    if msg.passive_context {
-        record_passive_context(ctx.as_ref(), &msg, &history_key);
-        return;
     }
 
     // The early ack is spawned (fire-and-forget) so it lands before the
@@ -18987,7 +18987,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+        let mut runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             provider,
             zeroclaw_config::schema::Config::default(),
@@ -18995,6 +18995,22 @@ BTC is currently around $65,000 based on latest tool output."#
             "test-provider",
             None,
         );
+        let mut sop = channel_gate_sop(None);
+        sop.triggers = vec![zeroclaw_runtime::sop::types::SopTrigger::Channel {
+            channel: "whatsapp".into(),
+            alias: None,
+            condition: None,
+        }];
+        let mut sop_engine =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        sop_engine.set_sops_for_test(vec![sop]);
+        let sop_engine = Arc::new(std::sync::Mutex::new(sop_engine));
+        let sop_audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(Arc::new(
+            NoopMemory,
+        )));
+        let runtime_ctx_mut = Arc::get_mut(&mut runtime_ctx).unwrap();
+        runtime_ctx_mut.sop_engine = Some(Arc::clone(&sop_engine));
+        runtime_ctx_mut.sop_audit = Some(sop_audit);
 
         let passive_msg = zeroclaw_api::channel::ChannelMessage {
             id: "passive-1".into(),
@@ -19014,6 +19030,15 @@ BTC is currently around $65,000 based on latest tool output."#
             CancellationToken::new(),
         )
         .await;
+
+        assert!(
+            sop_engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_runs()
+                .is_empty(),
+            "passive context must not dispatch configured channel SOPs"
+        );
 
         assert!(
             provider_impl
