@@ -68,7 +68,7 @@ When `api_key` is configured, non-loopback endpoints must use secure WebSocket (
 
 ### Host contract
 
-The connection is one-to-one. Each connection attempt times out after 15 seconds. ZeroClaw reconnects with bounded backoff and sends WebSocket ping frames while connected.
+The connection is one-to-one. Each connection attempt times out after 15 seconds. Every outbound WebSocket write has a 5-second deadline; a stalled writer is disconnected and retried without blocking inbound control handling. ZeroClaw reconnects with bounded backoff and sends WebSocket ping frames while connected.
 
 | Direction | Native backend | `wyoming-events-ws` profile | Effect |
 |---|---|---|---|
@@ -77,13 +77,18 @@ The connection is one-to-one. Each connection attempt times out after 15 seconds
 | Host → ZeroClaw | `barge_in` | `user-event` named `barge_in` | Cancel the current turn without starting another |
 | ZeroClaw → host | `say { text, voice? }` | `synthesize` | Synthesize and play the agent response |
 | ZeroClaw → host | `tts_cancel` | `user-event` named `tts_cancel` | Stop current playback |
+| ZeroClaw → host | `error { code: "transcript_backpressure", retryable: true }` | `user-event` named `transcript_backpressure` with `data.retryable = true` | The preceding final transcript was not admitted; pause and retry it |
 | Both | `user-event` approval request/response | Same | Map approve, deny, and always-approve to the standard tool approval path |
 
 `wyoming-events-ws` is a custom text-only WebSocket profile: each WebSocket text frame contains one JSON object shaped like a Wyoming event. It is not the Wyoming peer-to-peer TCP protocol, which uses newline-terminated JSON headers followed by optional data and payload bytes. Standard Wyoming servers and satellites cannot connect directly; place an adapter in the host process to translate between Wyoming TCP framing and this WebSocket profile.
 
 Approval requests contain a generated request ID, tool name, and compact argument summary. Raw tool arguments are not sent. Unknown, malformed, binary, and server-direction events are ignored without reaching the model.
 
-Final and partial transcripts are limited to 16 KiB after trimming. When partial forwarding is enabled, ZeroClaw forwards at most one partial every 250 ms and drops partials while the shared ingress queue is full. Final transcripts and barge-in controls remain reliable; a partial stream cannot block WebSocket reads or delay interruption behind an unbounded backlog.
+Final and partial transcripts are limited to 16 KiB after trimming. When partial forwarding is enabled, ZeroClaw forwards at most one partial every 250 ms and drops partials while the shared ingress queue is full. Passive partials are recorded as context only; they never trigger an SOP workflow.
+
+Final transcripts preserve arrival order. If the shared ingress queue is full, ZeroClaw keeps up to 32 finals in a local FIFO while continuing to read interruption events. When that FIFO is also full, the next final is not admitted and ZeroClaw emits `transcript_backpressure` once; the host must pause final emission and retry the rejected final after ingress has drained. Because the signal has no transcript payload, a host that can burst finals must serialize emission during recovery so the rejected final is unambiguous. Barge-in uses a separate priority path, and duplicate remote TTS-cancel requests are coalesced while one is pending.
+
+VoiceHost is an audio delivery surface. A text-only `SendMessage` is rejected rather than reported as delivered; callers such as `send_via` receive a failed result and can choose a channel that supports text.
 
 ### FunASR and SenseVoice deployment
 

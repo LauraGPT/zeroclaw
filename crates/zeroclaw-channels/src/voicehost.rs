@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
@@ -20,8 +20,12 @@ use zeroclaw_api::channel::{
 use zeroclaw_config::schema::{VoiceHostConfig, ws_connect_with_proxy_headers};
 
 const OUTBOUND_CAPACITY: usize = 64;
+const WRITER_CONTROL_CAPACITY: usize = 8;
+const FINAL_TRANSCRIPT_CAPACITY: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024;
+const MAX_EVENT_BYTES: usize = MAX_TRANSCRIPT_BYTES + 4 * 1024;
 const PARTIAL_FORWARD_INTERVAL: Duration = Duration::from_millis(250);
 const PING_INTERVAL_SECS: u64 = 20;
 const RECONNECT_DELAYS_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
@@ -221,27 +225,36 @@ impl VoiceHostChannel {
         self.pending_approvals.lock().await.clear();
     }
 
-    async fn handle_barge_in<S>(
+    async fn handle_barge_in(
         &self,
         tx: &mpsc::Sender<ChannelMessage>,
-        write: &mut S,
-    ) -> Result<BargeInOutcome>
-    where
-        S: futures_util::Sink<Message> + Unpin,
-    {
+        cancel_tx: &mpsc::Sender<Message>,
+        pending_control: &mut Option<ChannelMessage>,
+    ) -> Result<BargeInOutcome> {
         if let Some(message) = self.message_for_action(InboundAction::BargeIn) {
             if let Some(control_tx) = self.control_tx.read().await.as_ref() {
                 if control_tx.send(message).is_err() {
                     return Ok(BargeInOutcome::DispatchClosed);
                 }
-            } else if tx.send(message).await.is_err() {
-                return Ok(BargeInOutcome::DispatchClosed);
+            } else {
+                match tx.try_send(message) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(message)) => {
+                        *pending_control = Some(message);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        return Ok(BargeInOutcome::DispatchClosed);
+                    }
+                }
             }
         }
 
         let cancel = encode_tts_cancel(self.backend)?;
-        if write.send(Message::Text(cancel.into())).await.is_err() {
-            return Ok(BargeInOutcome::RemoteClosed);
+        match cancel_tx.try_send(Message::Text(cancel.into())) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Ok(BargeInOutcome::RemoteClosed);
+            }
         }
         Ok(BargeInOutcome::Continue)
     }
@@ -268,9 +281,10 @@ impl Channel for VoiceHostChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        if message.suppress_voice {
-            return Ok(());
-        }
+        anyhow::ensure!(
+            !message.suppress_voice,
+            "voice host does not support text-only delivery"
+        );
 
         self.queue_payload(encode_reply(
             self.backend,
@@ -336,11 +350,35 @@ impl Channel for VoiceHostChannel {
             let connected_at = Instant::now();
             let (mut write, mut read) = socket.split();
             let (outbound_tx, mut outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
+            let (writer_control_tx, mut writer_control_rx) =
+                mpsc::channel::<Message>(WRITER_CONTROL_CAPACITY);
+            let (cancel_tx, mut cancel_rx) = mpsc::channel::<Message>(1);
             *self.outbound.write().await = Some(outbound_tx);
-            let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
-            ping.tick().await;
+            let mut writer_task = zeroclaw_spawn::spawn!(async move {
+                let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
+                ping.tick().await;
+                loop {
+                    let message = tokio::select! {
+                        biased;
+                        Some(message) = cancel_rx.recv() => message,
+                        Some(message) = writer_control_rx.recv() => message,
+                        Some(payload) = outbound_rx.recv() => Message::Text(payload.into()),
+                        _ = ping.tick() => Message::Ping(Vec::new().into()),
+                    };
+                    tokio::time::timeout(WRITE_TIMEOUT, write.send(message))
+                        .await
+                        .context("voice host WebSocket write timed out")?
+                        .context("voice host WebSocket write failed")?;
+                }
+                #[allow(unreachable_code)]
+                Ok::<(), anyhow::Error>(())
+            });
             let mut dispatch_closed = false;
+            let mut writer_finished = false;
             let mut last_partial_forwarded = None;
+            let mut pending_control = None::<ChannelMessage>;
+            let mut pending_finals = VecDeque::<ChannelMessage>::new();
+            let mut backpressure_reported = false;
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -354,26 +392,64 @@ impl Channel for VoiceHostChannel {
 
             loop {
                 tokio::select! {
+                    biased;
                     _ = tx.closed() => {
                         dispatch_closed = true;
                         break;
                     }
-                    _ = ping.tick() => {
-                        if write.send(Message::Ping(Vec::new().into())).await.is_err() {
-                            break;
+                    writer_result = &mut writer_task => {
+                        writer_finished = true;
+                        if let Ok(Err(error)) = writer_result {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "alias": self.alias,
+                                    "error": error.to_string(),
+                                })),
+                                "voice host writer stopped"
+                            );
+                        }
+                        break;
+                    }
+                    permit = tx.reserve(), if pending_control.is_some() => {
+                        match permit {
+                            Ok(permit) => {
+                                if let Some(message) = pending_control.take() {
+                                    permit.send(message);
+                                }
+                            }
+                            Err(_) => {
+                                dispatch_closed = true;
+                                break;
+                            }
                         }
                     }
-                    payload = outbound_rx.recv() => {
-                        let Some(payload) = payload else { break };
-                        if write.send(Message::Text(payload.into())).await.is_err() {
-                            break;
+                    permit = tx.reserve(), if !pending_finals.is_empty() => {
+                        match permit {
+                            Ok(permit) => {
+                                if let Some(message) = pending_finals.pop_front() {
+                                    permit.send(message);
+                                }
+                                if pending_finals.len() < FINAL_TRANSCRIPT_CAPACITY {
+                                    backpressure_reported = false;
+                                }
+                            }
+                            Err(_) => {
+                                dispatch_closed = true;
+                                break;
+                            }
                         }
                     }
                     incoming = read.next() => {
                         let raw = match incoming {
                             Some(Ok(Message::Text(text))) => text,
                             Some(Ok(Message::Ping(payload))) => {
-                                if write.send(Message::Pong(payload)).await.is_err() {
+                                if writer_control_tx.try_send(Message::Pong(payload)).is_err() {
                                     break;
                                 }
                                 continue;
@@ -410,6 +486,22 @@ impl Channel for VoiceHostChannel {
                             }
                         };
 
+                        if raw.len() > MAX_EVENT_BYTES {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "alias": self.alias,
+                                    "bytes": raw.len(),
+                                })),
+                                "rejected oversized voice host event"
+                            );
+                            continue;
+                        }
+
                         let action = parse_inbound(raw.as_str(), self.forward_partials);
                         match action {
                             InboundAction::Approval { request_id, decision } => {
@@ -420,7 +512,10 @@ impl Channel for VoiceHostChannel {
                                 }
                             }
                             InboundAction::BargeIn => {
-                                match self.handle_barge_in(&tx, &mut write).await? {
+                                match self
+                                    .handle_barge_in(&tx, &cancel_tx, &mut pending_control)
+                                    .await?
+                                {
                                     BargeInOutcome::Continue => {}
                                     BargeInOutcome::DispatchClosed => {
                                         dispatch_closed = true;
@@ -431,12 +526,40 @@ impl Channel for VoiceHostChannel {
                             }
                             action @ InboundAction::FinalTranscript(_) => {
                                 if let Some(message) = self.message_for_action(action) {
-                                    match tx.try_send(message) {
-                                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                                            dispatch_closed = true;
+                                    if pending_finals.is_empty() {
+                                        match tx.try_send(message) {
+                                            Ok(()) => continue,
+                                            Err(mpsc::error::TrySendError::Full(message)) => {
+                                                pending_finals.push_back(message);
+                                            }
+                                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                dispatch_closed = true;
+                                                break;
+                                            }
+                                        }
+                                    } else if pending_finals.len() < FINAL_TRANSCRIPT_CAPACITY {
+                                        pending_finals.push_back(message);
+                                    } else if !backpressure_reported {
+                                        let payload = encode_transcript_backpressure(self.backend)?;
+                                        if writer_control_tx
+                                            .try_send(Message::Text(payload.into()))
+                                            .is_err()
+                                        {
                                             break;
                                         }
+                                        backpressure_reported = true;
+                                        ::zeroclaw_log::record!(
+                                            WARN,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Reject
+                                            )
+                                            .with_attrs(::serde_json::json!({
+                                                "alias": self.alias,
+                                                "capacity": FINAL_TRANSCRIPT_CAPACITY,
+                                            })),
+                                            "voice host final transcript queue reached capacity"
+                                        );
                                     }
                                 }
                             }
@@ -474,6 +597,11 @@ impl Channel for VoiceHostChannel {
                         }
                     }
                 }
+            }
+
+            if !writer_finished {
+                writer_task.abort();
+                let _ = writer_task.await;
             }
 
             self.clear_connection_state().await;
@@ -699,6 +827,24 @@ fn encode_tts_cancel(backend: VoiceHostBackend) -> Result<String> {
     }
 }
 
+fn encode_transcript_backpressure(backend: VoiceHostBackend) -> Result<String> {
+    match backend {
+        VoiceHostBackend::Native => Ok(serde_json::json!({
+            "type": "error",
+            "code": "transcript_backpressure",
+            "retryable": true,
+        })
+        .to_string()),
+        VoiceHostBackend::Wyoming => Ok(serde_json::to_string(&WyomingEnvelope {
+            kind: "user-event",
+            data: WyomingUserEvent {
+                name: "transcript_backpressure",
+                data: TranscriptBackpressureData { retryable: true },
+            },
+        })?),
+    }
+}
+
 fn encode_approval_request(request_id: &str, request: &ChannelApprovalRequest) -> Result<String> {
     Ok(serde_json::to_string(&WyomingEnvelope {
         kind: "user-event",
@@ -748,44 +894,16 @@ struct ApprovalRequestData<'a> {
 #[derive(Serialize)]
 struct EmptyData {}
 
+#[derive(Serialize)]
+struct TranscriptBackpressureData {
+    retryable: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::Pin;
-    use std::task::{Context as TaskContext, Poll};
     use zeroclaw_api::channel::ChannelApprovalResponse;
     use zeroclaw_config::schema::VoiceHostConfig;
-
-    struct FailingSink;
-
-    impl futures_util::Sink<Message> for FailingSink {
-        type Error = anyhow::Error;
-
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
-            anyhow::bail!("remote closed")
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
 
     fn channel(forward_partials: bool) -> VoiceHostChannel {
         VoiceHostChannel::new(
@@ -845,16 +963,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suppressed_voice_message_is_not_queued_for_speech() {
+    async fn suppressed_voice_message_reports_unsupported_text_delivery() {
         let channel = channel(false);
         let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
         *channel.outbound.write().await = Some(outbound_tx);
 
-        channel
+        let error = channel
             .send(&SendMessage::new("internal error", "office").suppress_voice())
             .await
-            .unwrap();
+            .expect_err("VoiceHost cannot claim successful text-only delivery");
 
+        assert!(error.to_string().contains("text-only delivery"));
         assert!(outbound_rx.try_recv().is_err());
     }
 
@@ -862,11 +981,13 @@ mod tests {
     async fn barge_in_reaches_local_dispatch_when_remote_cancel_write_fails() {
         let channel = channel(false);
         let (tx, mut rx) = mpsc::channel(1);
-        let mut failing_remote = FailingSink;
+        let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        drop(cancel_rx);
+        let mut pending_control = None;
 
         assert_eq!(
             channel
-                .handle_barge_in(&tx, &mut failing_remote)
+                .handle_barge_in(&tx, &cancel_tx, &mut pending_control)
                 .await
                 .unwrap(),
             BargeInOutcome::RemoteClosed
@@ -1107,7 +1228,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
         inbound_tx.send(ChannelMessage::default()).await.unwrap();
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         let listener_channel = channel.clone();
@@ -1132,8 +1253,136 @@ mod tests {
             r#"{"type":"tts_cancel"}"#
         );
 
+        let _placeholder = inbound_rx.recv().await.unwrap();
+        let transcript = tokio::time::timeout(Duration::from_secs(1), inbound_rx.recv())
+            .await
+            .expect("final transcript should remain queued while dispatch is full")
+            .unwrap();
+        assert_eq!(transcript.content, "queue pressure");
+
         channel_listener.abort();
         let _ = channel_listener.await;
+    }
+
+    #[tokio::test]
+    async fn final_transcript_overflow_is_reported_to_the_voice_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for index in 0..128 {
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "speech_end",
+                            "transcript": format!("queued-{index}"),
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            socket.next().await.unwrap().unwrap().into_text().unwrap()
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        inbound_tx.send(ChannelMessage::default()).await.unwrap();
+        let listener_channel = Arc::clone(&channel);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel.listen(inbound_tx).await.unwrap();
+        });
+
+        let response = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("overflow must produce an observable protocol response")
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["code"], "transcript_backpressure");
+        assert_eq!(response["retryable"], true);
+
+        channel_listener.abort();
+        let _ = channel_listener.await;
+    }
+
+    #[tokio::test]
+    async fn non_reading_peer_does_not_delay_barge_in_control() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (connected_tx, connected_rx) = oneshot::channel();
+        let (send_barge_tx, send_barge_rx) = oneshot::channel();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            connected_tx.send(()).unwrap();
+            send_barge_rx.await.unwrap();
+            socket
+                .send(Message::Text(r#"{"type":"barge_in"}"#.into()))
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let listener_channel = Arc::clone(&channel);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel
+                .listen_with_control(inbound_tx, control_tx)
+                .await
+                .unwrap();
+        });
+        connected_rx.await.unwrap();
+
+        let sender_channel = Arc::clone(&channel);
+        let blocked_sender = zeroclaw_spawn::spawn!(async move {
+            let payload = "x".repeat(16 * 1024 * 1024);
+            for _ in 0..8 {
+                sender_channel
+                    .send(&SendMessage::new(&payload, "office"))
+                    .await
+                    .unwrap();
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send_barge_tx.send(()).unwrap();
+
+        let control = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("local barge-in dispatch must not wait for a stalled WebSocket writer")
+            .unwrap();
+        assert!(control.content.is_empty());
+
+        blocked_sender.abort();
+        let _ = blocked_sender.await;
+        channel_listener.abort();
+        let _ = channel_listener.await;
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -1167,6 +1416,34 @@ mod tests {
         assert_eq!(
             encode_tts_cancel(VoiceHostBackend::Wyoming).unwrap(),
             r#"{"type":"user-event","data":{"name":"tts_cancel","data":{}}}"#
+        );
+    }
+
+    #[test]
+    fn transcript_backpressure_encodes_for_native_and_wyoming_backends() {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &encode_transcript_backpressure(VoiceHostBackend::Native).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({
+                "type": "error",
+                "code": "transcript_backpressure",
+                "retryable": true,
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &encode_transcript_backpressure(VoiceHostBackend::Wyoming).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({
+                "type": "user-event",
+                "data": {
+                    "name": "transcript_backpressure",
+                    "data": { "retryable": true },
+                },
+            })
         );
     }
 
