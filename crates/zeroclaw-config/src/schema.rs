@@ -11062,6 +11062,27 @@ pub async fn ws_connect_with_proxy_headers(
     ProxiedWsStream,
     tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
 )> {
+    ws_connect_with_proxy_headers_and_config(
+        ws_url,
+        service_key,
+        channel_proxy_url,
+        extra_headers,
+        None,
+    )
+    .await
+}
+
+/// Connect a WebSocket with optional decoder limits.
+pub async fn ws_connect_with_proxy_headers_and_config(
+    ws_url: &str,
+    service_key: &str,
+    channel_proxy_url: Option<&str>,
+    extra_headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
+    websocket_config: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
+) -> anyhow::Result<(
+    ProxiedWsStream,
+    tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+)> {
     let proxy_url = resolve_ws_proxy_url(service_key, ws_url, channel_proxy_url);
 
     match proxy_url {
@@ -11124,13 +11145,13 @@ pub async fn ws_connect_with_proxy_headers(
             let ws_request = build_ws_request(ws_url, extra_headers)?;
 
             let (ws_stream, response) =
-                tokio_tungstenite::client_async(ws_request, stream)
+                tokio_tungstenite::client_async_with_config(ws_request, stream, websocket_config)
                     .await
                     .with_context(|| format!("WebSocket handshake failed for {ws_url}"))?;
 
             Ok((ws_stream, response))
         }
-        Some(proxy) => ws_connect_via_proxy(ws_url, &proxy, extra_headers).await,
+        Some(proxy) => ws_connect_via_proxy(ws_url, &proxy, extra_headers, websocket_config).await,
     }
 }
 
@@ -11139,6 +11160,7 @@ async fn ws_connect_via_proxy(
     ws_url: &str,
     proxy_url: &str,
     extra_headers: &tokio_tungstenite::tungstenite::http::HeaderMap,
+    websocket_config: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
 ) -> anyhow::Result<(
     ProxiedWsStream,
     tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
@@ -11273,9 +11295,10 @@ async fn ws_connect_via_proxy(
     // Perform the WebSocket client handshake over the tunnelled stream.
     let ws_request = build_ws_request(ws_url, extra_headers)?;
 
-    let (ws_stream, response) = tokio_tungstenite::client_async(ws_request, stream)
-        .await
-        .with_context(|| format!("WebSocket handshake failed for {ws_url}"))?;
+    let (ws_stream, response) =
+        tokio_tungstenite::client_async_with_config(ws_request, stream, websocket_config)
+            .await
+            .with_context(|| format!("WebSocket handshake failed for {ws_url}"))?;
 
     Ok((ws_stream, response))
 }
