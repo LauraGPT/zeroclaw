@@ -509,6 +509,7 @@ struct ChannelRuntimeContext {
     tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry>,
     observer: Arc<dyn Observer>,
     system_prompt: Arc<String>,
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     model: Arc<String>,
     temperature: Option<f64>,
     auto_save_memory: bool,
@@ -2259,6 +2260,7 @@ fn build_channel_turn_base_system_prompt(
         true,
         ctx.show_tool_calls,
         None,
+        ctx.shell_profile.as_ref(),
     )?;
     if ctx.agent_cfg.resolved.tool_receipts.enabled
         && ctx.agent_cfg.resolved.tool_receipts.inject_system_prompt
@@ -2273,6 +2275,7 @@ fn compose_channel_turn_system_prompt(
     msg: &ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
     model_provider: &dyn ModelProvider,
+    model: &str,
     excluded_tools: &[String],
     base_system_prompt: &str,
     thinking_prefix: Option<&str>,
@@ -2280,6 +2283,7 @@ fn compose_channel_turn_system_prompt(
     let native_tool_specs_present =
         zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             model_provider,
+            model,
             ctx.tools_registry.as_ref(),
             excluded_tools,
             ctx.activated_tools.as_ref(),
@@ -4854,7 +4858,7 @@ fn spawn_supervised_listener_with_control(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
     tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-    control_tx: tokio::sync::mpsc::UnboundedSender<zeroclaw_api::channel::ChannelMessage>,
+    control_tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     cancel: tokio_util::sync::CancellationToken,
@@ -4897,7 +4901,7 @@ fn spawn_supervised_listener_with_health_interval_and_control(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
     tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-    control_tx: Option<tokio::sync::mpsc::UnboundedSender<zeroclaw_api::channel::ChannelMessage>>,
+    control_tx: Option<tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>>,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     health_interval: Duration,
@@ -6646,6 +6650,7 @@ async fn process_channel_message_body(
         &msg,
         target_channel.as_ref(),
         active_model_provider.as_ref(),
+        route.model.as_str(),
         per_turn_excluded_tools.as_slice(),
         &base_system_prompt,
         thinking.params.system_prompt_prefix.as_deref(),
@@ -7378,6 +7383,7 @@ async fn process_channel_message_body(
                                 &msg,
                                 target_channel.as_ref(),
                                 active_model_provider.as_ref(),
+                                route.model.as_str(),
                                 per_turn_excluded_tools.as_slice(),
                                 &rebuilt_base_prompt,
                                 thinking.params.system_prompt_prefix.as_deref(),
@@ -8689,14 +8695,14 @@ async fn run_message_dispatch_loop(
     router: AgentRouter,
     max_in_flight_messages: usize,
 ) {
-    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(1);
     drop(control_tx);
     run_message_dispatch_loop_with_control(rx, control_rx, router, max_in_flight_messages).await;
 }
 
 async fn run_message_dispatch_loop_with_control(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
-    mut control_rx: tokio::sync::mpsc::UnboundedReceiver<zeroclaw_api::channel::ChannelMessage>,
+    mut control_rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
 ) {
@@ -12559,7 +12565,7 @@ pub async fn start_channels(
     let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
         None;
     let mut control_rx_holder: Option<
-        tokio::sync::mpsc::UnboundedReceiver<zeroclaw_api::channel::ChannelMessage>,
+        tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     > = None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
@@ -12973,7 +12979,7 @@ pub async fn start_channels(
                 .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
-            let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (control_tx, control_rx) = tokio::sync::mpsc::channel(32);
 
             for cc in &configured_channels {
                 listener_handles.push(spawn_supervised_listener_with_control(
@@ -13064,6 +13070,7 @@ pub async fn start_channels(
             tools_registry: Arc::clone(&tools_registry),
             observer: Arc::clone(&observer),
             system_prompt: Arc::new(system_prompt),
+            shell_profile: runtime.shell_profile(),
             model: Arc::new(model.clone()),
             temperature,
             auto_save_memory: config.memory.auto_save,
@@ -13630,6 +13637,7 @@ fn concurrent_persist_lock_serialization() {
         ),
         observer: Arc::new(NoopObserver),
         system_prompt: Arc::new(String::new()),
+        shell_profile: None,
         model: Arc::new("test".into()),
         temperature: Some(0.0),
         auto_save_memory: false,
@@ -15210,6 +15218,7 @@ temperature = 0.3
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(String::new()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -15836,6 +15845,7 @@ temperature = 0.3
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
+            shell_profile: None,
             model: Arc::new(model.to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -16315,6 +16325,7 @@ api_key = "anthropic-key"
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -16412,6 +16423,7 @@ api_key = "anthropic-key"
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -16531,6 +16543,7 @@ api_key = "anthropic-key"
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -16652,6 +16665,7 @@ api_key = "anthropic-key"
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -17669,6 +17683,7 @@ api_key = "anthropic-key"
             ),
             observer,
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -17775,6 +17790,7 @@ api_key = "anthropic-key"
             ),
             observer,
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -19544,14 +19560,14 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[cfg(feature = "channel-voicehost")]
     #[tokio::test]
-    async fn voicehost_excluded_tools_are_absent_from_final_text_provider_prompt() {
+    async fn voicehost_prompt_rebuild_preserves_shell_profile_and_excludes_tools() {
         let channel: Arc<dyn Channel> = Arc::new(
             VoiceHostChannel::new(
                 "office".into(),
                 zeroclaw_config::schema::VoiceHostConfig {
                     enabled: true,
                     url: "ws://127.0.0.1:8765/ws".into(),
-                    excluded_tools: vec!["shell".into()],
+                    excluded_tools: vec!["file_read".into()],
                     ..Default::default()
                 },
             )
@@ -19572,6 +19588,11 @@ BTC is currently around $65,000 based on latest tool output."#
                 Box::new(NamedMockTool("file_read")),
             ],
         );
+        let shell_profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "pwsh".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        Arc::get_mut(&mut runtime_ctx).unwrap().shell_profile = Some(shell_profile.clone());
 
         let tool_descs = [
             ("shell", "Execute shell commands"),
@@ -19591,7 +19612,7 @@ BTC is currently around $65,000 based on latest tool output."#
             usize::MAX,
             true,
             true,
-            None,
+            Some(&shell_profile),
         );
         startup_prompt.push_str(&zeroclaw_runtime::agent::loop_::build_tool_instructions(
             runtime_ctx.tools_registry.as_ref(),
@@ -19624,17 +19645,22 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls.len(), 1);
         let final_system_prompt = &calls[0][0].1;
         assert!(
-            final_system_prompt.contains("**file_read**"),
+            final_system_prompt.contains("**shell**"),
             "allowed tools must remain visible in the final model prompt: {final_system_prompt}"
         );
         assert!(
-            !final_system_prompt.contains("**shell**"),
+            !final_system_prompt.contains("**file_read**"),
             "VoiceHost-excluded tools must be absent from the final model prompt: {final_system_prompt}"
         );
         assert!(
-            !final_system_prompt.contains("Execute shell commands")
-                && !final_system_prompt.contains("\"name\":\"shell\""),
+            !final_system_prompt.contains("Read files")
+                && !final_system_prompt.contains("\"name\":\"file_read\""),
             "VoiceHost-excluded tools must not survive in descriptions or protocol examples: {final_system_prompt}"
+        );
+        assert!(
+            final_system_prompt.contains("Shell: pwsh")
+                && final_system_prompt.contains("Remove-Item"),
+            "policy rebuild must preserve the configured PowerShell profile: {final_system_prompt}"
         );
     }
 
@@ -20207,6 +20233,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry,
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20296,6 +20323,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20419,6 +20447,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20537,6 +20566,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20692,6 +20722,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20819,6 +20850,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -20968,6 +21000,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -21100,6 +21133,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -21217,6 +21251,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -21352,6 +21387,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -21511,6 +21547,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -21691,6 +21728,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: observer.clone(),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -22179,6 +22217,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -22291,6 +22330,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -22413,6 +22453,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -22783,6 +22824,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -22915,7 +22957,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
-        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let send_task = zeroclaw_spawn::spawn!(async move {
             tx.send(ChannelMessage {
                 id: "voice-1".into(),
@@ -22938,6 +22980,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     timestamp: 2,
                     ..Default::default()
                 })
+                .await
                 .unwrap();
         });
 
@@ -22977,7 +23020,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
-        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let dispatcher = zeroclaw_spawn::spawn!(run_message_dispatch_loop_with_control(
             rx,
             control_rx,
@@ -23021,6 +23064,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 3,
                 ..Default::default()
             })
+            .await
             .unwrap();
 
         tokio::time::timeout(Duration::from_millis(200), cancelled.notified())
@@ -23053,7 +23097,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
-        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
         let send_task = zeroclaw_spawn::spawn!(async move {
             tx.send(ChannelMessage {
                 id: "voice-pending".into(),
@@ -23076,6 +23120,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     timestamp: 2,
                     ..Default::default()
                 })
+                .await
                 .unwrap();
         });
 
@@ -23124,6 +23169,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -23285,6 +23331,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -23456,6 +23503,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -23603,6 +23651,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -23739,6 +23788,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -24225,6 +24275,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -24355,6 +24406,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -24488,6 +24540,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -24613,6 +24666,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -24738,6 +24792,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -25150,6 +25205,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -27682,6 +27738,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -27862,6 +27919,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(initial_system_prompt),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -28333,6 +28391,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -28820,6 +28879,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -28979,6 +29039,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -31548,6 +31609,7 @@ This is an example JSON object for profile settings."#;
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -31670,6 +31732,7 @@ This is an example JSON object for profile settings."#;
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -31834,6 +31897,7 @@ This is an example JSON object for profile settings."#;
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -32096,6 +32160,7 @@ This is an example JSON object for profile settings."#;
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -32251,6 +32316,7 @@ This is an example JSON object for profile settings."#;
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -32398,6 +32464,7 @@ This is an example JSON object for profile settings."#;
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -32565,6 +32632,7 @@ This is an example JSON object for profile settings."#;
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("default-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -33162,6 +33230,7 @@ This is an example JSON object for profile settings."#;
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
+            shell_profile: None,
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,

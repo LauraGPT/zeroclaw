@@ -685,7 +685,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     async fn listen_with_control(
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        _control_tx: tokio::sync::mpsc::UnboundedSender<ChannelMessage>,
+        _control_tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
         self.listen(tx).await
     }
