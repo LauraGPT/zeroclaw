@@ -22,6 +22,7 @@ use zeroclaw_config::schema::{VoiceHostConfig, ws_connect_with_proxy_headers_and
 const OUTBOUND_CAPACITY: usize = 64;
 const WRITER_CONTROL_CAPACITY: usize = 40;
 const FINAL_TRANSCRIPT_CAPACITY: usize = 32;
+const REPLAY_CONTROL_SCAN_LIMIT: usize = 8;
 const MAX_PARTIALS_PER_FINAL: usize = 32;
 const RECENT_EVENT_ID_CAPACITY: usize = 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -490,7 +491,7 @@ impl Channel for VoiceHostChannel {
             let mut last_partial_forwarded = None;
             let mut pending_replay = None::<(String, Option<String>)>;
             let mut replay_completion = None::<(oneshot::Receiver<()>, Option<String>)>;
-            let mut replay_read_precedence = false;
+            let mut replay_control_scan_remaining = 0usize;
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -574,7 +575,7 @@ impl Channel for VoiceHostChannel {
                         }
                     }
                     permit = writer_control_tx.reserve(),
-                        if pending_replay.is_some() && !replay_read_precedence =>
+                        if pending_replay.is_some() && replay_control_scan_remaining == 0 =>
                     {
                         match permit {
                             Ok(permit) => {
@@ -617,8 +618,8 @@ impl Channel for VoiceHostChannel {
                         break;
                     }
                     incoming = read.next() => {
-                        if pending_replay.is_some() {
-                            replay_read_precedence = false;
+                        if pending_replay.is_some() && replay_control_scan_remaining > 0 {
+                            replay_control_scan_remaining -= 1;
                         }
                         let raw = match incoming {
                             Some(Ok(Message::Text(text))) => text,
@@ -626,7 +627,8 @@ impl Channel for VoiceHostChannel {
                                 if !queue_writer_control(
                                     &writer_control_tx,
                                     WriterControl::Message(Message::Pong(payload)),
-                                ) {
+                                ) && pending_replay.is_none()
+                                {
                                     break;
                                 }
                                 continue;
@@ -773,7 +775,7 @@ impl Channel for VoiceHostChannel {
                                         event_id.as_deref(),
                                     )?;
                                     pending_replay = Some((payload, event_id));
-                                    replay_read_precedence = true;
+                                    replay_control_scan_remaining = REPLAY_CONTROL_SCAN_LIMIT;
                                 }
                             }
                             action @ InboundAction::PartialTranscript(_) => {
@@ -813,7 +815,7 @@ impl Channel for VoiceHostChannel {
                         }
                     }
                     permit = writer_control_tx.reserve(),
-                        if pending_replay.is_some() && replay_read_precedence =>
+                        if pending_replay.is_some() && replay_control_scan_remaining > 0 =>
                     {
                         match permit {
                             Ok(permit) => {
@@ -1821,6 +1823,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            socket.feed(Message::Ping(Vec::new().into())).await.unwrap();
             socket
                 .feed(Message::Text(r#"{"type":"barge_in"}"#.into()))
                 .await
@@ -1830,9 +1833,10 @@ mod tests {
             let mut acknowledgements = 0usize;
             while let Some(message) = socket.next().await {
                 let message = message.unwrap();
-                let Some(payload) = message.to_text().ok() else {
+                if !message.is_text() {
                     continue;
-                };
+                }
+                let payload = message.to_text().unwrap();
                 let payload: Value = serde_json::from_str(payload).unwrap();
                 match payload["type"].as_str() {
                     Some("transcript_ack") => acknowledgements += 1,
