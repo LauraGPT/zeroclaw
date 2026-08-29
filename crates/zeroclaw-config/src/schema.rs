@@ -10984,7 +10984,7 @@ fn build_ws_request(
         );
         anyhow::Error::msg("WebSocket URL has no host")
     })?;
-    let authority_host = if target_host.contains(':') {
+    let authority_host = if target_host.contains(':') && !target_host.starts_with('[') {
         format!("[{target_host}]")
     } else {
         target_host.to_string()
@@ -28149,6 +28149,61 @@ auto_save = true
             "Bearer test-token"
         );
         assert_eq!(request.headers()["x-voicehost-client"], "zeroclaw");
+    }
+
+    #[test]
+    async fn ws_request_formats_ipv6_host_authorities() {
+        use tokio_tungstenite::tungstenite::http::{HeaderMap, header};
+
+        let headers = HeaderMap::new();
+        for (url, expected_host) in [
+            ("wss://[2001:db8::1]/ws", "[2001:db8::1]"),
+            ("ws://[::1]:8765/ws", "[::1]:8765"),
+            ("ws://127.0.0.1:8765/ws", "127.0.0.1:8765"),
+        ] {
+            let request = build_ws_request(url, &headers).unwrap();
+            assert_eq!(request.headers()[header::HOST], expected_host, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn ws_request_completes_ipv6_loopback_handshake() {
+        use tokio_tungstenite::tungstenite::http::{HeaderMap, StatusCode, header};
+
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        let port = listener.local_addr().unwrap().port();
+        let expected_host = format!("[::1]:{port}");
+        let server = async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                      response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    assert_eq!(request.headers()[header::HOST], expected_host);
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap()
+        };
+
+        let url = format!("ws://[::1]:{port}/ws");
+        let client = async move {
+            let tcp = tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
+                .await
+                .unwrap();
+            let request = build_ws_request(&url, &HeaderMap::new()).unwrap();
+            let (socket, response) = tokio_tungstenite::client_async(request, tcp).await.unwrap();
+            drop(socket);
+            response.status()
+        };
+        let (status, _) = tokio::join!(client, server);
+
+        assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
     }
 
     #[test]
