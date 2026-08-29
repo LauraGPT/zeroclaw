@@ -20,8 +20,7 @@ use zeroclaw_api::channel::{
 use zeroclaw_config::schema::{VoiceHostConfig, ws_connect_with_proxy_headers_and_config};
 
 const OUTBOUND_CAPACITY: usize = 64;
-const WRITER_CONTROL_CAPACITY: usize = 8;
-const WRITER_CONTROL_BACKLOG_CAPACITY: usize = 32;
+const WRITER_CONTROL_CAPACITY: usize = 40;
 const FINAL_TRANSCRIPT_CAPACITY: usize = 32;
 const MAX_PARTIALS_PER_FINAL: usize = 32;
 const RECENT_EVENT_ID_CAPACITY: usize = 1024;
@@ -110,26 +109,9 @@ enum WriterControl {
     },
 }
 
-fn queue_writer_control(
-    sender: &mpsc::Sender<WriterControl>,
-    pending: &mut VecDeque<WriterControl>,
-    control: WriterControl,
-) -> bool {
-    if !pending.is_empty() {
-        if pending.len() >= WRITER_CONTROL_BACKLOG_CAPACITY {
-            return false;
-        }
-        pending.push_back(control);
-        return true;
-    }
+fn queue_writer_control(sender: &mpsc::Sender<WriterControl>, control: WriterControl) -> bool {
     match sender.try_send(control) {
         Ok(()) => true,
-        Err(mpsc::error::TrySendError::Full(control))
-            if pending.len() < WRITER_CONTROL_BACKLOG_CAPACITY =>
-        {
-            pending.push_back(control);
-            true
-        }
         Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
             false
         }
@@ -506,7 +488,6 @@ impl Channel for VoiceHostChannel {
             let mut dispatch_closed = false;
             let mut writer_finished = false;
             let mut last_partial_forwarded = None;
-            let mut pending_writer_controls = VecDeque::<WriterControl>::new();
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -576,16 +557,6 @@ impl Channel for VoiceHostChannel {
                             }
                         }
                     }
-                    permit = writer_control_tx.reserve(), if !pending_writer_controls.is_empty() => {
-                        match permit {
-                            Ok(permit) => {
-                                if let Some(control) = pending_writer_controls.pop_front() {
-                                    permit.send(control);
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
                     permit = tx.reserve(), if !pending_finals.is_empty() => {
                         match permit {
                             Ok(permit) => {
@@ -605,7 +576,6 @@ impl Channel for VoiceHostChannel {
                             Some(Ok(Message::Ping(payload))) => {
                                 if !queue_writer_control(
                                     &writer_control_tx,
-                                    &mut pending_writer_controls,
                                     WriterControl::Message(Message::Pong(payload)),
                                 ) {
                                     break;
@@ -702,7 +672,6 @@ impl Channel for VoiceHostChannel {
                                     )?;
                                     if !queue_writer_control(
                                         &writer_control_tx,
-                                        &mut pending_writer_controls,
                                         WriterControl::Message(Message::Text(payload.into())),
                                     ) {
                                         break;
@@ -742,7 +711,6 @@ impl Channel for VoiceHostChannel {
                                     )?;
                                     if !queue_writer_control(
                                         &writer_control_tx,
-                                        &mut pending_writer_controls,
                                         WriterControl::Message(Message::Text(payload.into())),
                                     ) {
                                         break;
@@ -752,16 +720,6 @@ impl Channel for VoiceHostChannel {
                                         self.backend,
                                         event_id.as_deref(),
                                     )?;
-                                    let mut writer_closed = false;
-                                    while let Some(control) = pending_writer_controls.pop_front() {
-                                        if writer_control_tx.send(control).await.is_err() {
-                                            writer_closed = true;
-                                            break;
-                                        }
-                                    }
-                                    if writer_closed {
-                                        break;
-                                    }
                                     let (completed_tx, completed_rx) = oneshot::channel();
                                     if writer_control_tx
                                         .send(WriterControl::ReplayAndClose {
@@ -1973,44 +1931,113 @@ mod tests {
         assert!(budget.admit());
     }
 
-    #[tokio::test]
-    async fn full_ack_queue_does_not_delay_barge_in_control() {
-        let (writer_control_tx, _writer_control_rx) =
-            mpsc::channel::<WriterControl>(WRITER_CONTROL_CAPACITY);
-        for _ in 0..WRITER_CONTROL_CAPACITY {
-            writer_control_tx
-                .try_send(WriterControl::Message(Message::Text("ack".into())))
-                .unwrap();
-        }
-        let mut pending_writer_controls = VecDeque::new();
-        assert!(queue_writer_control(
-            &writer_control_tx,
-            &mut pending_writer_controls,
-            WriterControl::Message(Message::Text("backlogged-ack".into())),
-        ));
-        assert_eq!(pending_writer_controls.len(), 1);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ack_burst_does_not_starve_inbound_barge_in() {
+        const ACK_BURST: usize = 20;
 
-        let channel = channel(false);
-        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
-        let (control_tx, mut control_rx) = mpsc::channel(1);
-        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
-        let mut pending_control = None;
-        assert_eq!(
-            channel
-                .handle_barge_in(
-                    &inbound_tx,
-                    Some(&control_tx),
-                    &cancel_tx,
-                    &mut pending_control,
-                )
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ack_count_tx, ack_count_rx) = oneshot::channel();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for index in 0..ACK_BURST {
+                socket
+                    .feed(Message::Text(
+                        serde_json::json!({
+                            "type": "speech_end",
+                            "event_id": format!("final-{index}"),
+                            "transcript": format!("accepted-{index}"),
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            socket
+                .feed(Message::Text(r#"{"type":"barge_in"}"#.into()))
                 .await
-                .unwrap(),
-            BargeInOutcome::Continue
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            let mut acknowledgements_before_cancel = 0;
+            while let Some(message) = socket.next().await {
+                let message = message.unwrap().into_text().unwrap();
+                let kind = serde_json::from_str::<Value>(&message).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                match kind.as_str() {
+                    "transcript_ack" => acknowledgements_before_cancel += 1,
+                    "tts_cancel" => {
+                        ack_count_tx.send(acknowledgements_before_cancel).unwrap();
+                        return;
+                    }
+                    other => panic!("unexpected server event: {other}"),
+                }
+            }
+            panic!("connection closed before tts_cancel");
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, _inbound_rx) = mpsc::channel(ACK_BURST);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let listener_channel = Arc::clone(&channel);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel
+                .listen_with_control(inbound_tx, control_tx)
+                .await
+                .unwrap();
+        });
+
+        let control = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+            .await
+            .expect("barge-in must not wait for the ACK burst to drain")
+            .unwrap();
+        let acknowledgements_before_cancel =
+            tokio::time::timeout(Duration::from_secs(5), ack_count_rx)
+                .await
+                .expect("remote must receive tts_cancel")
+                .unwrap();
+
+        assert!(control.content.is_empty());
+        assert!(
+            acknowledgements_before_cancel <= 1,
+            "tts_cancel arrived after {acknowledgements_before_cancel} ACKs"
         );
 
-        let control = control_rx.recv().await.unwrap();
-        assert!(control.content.is_empty());
-        assert!(pending_control.is_none());
+        channel_listener.abort();
+        let _ = channel_listener.await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn ack_capacity_is_owned_by_the_writer_queue() {
+        let (writer_control_tx, _writer_control_rx) =
+            mpsc::channel::<WriterControl>(WRITER_CONTROL_CAPACITY);
+
+        for _ in 0..WRITER_CONTROL_CAPACITY {
+            assert!(queue_writer_control(
+                &writer_control_tx,
+                WriterControl::Message(Message::Text("ack".into())),
+            ));
+        }
+        assert!(!queue_writer_control(
+            &writer_control_tx,
+            WriterControl::Message(Message::Text("overflow".into())),
+        ));
     }
 
     #[test]
