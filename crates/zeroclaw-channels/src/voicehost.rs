@@ -488,6 +488,9 @@ impl Channel for VoiceHostChannel {
             let mut dispatch_closed = false;
             let mut writer_finished = false;
             let mut last_partial_forwarded = None;
+            let mut pending_replay = None::<(String, Option<String>)>;
+            let mut replay_completion = None::<(oneshot::Receiver<()>, Option<String>)>;
+            let mut replay_read_precedence = false;
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -570,7 +573,53 @@ impl Channel for VoiceHostChannel {
                             }
                         }
                     }
+                    permit = writer_control_tx.reserve(),
+                        if pending_replay.is_some() && !replay_read_precedence =>
+                    {
+                        match permit {
+                            Ok(permit) => {
+                                let (payload, event_id) = pending_replay
+                                    .take()
+                                    .expect("guard requires a pending replay notice");
+                                let (completed_tx, completed_rx) = oneshot::channel();
+                                permit.send(WriterControl::ReplayAndClose {
+                                    payload,
+                                    completed: completed_tx,
+                                });
+                                replay_completion = Some((completed_rx, event_id));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    completed = async {
+                        let (receiver, _) = replay_completion
+                            .as_mut()
+                            .expect("guard requires replay completion");
+                        receiver.await
+                    }, if replay_completion.is_some() => {
+                        let (_, event_id) = replay_completion
+                            .take()
+                            .expect("guard requires replay completion");
+                        let _ = completed;
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "capacity": FINAL_TRANSCRIPT_CAPACITY,
+                                "event_id": event_id,
+                            })),
+                            "voice host requires final transcript replay after reconnect"
+                        );
+                        break;
+                    }
                     incoming = read.next() => {
+                        if pending_replay.is_some() {
+                            replay_read_precedence = false;
+                        }
                         let raw = match incoming {
                             Some(Ok(Message::Text(text))) => text,
                             Some(Ok(Message::Ping(payload))) => {
@@ -662,6 +711,9 @@ impl Channel for VoiceHostChannel {
                                     InboundAction::FinalTranscript { event_id, .. } => event_id.clone(),
                                     _ => None,
                                 };
+                                if pending_replay.is_some() || replay_completion.is_some() {
+                                    continue;
+                                }
                                 if event_id
                                     .as_deref()
                                     .is_some_and(|event_id| recent_event_ids.contains(event_id))
@@ -720,36 +772,8 @@ impl Channel for VoiceHostChannel {
                                         self.backend,
                                         event_id.as_deref(),
                                     )?;
-                                    let (completed_tx, completed_rx) = oneshot::channel();
-                                    if writer_control_tx
-                                        .send(WriterControl::ReplayAndClose {
-                                            payload,
-                                            completed: completed_tx,
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    let _ = tokio::time::timeout(
-                                        WRITE_TIMEOUT + WRITE_TIMEOUT,
-                                        completed_rx,
-                                    )
-                                    .await;
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Reject
-                                        )
-                                        .with_attrs(::serde_json::json!({
-                                            "alias": self.alias,
-                                            "capacity": FINAL_TRANSCRIPT_CAPACITY,
-                                            "event_id": event_id,
-                                        })),
-                                        "voice host requires final transcript replay after reconnect"
-                                    );
-                                    break;
+                                    pending_replay = Some((payload, event_id));
+                                    replay_read_precedence = true;
                                 }
                             }
                             action @ InboundAction::PartialTranscript(_) => {
@@ -786,6 +810,24 @@ impl Channel for VoiceHostChannel {
                                     "ignored voice host event"
                                 );
                             }
+                        }
+                    }
+                    permit = writer_control_tx.reserve(),
+                        if pending_replay.is_some() && replay_read_precedence =>
+                    {
+                        match permit {
+                            Ok(permit) => {
+                                let (payload, event_id) = pending_replay
+                                    .take()
+                                    .expect("guard requires a pending replay notice");
+                                let (completed_tx, completed_rx) = oneshot::channel();
+                                permit.send(WriterControl::ReplayAndClose {
+                                    payload,
+                                    completed: completed_tx,
+                                });
+                                replay_completion = Some((completed_rx, event_id));
+                            }
+                            Err(_) => break,
                         }
                     }
                 }
@@ -1726,6 +1768,117 @@ mod tests {
         assert!(
             closed,
             "overflow must terminate the connection after the replay notice"
+        );
+
+        channel_listener.abort();
+        let _ = channel_listener.await;
+    }
+
+    #[tokio::test]
+    async fn full_writer_control_queue_does_not_block_barge_in_on_final_overflow() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for index in 0..FINAL_TRANSCRIPT_CAPACITY {
+                socket
+                    .feed(Message::Text(
+                        serde_json::json!({
+                            "type": "speech_end",
+                            "event_id": format!("overflow-{index}"),
+                            "transcript": format!("queued-{index}"),
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..(WRITER_CONTROL_CAPACITY - FINAL_TRANSCRIPT_CAPACITY) {
+                socket
+                    .feed(Message::Text(
+                        serde_json::json!({
+                            "type": "speech_end",
+                            "event_id": "overflow-0",
+                            "transcript": "duplicate accepted final",
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            socket
+                .feed(Message::Text(
+                    serde_json::json!({
+                        "type": "speech_end",
+                        "event_id": format!("overflow-{FINAL_TRANSCRIPT_CAPACITY}"),
+                        "transcript": "overflow final",
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .feed(Message::Text(r#"{"type":"barge_in"}"#.into()))
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            let mut acknowledgements = 0usize;
+            while let Some(message) = socket.next().await {
+                let message = message.unwrap();
+                let Some(payload) = message.to_text().ok() else {
+                    continue;
+                };
+                let payload: Value = serde_json::from_str(payload).unwrap();
+                match payload["type"].as_str() {
+                    Some("transcript_ack") => acknowledgements += 1,
+                    Some(kind) => return (kind.to_owned(), acknowledgements),
+                    None => panic!("unexpected server event: {payload}"),
+                }
+            }
+            panic!("connection closed before tts_cancel or replay notice");
+        });
+
+        let channel = Arc::new(
+            VoiceHostChannel::new(
+                "office".into(),
+                VoiceHostConfig {
+                    enabled: true,
+                    url: format!("ws:{0}{0}{address}", '/'),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        inbound_tx.send(ChannelMessage::default()).await.unwrap();
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let listener_channel = Arc::clone(&channel);
+        let channel_listener = zeroclaw_spawn::spawn!(async move {
+            listener_channel
+                .listen_with_control(inbound_tx, control_tx)
+                .await
+                .unwrap();
+        });
+
+        let control = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("overflow replay admission must not block buffered barge-in")
+            .unwrap();
+        assert!(control.content.is_empty());
+        let (first_control, acknowledgements_before_control) =
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .expect("remote cancellation must precede the replay notice")
+                .unwrap();
+        assert_eq!(first_control, "tts_cancel");
+        assert!(
+            acknowledgements_before_control < WRITER_CONTROL_CAPACITY,
+            "tts_cancel arrived after the full ACK backlog drained"
         );
 
         channel_listener.abort();
