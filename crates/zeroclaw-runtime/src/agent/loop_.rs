@@ -1092,14 +1092,6 @@ fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn
     instructions.push_str(
         "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
     );
-    let example = serde_json::json!({
-        "name": tools[0].name(),
-        "arguments": {},
-    });
-    let _ = writeln!(
-        instructions,
-        "Example tool call:\n<tool_call>\n{example}\n</tool_call>\n"
-    );
     instructions.push_str("You may use multiple tool calls in a single response. ");
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
     instructions
@@ -12660,6 +12652,7 @@ This is an example, not an invocation."#;
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
+        assert_eq!(tools[0].name(), "shell");
         let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
@@ -12667,6 +12660,11 @@ This is an example, not an invocation."#;
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+        assert!(
+            !instructions.contains("Example tool call:"),
+            "the prompt must not synthesize a concrete call without schema-valid arguments"
+        );
+        assert!(!instructions.contains(r#"{"name":"shell","arguments":{}}"#));
     }
 
     #[test]
