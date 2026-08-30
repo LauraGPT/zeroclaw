@@ -6329,7 +6329,7 @@ async fn process_channel_message_body(
         }
     }
 
-    let history_key = conversation_history_key(&msg);
+    let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
     stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
