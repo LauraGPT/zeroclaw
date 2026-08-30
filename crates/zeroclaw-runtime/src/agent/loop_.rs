@@ -12720,6 +12720,7 @@ This is an example, not an invocation."#;
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
+        assert_eq!(tools[0].name(), "shell");
         let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
@@ -12727,6 +12728,11 @@ This is an example, not an invocation."#;
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+        assert!(
+            !instructions.contains("Example tool call:"),
+            "the prompt must not synthesize a concrete call without schema-valid arguments"
+        );
+        assert!(!instructions.contains(r#"{"name":"shell","arguments":{}}"#));
     }
 
     /// The tool-call guidance lives in `agent::tool_call_format` and
