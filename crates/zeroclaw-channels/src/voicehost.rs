@@ -23,6 +23,7 @@ const OUTBOUND_CAPACITY: usize = 64;
 const WRITER_CONTROL_CAPACITY: usize = 40;
 const FINAL_TRANSCRIPT_CAPACITY: usize = 32;
 const REPLAY_CONTROL_SCAN_LIMIT: usize = 8;
+const REPLAY_CONTROL_SCAN_TIMEOUT: Duration = Duration::from_millis(50);
 const MAX_PARTIALS_PER_FINAL: usize = 32;
 const RECENT_EVENT_ID_CAPACITY: usize = 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -492,6 +493,7 @@ impl Channel for VoiceHostChannel {
             let mut pending_replay = None::<(String, Option<String>)>;
             let mut replay_completion = None::<(oneshot::Receiver<()>, Option<String>)>;
             let mut replay_control_scan_remaining = 0usize;
+            let mut replay_control_scan_deadline = None::<Instant>;
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -582,6 +584,7 @@ impl Channel for VoiceHostChannel {
                                 let (payload, event_id) = pending_replay
                                     .take()
                                     .expect("guard requires a pending replay notice");
+                                replay_control_scan_deadline = None;
                                 let (completed_tx, completed_rx) = oneshot::channel();
                                 permit.send(WriterControl::ReplayAndClose {
                                     payload,
@@ -616,6 +619,15 @@ impl Channel for VoiceHostChannel {
                             "voice host requires final transcript replay after reconnect"
                         );
                         break;
+                    }
+                    _ = async {
+                        let deadline = replay_control_scan_deadline
+                            .expect("guard requires a replay control scan deadline");
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    }, if pending_replay.is_some() && replay_control_scan_remaining > 0 => {
+                        // Give already-ready interruption controls a bounded chance to be read
+                        // before replay closes the connection, even when the writer frees a slot.
+                        replay_control_scan_remaining = 0;
                     }
                     incoming = read.next() => {
                         if pending_replay.is_some() && replay_control_scan_remaining > 0 {
@@ -776,6 +788,9 @@ impl Channel for VoiceHostChannel {
                                     )?;
                                     pending_replay = Some((payload, event_id));
                                     replay_control_scan_remaining = REPLAY_CONTROL_SCAN_LIMIT;
+                                    replay_control_scan_deadline = Some(
+                                        Instant::now() + REPLAY_CONTROL_SCAN_TIMEOUT,
+                                    );
                                 }
                             }
                             action @ InboundAction::PartialTranscript(_) => {
@@ -812,24 +827,6 @@ impl Channel for VoiceHostChannel {
                                     "ignored voice host event"
                                 );
                             }
-                        }
-                    }
-                    permit = writer_control_tx.reserve(),
-                        if pending_replay.is_some() && replay_control_scan_remaining > 0 =>
-                    {
-                        match permit {
-                            Ok(permit) => {
-                                let (payload, event_id) = pending_replay
-                                    .take()
-                                    .expect("guard requires a pending replay notice");
-                                let (completed_tx, completed_rx) = oneshot::channel();
-                                permit.send(WriterControl::ReplayAndClose {
-                                    payload,
-                                    completed: completed_tx,
-                                });
-                                replay_completion = Some((completed_rx, event_id));
-                            }
-                            Err(_) => break,
                         }
                     }
                 }
