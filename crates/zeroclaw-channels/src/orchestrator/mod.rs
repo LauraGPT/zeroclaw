@@ -9491,9 +9491,22 @@ fn build_channel_by_id(
                 };
                 let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
+                let transcription_config_arc = Arc::clone(config_arc);
+                let transcription_channel_key = format!("matrix.{alias}");
                 Ok(Arc::new(
                     MatrixChannel::new(mx.clone(), alias, peer_resolver, state_dir)?
-                        .with_transcription(config.transcription.clone())
+                        .with_transcription_manager_factory(move || {
+                            let config = transcription_config_arc.read();
+                            let provider = resolve_agent_transcription_provider(
+                                &config,
+                                &transcription_channel_key,
+                            );
+                            Some(
+                                crate::transcription::TranscriptionManager::from_config_with_provider(
+                                    &config, provider,
+                                ),
+                            )
+                        })
                         .with_workspace_dir(workspace_dir)
                         .with_ack_reactions(ack),
                 ))
@@ -10830,10 +10843,23 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
         };
         let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
+        let transcription_config_arc = Arc::clone(config_arc);
+        let transcription_channel_key = format!("matrix.{alias}");
         match MatrixChannel::new(mx.clone(), alias.clone(), peer_resolver, state_dir) {
             Ok(channel) => {
                 let channel = channel
-                    .with_transcription(config.transcription.clone())
+                    .with_transcription_manager_factory(move || {
+                        let config = transcription_config_arc.read();
+                        let provider = resolve_agent_transcription_provider(
+                            &config,
+                            &transcription_channel_key,
+                        );
+                        Some(
+                            crate::transcription::TranscriptionManager::from_config_with_provider(
+                                &config, provider,
+                            ),
+                        )
+                    })
                     .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
                     .with_ack_reactions(ack);
                 channels.push(ConfiguredChannel {
