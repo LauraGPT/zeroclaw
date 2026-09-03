@@ -657,7 +657,7 @@ fn filter_deferred_tools_for_turn(
 /// Build the model-visible system prompt for one turn from the same effective
 /// tool exclusion set used by native specs and runtime execution.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_system_prompt_for_turn(
+pub fn build_system_prompt_for_turn(
     agent_workspace: &std::path::Path,
     model_name: &str,
     tool_descs: &[(&str, &str)],
@@ -697,7 +697,8 @@ pub(crate) fn build_system_prompt_for_turn(
         .collect();
     let mut turn_tool_descs = tool_descs.to_vec();
     turn_tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
-    let mut turn_deferred_section = deferred_section.to_string();
+    let mut turn_deferred_section =
+        filter_deferred_tools_for_turn(deferred_section, &excluded_tool_names);
     let expose_text_tool_protocol = apply_text_tool_prompt_policy(
         native_tools,
         strict_tool_parsing,
